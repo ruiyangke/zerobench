@@ -467,3 +467,97 @@ fn env_with_empty_name_and_default_errors() {
         "got {err:?}"
     );
 }
+
+#[test]
+fn rand_hex_with_non_numeric_arg_errors() {
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{rand_hex:abc}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::InvalidRandArgs(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn rand_str_with_non_numeric_arg_errors() {
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{rand_str:abc}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::InvalidRandArgs(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn rand_hex_zero_bytes_expands_to_empty() {
+    let mut vars = VarRegistry::new();
+    let t = Template::compile("{{rand_hex:0}}", &mut vars).unwrap();
+    let mut h = Harness::new();
+    let out = expand(&t, &mut h);
+    assert!(out.is_empty(), "expected empty, got {out:?}");
+}
+
+#[test]
+fn rand_str_zero_len_expands_to_empty() {
+    let mut vars = VarRegistry::new();
+    let t = Template::compile("{{rand_str:0}}", &mut vars).unwrap();
+    let mut h = Harness::new();
+    let out = expand(&t, &mut h);
+    assert!(out.is_empty(), "expected empty, got {out:?}");
+}
+
+#[test]
+fn zero_width_expression_errors() {
+    // `{{}}` — no prefix, no args.
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{}}", &mut vars).unwrap_err();
+    match err {
+        TemplateError::UnknownVariable(s) => assert_eq!(s, ""),
+        other => panic!("expected UnknownVariable(\"\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_colon_expression_errors() {
+    // `{{:}}` — empty head, empty tail. Doesn't match any known prefix.
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{:}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::UnknownVariable(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn rand_int_accepts_negative_bounds() {
+    let mut vars = VarRegistry::new();
+    let t = Template::compile("{{rand_int:-5:-1}}", &mut vars).unwrap();
+    let mut h = Harness::new();
+    for _ in 0..200 {
+        let mut out = Vec::new();
+        let mut ctx = h.ctx();
+        t.expand_into(&mut out, &mut ctx);
+        let n: i64 = std::str::from_utf8(&out).unwrap().parse().unwrap();
+        assert!((-5..=-1).contains(&n), "out of bounds: {n}");
+    }
+}
+
+#[test]
+fn rand_int_with_three_args_errors() {
+    // `{{rand_int:5:6:7}}` — extra component. The middle MAX parses "6:7"
+    // as i64, which fails → InvalidRandInt.
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{rand_int:5:6:7}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::InvalidRandInt(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn template_literal_empty_expands_to_empty() {
+    let t = Template::literal("");
+    let mut h = Harness::new();
+    let out = expand(&t, &mut h);
+    assert!(out.is_empty(), "expected empty, got {out:?}");
+}

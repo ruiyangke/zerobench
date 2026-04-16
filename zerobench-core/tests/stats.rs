@@ -218,3 +218,34 @@ fn merge_of_zero_tasks_yields_empty_summary() {
     assert_eq!(sum.errors.total(), 0);
     assert!(sum.per_scenario.is_empty());
 }
+
+#[test]
+fn record_zero_duration_clamps_to_hist_lo_without_panic() {
+    // Duration::ZERO is below HDR's minimum recordable value (1ns); it
+    // must clamp up to 1 rather than panic or drop the sample.
+    let mut s = TaskStats::new(1);
+    s.record(0, Duration::ZERO, Duration::ZERO, 0, 0);
+    assert_eq!(s.requests, 1);
+    // The min recorded value reflects the clamp (HIST_LO_NS == 1).
+    assert_eq!(s.latency.min(), 1);
+    assert_eq!(s.ttfb.min(), 1);
+    // Per-scenario bucket incremented too.
+    assert_eq!(s.per_scenario[0].requests, 1);
+}
+
+#[test]
+fn record_error_with_out_of_range_scenario_id_does_not_panic() {
+    // Task-level counter must still increment; per-scenario buckets are
+    // silently skipped for unknown scenario IDs (no panic, no bounds
+    // growth).
+    let mut s = TaskStats::new(2);
+    s.record_error(99, ErrorKind::Connect);
+    s.record_error(u16::MAX, ErrorKind::Timeout);
+    assert_eq!(s.errors.connect, 1);
+    assert_eq!(s.errors.timeout, 1);
+    assert_eq!(s.errors.total(), 2);
+    // Scenario buckets remain untouched.
+    assert_eq!(s.per_scenario.len(), 2);
+    assert_eq!(s.per_scenario[0].errors.total(), 0);
+    assert_eq!(s.per_scenario[1].errors.total(), 0);
+}
