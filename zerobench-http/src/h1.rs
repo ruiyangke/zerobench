@@ -304,16 +304,16 @@ fn build_request(
         .map_err(|e| TransportError::RequestBuild(format!("url not utf-8: {e}")))?;
 
     // Strip scheme + authority if the template produced an absolute URL.
+    // `extract_path_and_query` is guaranteed to return a non-empty slice
+    // and handles query/fragment rules consistently across absolute and
+    // relative inputs. Only owned in the edge case of an absolute URL
+    // whose authority is immediately followed by '?' (needs a synthetic
+    // leading '/').
     let path_and_query = extract_path_and_query(url_str);
-    let path_and_query = if path_and_query.is_empty() {
-        "/"
-    } else {
-        path_and_query
-    };
 
     let mut builder = Request::builder()
         .method(plan.method.clone())
-        .uri(path_and_query);
+        .uri(path_and_query.as_ref());
 
     // Headers: start with `Host` since hyper requires it, then layer
     // user-supplied headers which can override it.
@@ -350,28 +350,61 @@ fn build_request(
         .map_err(|e| TransportError::RequestBuild(format!("build: {e}")))
 }
 
-/// Extract the path+query portion from a URL-ish string, falling back
-/// to the whole input if no scheme is present.
+/// Extract the origin-form path+query from a URL-ish string.
+///
+/// Rules:
+/// - `#fragment` is always stripped (it's client-side and must not
+///   appear on the wire).
+/// - `?query` is always preserved, even when there's no path — an
+///   absolute URL like `http://h:80?q=1` maps to `"/?q=1"`.
+/// - A missing path is replaced with `"/"`. If the whole input has no
+///   path, no query, and no fragment, the result is `"/"`.
+///
+/// Returns a `Cow<str>` — borrowed for the common case where we can
+/// return a suffix of the input unchanged, owned only when we must
+/// prepend `/` (absolute URL with query but no path).
 ///
 /// Used because plan URLs are most often relative (`/api/x?k=v`) but
 /// front-ends occasionally hand us absolute URLs from a CLI flag.
-fn extract_path_and_query(url: &str) -> &str {
-    if let Some(pos) = url.find("://") {
-        // Absolute. Skip past "://authority/" — find the next '/' after
-        // the authority start.
+fn extract_path_and_query(url: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    // Narrow to the part after scheme://authority if the URL is
+    // absolute; otherwise operate on the input as-is. Track whether
+    // we entered the absolute branch so we can prepend "/" when the
+    // authority is followed directly by '?'.
+    let (rest, absolute) = if let Some(pos) = url.find("://") {
         let after_scheme = &url[pos + 3..];
-        match after_scheme.find('/') {
-            Some(i) => &after_scheme[i..],
-            // No path → origin form is just "/"
-            None => "/",
+        // Authority ends at the first '/', '?', or '#'.
+        match after_scheme.find(|c: char| c == '/' || c == '?' || c == '#') {
+            Some(i) => (&after_scheme[i..], true),
+            // No path / query / fragment at all — "/" is the only
+            // sensible origin-form.
+            None => return Cow::Borrowed("/"),
         }
     } else {
-        // Already relative; strip any accidental fragment.
-        match url.find('#') {
-            Some(i) => &url[..i],
-            None => url,
-        }
+        (url, false)
+    };
+
+    // Strip fragment in both branches. Anything after '#' is
+    // client-side and not part of the origin-form request.
+    let without_fragment = match rest.find('#') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+
+    if without_fragment.is_empty() {
+        // "#frag" alone (and theoretically empty input) — default.
+        return Cow::Borrowed("/");
     }
+
+    // Absolute URL where the authority was followed directly by '?' has
+    // no explicit path; prepend "/" so the origin-form is well-formed.
+    if absolute && without_fragment.starts_with('?') {
+        return Cow::Owned(format!("/{without_fragment}"));
+    }
+
+    Cow::Borrowed(without_fragment)
 }
 
 // ---------------------------------------------------------------------------
@@ -382,20 +415,81 @@ fn extract_path_and_query(url: &str) -> &str {
 mod tests {
     use super::*;
 
+    // --- Absolute URLs ------------------------------------------------------
+
     #[test]
-    fn extract_path_and_query_from_absolute_url() {
-        assert_eq!(
-            extract_path_and_query("http://h:8080/api/x?k=v"),
-            "/api/x?k=v"
-        );
-        assert_eq!(extract_path_and_query("http://h:8080"), "/");
-        assert_eq!(extract_path_and_query("http://h:8080/"), "/");
+    fn absolute_no_path_no_query_defaults_to_slash() {
+        assert_eq!(extract_path_and_query("http://h:80"), "/");
     }
 
     #[test]
-    fn extract_path_and_query_from_relative_url() {
-        assert_eq!(extract_path_and_query("/api/x?k=v"), "/api/x?k=v");
-        assert_eq!(extract_path_and_query("/api#frag"), "/api");
+    fn absolute_bare_slash_stays_slash() {
+        assert_eq!(extract_path_and_query("http://h:80/"), "/");
+    }
+
+    #[test]
+    fn absolute_query_without_path_preserves_query() {
+        // Regression: the old implementation located the path by searching
+        // for the next '/' after the authority and silently dropped any
+        // query that appeared before one — i.e. when there was no path.
+        assert_eq!(extract_path_and_query("http://h:80?q=1"), "/?q=1");
+    }
+
+    #[test]
+    fn absolute_path_with_query_preserves_both() {
+        assert_eq!(extract_path_and_query("http://h:80/foo?q=1"), "/foo?q=1");
+    }
+
+    #[test]
+    fn absolute_fragment_is_stripped() {
+        assert_eq!(extract_path_and_query("http://h:80/foo#frag"), "/foo");
+    }
+
+    #[test]
+    fn absolute_query_plus_fragment_keeps_query_drops_fragment() {
+        assert_eq!(
+            extract_path_and_query("http://h:80/foo?q=1#frag"),
+            "/foo?q=1"
+        );
+    }
+
+    #[test]
+    fn absolute_fragment_only_after_authority_defaults_to_slash() {
+        // "http://h:80#f" has no path, no query, only a fragment — the
+        // fragment is client-side so we strip it and fall back to "/".
+        assert_eq!(extract_path_and_query("http://h:80#frag"), "/");
+    }
+
+    // --- Relative URLs ------------------------------------------------------
+
+    #[test]
+    fn relative_path_with_query_preserves_query() {
+        assert_eq!(
+            extract_path_and_query("/relative/path?q=1"),
+            "/relative/path?q=1"
+        );
+    }
+
+    #[test]
+    fn relative_fragment_is_stripped() {
+        assert_eq!(extract_path_and_query("/path#frag"), "/path");
+    }
+
+    #[test]
+    fn relative_bare_slash_stays_slash() {
         assert_eq!(extract_path_and_query("/"), "/");
+    }
+
+    #[test]
+    fn relative_path_query_fragment_strips_only_fragment() {
+        assert_eq!(
+            extract_path_and_query("/path?q=1#frag"),
+            "/path?q=1"
+        );
+    }
+
+    #[test]
+    fn relative_empty_falls_back_to_slash() {
+        assert_eq!(extract_path_and_query(""), "/");
     }
 }
