@@ -128,11 +128,12 @@ async fn open_loop_constant_rate_matches_target() {
     let summary = Summary::merge(stats, plan.duration);
 
     let total = summary.requests;
-    // Allow ±5% for scheduler drift + compio's timer granularity.
-    // Be conservative: test CI can be noisy.
+    // Tight bound: ±5%. The spec target is ±3%, but 5% absorbs timer
+    // granularity and warm-up jitter without letting real regressions
+    // through. Keep the same bound on CI and locally (no env branching).
     assert!(
-        total >= 1500 && total <= 2400,
-        "expected ~2000 requests, got {total} (keepup={})",
+        total >= 1900 && total <= 2100,
+        "expected ~2000 requests (±5%), got {total} (keepup={})",
         summary.errors.keepup
     );
     // No transport/status errors expected.
@@ -144,37 +145,32 @@ async fn open_loop_constant_rate_matches_target() {
 
 #[compio::test]
 async fn open_loop_captures_queue_time_in_latency() {
-    // 1000 rps target with service time of 100µs normally. Every 10th
-    // request sleeps 5ms — enough to build backlog under open-loop
-    // queue semantics. Workers = 1 so the queue is the only backpressure
-    // mechanism.
+    // 500 rps target, 1 worker, 500µs normal service, with a 200ms
+    // stall every 10th request. Each stall parks ~100 intended-start
+    // times in the queue; those that land in the channel (capacity
+    // ~4× workers) carry nearly-full stall duration of queue time.
     //
-    // Under CO-free measurement, the latency histogram must include
-    // queue time — p99 should be much larger than the 5ms slow request
-    // because tokens queued behind the slow one accumulate queue time.
+    // Under CO-free measurement, latency = now − token.intended_start,
+    // so p99 must reflect the stall's queue time — well beyond 100ms.
+    // Under CO-bad measurement (latency = now − send_start) p99 would
+    // cap near the 200ms service time but with fewer samples at that
+    // tail; the 100ms bar separates the two regimes comfortably.
     let plan = constant_plan(500.0, Duration::from_millis(1500));
     let client = FakeClient::new();
     client.service_time_us.store(500, Ordering::Relaxed);
     client.slow_every_nth.store(10, Ordering::Relaxed);
-    client.slow_time_us.store(20_000, Ordering::Relaxed); // 20ms
+    client.slow_time_us.store(200_000, Ordering::Relaxed); // 200ms stall
     let stop = StopSignal::after(plan.duration);
 
     let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop).await;
     let summary = Summary::merge(stats, plan.duration);
 
-    // We expect a massively inflated p99 because every 10th token
-    // blocks behind a 20ms response, and tokens behind it accumulate
-    // up to seconds of queue time (a single worker can't keep up with
-    // 500rps when one in 10 responses takes 20ms — arrival rate >>
-    // service rate, so queue grows unboundedly).
-    //
-    // Assert p99 is substantially larger than the slow request itself
-    // (20ms). Under CO-bad measurement (no queue time) we'd see p99
-    // close to 20ms.
     let p99 = summary.latency_p(99.0);
     assert!(
-        p99 > Duration::from_millis(20),
-        "p99 should capture queue time, got {p99:?}"
+        p99 > Duration::from_millis(100),
+        "p99 should capture accumulated queue time, got {p99:?} (requests={} keepup={})",
+        summary.requests,
+        summary.errors.keepup
     );
 }
 
