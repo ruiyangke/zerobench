@@ -118,8 +118,8 @@ pub struct CliArgs {
 
     /// Preferred HTTP protocol version.
     ///
-    /// - `auto` (default): HTTP → H1; HTTPS → ALPN-negotiated (resolves
-    ///   to H1 until TLS wiring is complete).
+    /// - `auto` (default): HTTP → H1; HTTPS → ALPN-negotiated (picks H2
+    ///   when the server offers it, falls back to H1 otherwise).
     /// - `h1`: always HTTP/1.1.
     /// - `h2`: always HTTP/2. Requires the binary to be built with the
     ///   `h2` feature; otherwise the run exits with a clear error.

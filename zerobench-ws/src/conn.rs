@@ -175,6 +175,7 @@ impl WsConnection<TcpStream> {
     /// call sites should prefer the unified [`connect`] wrapper below.
     pub async fn connect_tcp(
         target: &Target,
+        opts: &TransportOpts,
         path: &str,
         extra_headers: &[(String, String)],
         mut mask_rng: BenchRng,
@@ -186,12 +187,15 @@ impl WsConnection<TcpStream> {
         }
 
         let addr = target.addr();
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            WsError::Io(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("{addr}: {e}"),
-            ))
-        })?;
+        let stream = compio::time::timeout(opts.connect_timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| WsError::Io(io::Error::new(io::ErrorKind::TimedOut, format!("{addr}: connect timeout"))))?
+            .map_err(|e| {
+                WsError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("{addr}: {e}"),
+                ))
+            })?;
         // Best-effort NODELAY; same as the HTTP transport. A failure
         // here doesn't justify aborting.
         let _ = stream.set_nodelay(true);
@@ -224,12 +228,15 @@ impl WsConnection<TlsStream<TcpStream>> {
         }
 
         let addr = target.addr();
-        let tcp = TcpStream::connect(&addr).await.map_err(|e| {
-            WsError::Io(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("{addr}: {e}"),
-            ))
-        })?;
+        let tcp = compio::time::timeout(opts.connect_timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| WsError::Io(io::Error::new(io::ErrorKind::TimedOut, format!("{addr}: connect timeout"))))?
+            .map_err(|e| {
+                WsError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("{addr}: {e}"),
+                ))
+            })?;
         let _ = tcp.set_nodelay(true);
 
         // Empty ALPN list — WebSocket handshake is entirely over TLS
@@ -237,9 +244,9 @@ impl WsConnection<TlsStream<TcpStream>> {
         let cfg = tls_client_config(opts, &[]);
         let connector = compio_tls::TlsConnector::from(cfg);
         let server_name = target.sni_name().to_string();
-        let tls = connector
-            .connect(&server_name, tcp)
+        let tls = compio::time::timeout(opts.connect_timeout, connector.connect(&server_name, tcp))
             .await
+            .map_err(|_| WsError::Tls(format!("{addr}: tls handshake timeout")))?
             .map_err(|e| WsError::Tls(format!("handshake: {e}")))?;
 
         Self::handshake_over(tls, target, path, extra_headers, &mut mask_rng).await
@@ -322,6 +329,7 @@ impl WsConnection<TcpStream> {
         } else {
             let c = WsConnection::<TcpStream>::connect_tcp(
                 target,
+                opts,
                 path,
                 extra_headers,
                 mask_rng,
