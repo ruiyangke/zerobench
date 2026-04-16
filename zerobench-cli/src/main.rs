@@ -44,6 +44,8 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(cmd) = args.command.clone() {
         return match cmd {
             Subcommand::Diff(da) => diff::run(&da),
+            #[cfg(feature = "script")]
+            Subcommand::Run(ra) => run_script(ra).await,
         };
     }
 
@@ -594,5 +596,112 @@ fn format_ns_ws(ns: u64) -> String {
         format!("{:.0}µs", ns as f64 / 1_000.0)
     } else {
         format!("{ns}ns")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rhai script dispatch
+// ---------------------------------------------------------------------------
+
+/// Load a `.rhai` scenario script, apply any CLI overrides, stand up the
+/// HTTP transport, dispatch the run, and render the report.
+///
+/// The Rhai engine lives only inside `load_script` — this function sees
+/// a pure Rust [`Plan`] and never pulls in the interpreter again. CLI
+/// overrides (`--duration`, `--rate`) mutate the Plan in-place after
+/// load; `--connections` / TLS / timeouts shape the transport opts.
+#[cfg(feature = "script")]
+async fn run_script(
+    args: cli_args::RunArgs,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use zerobench_core::plan::RateProfile;
+    use zerobench_core::transport::TransportOpts;
+
+    let zerobench_rhai::LoadedScript {
+        mut plan,
+        target,
+        http_version,
+    } = zerobench_rhai::load_script(&args.script)?;
+
+    // CLI override: duration wins over the script's `duration(...)`.
+    if let Some(d) = args.duration {
+        plan.duration = d;
+    }
+    // CLI override: rate replaces every scenario's rate profile with
+    // `Constant(rate * weight)`. Weight information from the script is
+    // already folded into each scenario's rate via finalize, so we just
+    // replace the profile with a uniform split.
+    if let Some(r) = args.rate {
+        let n = plan.scenarios.len() as f64;
+        for s in &mut plan.scenarios {
+            s.rate = RateProfile::Constant(r / n);
+        }
+    }
+
+    let opts = TransportOpts {
+        connect_timeout: args.connect_timeout,
+        request_timeout: args.request_timeout,
+        max_conns: args.connections,
+        tcp_nodelay: true,
+        insecure_tls: args.insecure,
+        http_version,
+    };
+
+    // Decide open-loop vs. saturate based on the first scenario's rate
+    // profile. Mixed profiles across scenarios are legal but we only
+    // have one dispatcher flavor to pick; `run_open_loop` handles
+    // `Constant` / `Ramp` / `Stepped`, `run_saturate` handles
+    // `Saturate { ... }`. If the first is Saturate we saturate, else
+    // we open-loop.
+    let open_loop = !matches!(plan.scenarios[0].rate, RateProfile::Saturate { .. });
+
+    let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
+
+    let stop = StopSignal::after(plan.duration);
+    let stats = if open_loop {
+        run_open_loop::<HttpTransport>(&plan, client, args.connections, stop, None).await
+    } else {
+        run_saturate::<HttpTransport>(&plan, client, args.connections, stop, None).await
+    };
+
+    let summary = Summary::merge(stats, plan.duration);
+
+    let color = match args.color {
+        CliColor::Always => ColorChoice::Always,
+        CliColor::Auto => ColorChoice::Auto,
+        CliColor::Never => ColorChoice::Never,
+    };
+    match args.format {
+        CliFormat::Terminal => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            print_json(&summary, &plan, &mut out)?;
+        }
+        CliFormat::Jsonl => {
+            // Jsonl in run-script mode doesn't stream per-second yet —
+            // we emit the terminal summary to stderr to match the
+            // default path's contract.
+            let stderr = std::io::stderr();
+            let is_tty = stderr.is_terminal();
+            let mut out = stderr.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Prom => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
+        }
+    }
+
+    if summary.errors.total() > 0 || summary.requests == 0 {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
 }

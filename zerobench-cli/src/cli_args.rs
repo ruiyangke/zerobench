@@ -262,6 +262,68 @@ pub enum CliFormat {
 pub enum Subcommand {
     /// Compare two JSON bench outputs and report deltas.
     Diff(DiffArgs),
+    /// Run a Rhai scenario script. Only available when built with
+    /// `--features script`. The script is evaluated once at startup to
+    /// produce a `Plan`; the Rhai engine is then dropped and the
+    /// benchmark runs as pure Rust.
+    #[cfg(feature = "script")]
+    Run(RunArgs),
+}
+
+/// Arguments for `zerobench run <script.rhai>`.
+///
+/// The script is the source of truth for scenarios, rate, duration,
+/// warmup, and transport. The flags here are safe overrides for the
+/// common "I want to re-run the same script with a longer duration"
+/// case — they win over whatever the script said.
+#[cfg(feature = "script")]
+#[derive(Debug, Clone, clap::Args)]
+pub struct RunArgs {
+    /// Path to the `.rhai` script.
+    #[arg(value_name = "SCRIPT")]
+    pub script: PathBuf,
+
+    /// Override the script's `duration(...)` — useful for quick
+    /// smoke-tests of an otherwise-long scenario. Must still be a
+    /// positive duration; parsed with the same grammar as the
+    /// `--duration` flag on the default subcommand.
+    #[arg(long = "duration", value_parser = parse_duration_flag)]
+    pub duration: Option<Duration>,
+
+    /// Override the script's `rate(...)` — parsed with the same
+    /// grammar as `-r` / `--rate` on the default subcommand.
+    /// Implicitly overrides any per-scenario `.rate(...)` too.
+    #[arg(long = "rate", short = 'r', value_parser = parse_rate_flag)]
+    pub rate: Option<f64>,
+
+    /// Max concurrent connections. Used in saturate mode (when the
+    /// script set `saturate(...)` or neither `rate()` nor `saturate()`
+    /// was called) and as the pool ceiling in open-loop mode.
+    #[arg(short = 'c', long = "connections", default_value_t = 50)]
+    pub connections: usize,
+
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = CliFormat::Terminal)]
+    pub format: CliFormat,
+
+    /// Color output preference.
+    #[arg(long = "color", value_enum, default_value_t = CliColor::Auto)]
+    pub color: CliColor,
+
+    /// TCP+TLS connect timeout.
+    #[arg(long = "connect-timeout", default_value = "5s",
+          value_parser = parse_duration_flag)]
+    pub connect_timeout: Duration,
+
+    /// Per-request deadline.
+    #[arg(long = "timeout", default_value = "30s",
+          value_parser = parse_duration_flag)]
+    pub request_timeout: Duration,
+
+    /// Accept invalid TLS certificates. Only meaningful for https://
+    /// targets.
+    #[arg(short = 'k', long = "insecure", action = ArgAction::SetTrue)]
+    pub insecure: bool,
 }
 
 /// Arguments for `zerobench diff`.
@@ -543,6 +605,8 @@ mod tests {
                 assert_eq!(da.current.to_str(), Some("/tmp/curr.json"));
                 assert!((da.threshold_p99 - 3.5).abs() < 1e-9);
             }
+            #[cfg(feature = "script")]
+            Subcommand::Run(_) => panic!("expected Diff, got Run"),
         }
     }
 
@@ -560,6 +624,8 @@ mod tests {
                 assert!((da.threshold_p99 - 5.0).abs() < 1e-9);
                 assert!((da.threshold_rps - 2.0).abs() < 1e-9);
             }
+            #[cfg(feature = "script")]
+            Subcommand::Run(_) => panic!("expected Diff, got Run"),
         }
     }
 

@@ -901,3 +901,130 @@ fn cli_ws_flag_runs_and_reports_messages() {
         .expect("messages line must have a parsable `received` count");
     assert!(received > 0, "reported 0 messages received:\n{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// Rhai script subcommand — feature-gated
+// ---------------------------------------------------------------------------
+
+/// Write a minimal `.rhai` fixture targeting `addr`. The script declares
+/// a single saturate scenario with one GET, short duration, no rate.
+#[cfg(feature = "script")]
+fn write_rhai_fixture(addr: std::net::SocketAddr) -> std::path::PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir()
+        .join(format!("zerobench-cli-rhai-{pid}-{nanos}.rhai"));
+    let body = format!(
+        r#"
+// Smoke-test scenario for `zerobench run`. Targets a local echo server
+// via the address passed in at test-generation time.
+scenario("smoke", |s| {{
+    s.step(
+        GET("http://{addr}/ping")
+            .expect_status(200)
+    );
+}});
+saturate(2);
+duration("500ms");
+"#
+    );
+    std::fs::write(&path, body).expect("write fixture");
+    path
+}
+
+/// End-to-end: `zerobench run <script.rhai>` drives a real bench loop
+/// against a local server and reports non-zero throughput.
+#[cfg(feature = "script")]
+#[test]
+fn cli_run_rhai_script_against_local_server() {
+    let addr = spawn_server(200, b"pong");
+    let fixture = write_rhai_fixture(addr);
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "run",
+            fixture.to_str().unwrap(),
+            "-c",
+            "2",
+            "--color",
+            "never",
+        ])
+        .output()
+        .expect("run zerobench run <rhai>");
+
+    // Delete fixture before assertion so a failed test doesn't leak.
+    let _ = std::fs::remove_file(&fixture);
+
+    assert!(
+        out.status.success(),
+        "zerobench run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("actual rate") || stdout.contains("latency"),
+        "missing terminal report output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("actual rate    0.0"),
+        "rate was zero — server unreachable? stdout:\n{stdout}"
+    );
+}
+
+/// `zerobench run` with `--duration` must override the script's
+/// `duration(...)` — regression test for the override plumbing.
+#[cfg(feature = "script")]
+#[test]
+fn cli_run_rhai_script_duration_override() {
+    let addr = spawn_server(200, b"pong");
+
+    // Write a script with a ridiculously long duration that we then
+    // override via --duration. If the override were ignored, the test
+    // would time out well before the 30s script duration.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir()
+        .join(format!("zerobench-cli-rhai-override-{pid}-{nanos}.rhai"));
+    let body = format!(
+        r#"
+scenario("x", |s| {{
+    s.step(GET("http://{addr}/").expect_status(200));
+}});
+saturate(2);
+duration("30s");
+"#
+    );
+    std::fs::write(&path, body).expect("write fixture");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "run",
+            path.to_str().unwrap(),
+            "-c",
+            "2",
+            "--duration",
+            "300ms",
+            "--color",
+            "never",
+        ])
+        .output()
+        .expect("run zerobench run --duration");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "zerobench run --duration failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
