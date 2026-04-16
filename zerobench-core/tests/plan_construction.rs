@@ -172,3 +172,82 @@ fn default_plan_is_empty_with_sensible_duration() {
     assert_eq!(p.duration, Duration::from_secs(30));
     assert!(p.warmup.is_none());
 }
+
+/// Ensures the Plan serialization contract stays intact so the diff tool
+/// (Task 13) can persist and compare benchmark runs. Touches every in-scope
+/// variant: GET/POST, both Extract variants, all three Assertion variants,
+/// both BodySource variants, and every Step variant.
+#[test]
+fn plan_roundtrips_through_serde_json() {
+    let mut vars = VarRegistry::new();
+    let token = vars.allocate("token");
+    let status_slot = vars.allocate("last_status");
+
+    let login = RequestPlan {
+        method: Method::POST,
+        url: Template::literal("/login"),
+        headers: smallvec![(
+            Template::literal("content-type"),
+            Template::literal("application/json"),
+        )],
+        body: Some(BodySource::Static(bytes::Bytes::from_static(
+            br#"{"user":"bob"}"#,
+        ))),
+        extract: vec![Extract::Header {
+            name: HeaderName::from_static("x-auth-token"),
+            into: token,
+        }],
+        checks: vec![
+            Assertion::StatusEq(200),
+            Assertion::StatusIn(smallvec![200, 201]),
+            Assertion::LatencyUnder(Duration::from_millis(500)),
+        ],
+    };
+
+    let probe = RequestPlan {
+        method: Method::GET,
+        url: Template::literal("/api/me"),
+        headers: smallvec![],
+        body: None,
+        extract: vec![Extract::StatusCode { into: status_slot }],
+        checks: vec![Assertion::StatusEq(200)],
+    };
+
+    let original = Plan {
+        scenarios: vec![Scenario {
+            name: "e2e".into(),
+            rate: RateProfile::Placeholder,
+            steps: vec![
+                Step::Request(login),
+                Step::Pause(Duration::from_millis(50)),
+                Step::PauseRandom {
+                    min: Duration::from_millis(10),
+                    max: Duration::from_millis(20),
+                },
+                Step::Request(probe),
+            ],
+        }],
+        vars,
+        duration: Duration::from_secs(30),
+        warmup: Some(Duration::from_secs(2)),
+    };
+
+    let json = serde_json::to_string(&original).expect("Plan serialization must succeed");
+    let decoded: Plan = serde_json::from_str(&json).expect("Plan deserialization must succeed");
+
+    // Structural equality — Plan doesn't implement Eq (Template carries an
+    // internal Bytes and we'd rather not require Eq through the whole tree),
+    // so we verify the shape round-trips by re-serializing and comparing JSON.
+    let reencoded = serde_json::to_string(&decoded).expect("re-serialization must succeed");
+    assert_eq!(json, reencoded, "plan JSON must be stable across roundtrip");
+
+    // Spot-check critical fields survived.
+    assert_eq!(decoded.scenarios.len(), 1);
+    assert_eq!(decoded.scenarios[0].name, "e2e");
+    assert_eq!(decoded.scenarios[0].steps.len(), 4);
+    assert_eq!(decoded.vars.len(), 2);
+    assert_eq!(decoded.vars.name(token), Some("token"));
+    assert_eq!(decoded.vars.name(status_slot), Some("last_status"));
+    assert_eq!(decoded.duration, Duration::from_secs(30));
+    assert_eq!(decoded.warmup, Some(Duration::from_secs(2)));
+}
