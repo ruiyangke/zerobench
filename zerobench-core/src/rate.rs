@@ -24,15 +24,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use rand::Rng;
 
-use crate::plan::{Assertion, Extract, Plan, RateProfile, Step};
+use crate::plan::{Plan, RateProfile, Step};
 use crate::rng::from_entropy;
 use crate::scenario_context::ScenarioContext;
-use crate::stats::{ErrorKind, TaskStats};
+use crate::stats::TaskStats;
+use crate::step_exec::{classify_transport_error, process_response};
 use crate::stop::StopSignal;
-use crate::transport::{Response, Transport, TransportError};
+use crate::transport::{Response, Transport};
 
 // ---------------------------------------------------------------------------
 // Token
@@ -459,65 +459,6 @@ async fn execute_steps_open_loop<T: Transport>(
                 compio::time::sleep(d).await;
             }
         }
-    }
-}
-
-fn process_response(
-    scenario_id: u16,
-    req: &crate::plan::RequestPlan,
-    resp: &Response,
-    ctx: &mut ScenarioContext,
-    stats: &mut TaskStats,
-) {
-    let status = resp.status;
-    if (400..500).contains(&status) {
-        stats.record_error(scenario_id, ErrorKind::Status4xx);
-    } else if (500..600).contains(&status) {
-        stats.record_error(scenario_id, ErrorKind::Status5xx);
-    }
-    stats.record(scenario_id, resp.total, resp.ttfb, resp.bytes_sent, resp.bytes_received);
-    for extract in &req.extract {
-        apply_extract(extract, resp, ctx);
-    }
-    for check in &req.checks {
-        if !check_assertion(check, resp) {
-            stats.record_error(scenario_id, ErrorKind::AssertionFailed);
-        }
-    }
-}
-
-fn apply_extract(extract: &Extract, resp: &Response, ctx: &mut ScenarioContext) {
-    match extract {
-        Extract::Header { name, into } => {
-            if let Some(value) = resp.headers.get(name) {
-                ctx.set_var(*into, Bytes::copy_from_slice(value.as_bytes()));
-            } else {
-                ctx.clear_var(*into);
-            }
-        }
-        Extract::StatusCode { into } => {
-            let s = resp.status.to_string();
-            ctx.set_var(*into, Bytes::from(s.into_bytes()));
-        }
-    }
-}
-
-fn check_assertion(check: &Assertion, resp: &Response) -> bool {
-    match check {
-        Assertion::StatusEq(code) => resp.status == *code,
-        Assertion::StatusIn(codes) => codes.iter().any(|c| *c == resp.status),
-        Assertion::LatencyUnder(d) => resp.total < *d,
-    }
-}
-
-fn classify_transport_error(e: &TransportError) -> ErrorKind {
-    match e {
-        TransportError::Connect(_) => ErrorKind::Connect,
-        TransportError::Timeout => ErrorKind::Timeout,
-        TransportError::Protocol(_) => ErrorKind::Read,
-        TransportError::Io(_) => ErrorKind::Read,
-        TransportError::RequestBuild(_) => ErrorKind::Write,
-        TransportError::Tls(_) => ErrorKind::Connect,
     }
 }
 
