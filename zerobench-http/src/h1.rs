@@ -172,17 +172,30 @@ impl Http1Pool {
             .ok_or_else(|| TransportError::Connect(format!("slot {slot_idx} unavailable")))?;
 
         let send_fut = sender.send_request(req);
-        // Enforce request_timeout around headers *and* body.
-        let res = compio::time::timeout(self.request_timeout, send_fut)
-            .await
-            .map_err(|_| TransportError::Timeout)?
-            .map_err(|e| {
+        // Enforce request_timeout around headers *and* body. Every exit
+        // path that leaves the slot in an undefined state (timeout *or*
+        // connection error) must null the sender: the driver task has
+        // either been cancelled mid-write or seen the connection die,
+        // so the next request on this slot would otherwise hit an
+        // out-of-sync SendRequest.
+        let res = match compio::time::timeout(self.request_timeout, send_fut).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
                 // Connection died — mark slot empty so future users don't
                 // hit the same dead sender (conservative: we don't try
                 // to reopen here; that's a later task).
                 guard.sender = None;
-                TransportError::Protocol(format!("send_request: {e}"))
-            })?;
+                return Err(TransportError::Protocol(format!("send_request: {e}")));
+            }
+            Err(_) => {
+                // Timeout — the send_request future is being dropped, which
+                // leaves the underlying hyper connection in an indeterminate
+                // state. Invalidate the slot so subsequent exchanges fail
+                // cleanly instead of hanging or reading stale bytes.
+                guard.sender = None;
+                return Err(TransportError::Timeout);
+            }
+        };
 
         let ttfb = t0.elapsed();
 
@@ -192,16 +205,24 @@ impl Http1Pool {
         let headers = res.headers().clone();
         let body = res.into_body();
 
-        let collected = compio::time::timeout(
+        let collected = match compio::time::timeout(
             self.request_timeout.saturating_sub(ttfb).max(Duration::from_millis(1)),
             body.collect(),
         )
         .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| {
-            guard.sender = None;
-            TransportError::Protocol(format!("body: {e}"))
-        })?;
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                guard.sender = None;
+                return Err(TransportError::Protocol(format!("body: {e}")));
+            }
+            Err(_) => {
+                // Body-collection timeout — same reasoning as above. The
+                // body future is cancelled mid-read; invalidate the slot.
+                guard.sender = None;
+                return Err(TransportError::Timeout);
+            }
+        };
 
         let bytes = collected.to_bytes();
         let total = t0.elapsed();
