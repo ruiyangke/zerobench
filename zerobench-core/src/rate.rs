@@ -333,7 +333,11 @@ pub async fn run_open_loop<T: Transport>(
     // heuristic.
     let capacity = (max_conns * 4).max(max_conns + 1);
     let (tx, rx) = flume::bounded::<Token>(capacity);
-    let keepup = KeepupCounter::new();
+    // One keepup counter per scenario, so we can attribute drops back to
+    // the scheduler that saw them. The overall Summary gets the sum.
+    let scenario_keepup: Vec<KeepupCounter> = (0..num_scenarios)
+        .map(|_| KeepupCounter::new())
+        .collect();
     let started_at = Instant::now();
 
     // Spawn one scheduler per non-Saturate scenario.
@@ -345,7 +349,7 @@ pub async fn run_open_loop<T: Transport>(
         let id = i as u16;
         let tx = tx.clone();
         let stop = stop.clone();
-        let keepup = keepup.clone();
+        let keepup = scenario_keepup[i].clone();
         let profile = scenario.rate.clone();
         let h = compio::runtime::spawn(async move {
             run_scheduler(id, profile, tx, started_at, stop, keepup).await;
@@ -393,11 +397,23 @@ pub async fn run_open_loop<T: Transport>(
         }
     }
 
-    // Fold keepup into every task's errors — attribute to task 0 so the
-    // merged Summary reflects the total without double-counting per
-    // scenario.
+    // Fold per-scenario keepup into task 0's slots so that:
+    //   * `Summary::errors.keepup` carries the run-wide total (via the
+    //     task-level counter, summed during merge), and
+    //   * `Summary::per_scenario[i].errors.keepup` carries the
+    //     correctly-attributed per-scenario count.
+    // Attributing to task 0 keeps the count from being multiplied across
+    // every worker's merge.
     if let Some(first) = out.first_mut() {
-        first.errors.keepup += keepup.get();
+        let mut total: u64 = 0;
+        for (i, counter) in scenario_keepup.iter().enumerate() {
+            let n = counter.get();
+            total += n;
+            if let Some(sc) = first.per_scenario.get_mut(i) {
+                sc.errors.keepup += n;
+            }
+        }
+        first.errors.keepup += total;
     }
     out
 }

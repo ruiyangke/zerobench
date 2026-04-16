@@ -209,6 +209,62 @@ async fn open_loop_empty_plan_is_noop() {
 }
 
 #[compio::test]
+async fn open_loop_keepup_is_attributed_per_scenario() {
+    // Two scenarios with wildly different target rates, served by only
+    // one worker with a slow service time. Both schedulers overflow the
+    // channel, but the faster scenario should rack up far more drops.
+    // Verify the per-scenario keepup counts reflect that split.
+    let mut vars = VarRegistry::new();
+    let url_fast = Template::compile("/fast", &mut vars).unwrap();
+    let url_slow = Template::compile("/slow", &mut vars).unwrap();
+    let plan = Plan {
+        scenarios: vec![
+            Scenario {
+                name: "fast".into(),
+                rate: RateProfile::Constant(100_000.0),
+                steps: vec![Step::Request(RequestPlan::get(url_fast))],
+            },
+            Scenario {
+                name: "slow".into(),
+                rate: RateProfile::Constant(1_000.0),
+                steps: vec![Step::Request(RequestPlan::get(url_slow))],
+            },
+        ],
+        vars,
+        duration: Duration::from_millis(300),
+        warmup: None,
+    };
+    let client = FakeClient::new();
+    client.service_time_us.store(500, Ordering::Relaxed);
+    let stop = StopSignal::after(plan.duration);
+
+    let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop).await;
+    let summary = Summary::merge(stats, plan.duration);
+
+    assert_eq!(summary.per_scenario.len(), 2);
+    let fast_keepup = summary.per_scenario[0].errors.keepup;
+    let slow_keepup = summary.per_scenario[1].errors.keepup;
+
+    // The 100k rps scheduler must record dramatically more drops than
+    // the 1k rps scheduler. A 100x rate ratio with the same single
+    // worker should give at least a 10x keepup ratio (generous bound).
+    assert!(
+        fast_keepup > 0,
+        "fast scenario should have keepup drops, got {fast_keepup}"
+    );
+    assert!(
+        fast_keepup > slow_keepup.saturating_mul(10),
+        "fast keepup ({fast_keepup}) should dominate slow keepup ({slow_keepup})"
+    );
+    // The totals should add up to the summary-wide count.
+    assert_eq!(
+        fast_keepup + slow_keepup,
+        summary.errors.keepup,
+        "per-scenario keepup should sum to total"
+    );
+}
+
+#[compio::test]
 async fn open_loop_saturate_scenario_produces_no_tokens() {
     // A plan whose only scenario is Saturate should not be run by the
     // open-loop dispatcher — returns empty stats.
