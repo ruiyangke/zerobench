@@ -77,9 +77,43 @@ async fn spawn_echo_server(body: &'static [u8]) -> std::net::SocketAddr {
     addr
 }
 
-/// Start a server that accepts the connection but intentionally never
-/// reads the request / writes a response. Used to exercise the
-/// request_timeout path.
+/// Echo back the request's path+query in the response body. Lets the
+/// caller inspect which URL each exchange actually issued — used to
+/// verify that template expansion (`{{counter}}`, `{{rand_*}}`) is
+/// producing distinct URLs per exchange.
+async fn spawn_path_echo_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    spawn(async move {
+        loop {
+            let (socket, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            spawn(async move {
+                let io = HyperStream::new(socket);
+                let service = service_fn(move |req: Request<Incoming>| async move {
+                    let path_and_query = req
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| req.uri().path().to_string());
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(path_and_query))))
+                });
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            })
+            .detach();
+        }
+    })
+    .detach();
+
+    addr
+}
+
+/// Respond to *every* request by holding the socket for 60 seconds —
+/// neither reading the request nor writing a response. Exercises the
+/// request_timeout path on the *first* request on a fresh connection.
 async fn spawn_hanging_server() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -269,4 +303,200 @@ async fn zero_max_conns_rejected() {
     };
     let err = Http1Pool::new(&target, &opts).await.expect_err("expected error");
     assert!(matches!(err, TransportError::Connect(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Template expansion through exchange (Fix 7a).
+// ---------------------------------------------------------------------------
+
+#[compio::test]
+async fn template_expansion_produces_distinct_urls_per_exchange() {
+    let addr = spawn_path_echo_server().await;
+    let target = target_for(addr);
+    let opts = TransportOpts {
+        max_conns: 2,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        ..TransportOpts::default()
+    };
+    let pool = Http1Pool::new(&target, &opts).await.expect("pool");
+
+    let mut vars = VarRegistry::new();
+    // {{counter}} emits 0, 1, 2, ... per worker; {{rand_int}} stretches
+    // the expansion path without making assertions flaky (we only check
+    // path shape + the counter, not the rand value).
+    let url_tpl = Template::compile(
+        "/api/{{counter}}?seed={{rand_int:1:100}}",
+        &mut vars,
+    )
+    .expect("compile url");
+    let plan = RequestPlan::get(url_tpl);
+    let mut ctx = ScenarioContext::new(vars.len(), from_seed(42));
+
+    let mut observed_paths: Vec<String> = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let resp = pool.exchange(&plan, &mut ctx).await.expect("exchange");
+        assert_eq!(resp.status, 200);
+        let body = match resp.body {
+            ResponseBody::Buffered(b) => b,
+            _ => panic!("expected buffered body"),
+        };
+        observed_paths.push(String::from_utf8(body.to_vec()).expect("utf-8 path"));
+    }
+
+    // Counter increments per expansion, so the 10 counter values must be
+    // the 10 distinct integers 0..10. Every path must start with /api/N
+    // where N is the counter for that iteration and carries a seed query.
+    for (i, path) in observed_paths.iter().enumerate() {
+        let expected_prefix = format!("/api/{i}?seed=");
+        assert!(
+            path.starts_with(&expected_prefix),
+            "iter {i}: expected prefix {expected_prefix:?}, got {path:?}"
+        );
+    }
+    // And every path is distinct (the counter already guarantees this,
+    // but assert it explicitly to catch the case where expansion is
+    // accidentally cached or URL rewriting strips the counter).
+    let mut unique = observed_paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 10, "expected 10 distinct paths");
+}
+
+// ---------------------------------------------------------------------------
+// max_conns = 1 with concurrent requests (Fix 7b).
+// ---------------------------------------------------------------------------
+
+#[compio::test]
+async fn max_conns_one_serializes_concurrent_exchanges() {
+    let addr = spawn_echo_server(b"pong").await;
+    let target = target_for(addr);
+    let opts = TransportOpts {
+        max_conns: 1,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(5),
+        ..TransportOpts::default()
+    };
+    let pool = Arc::new(Http1Pool::new(&target, &opts).await.expect("pool"));
+    assert_eq!(pool.len(), 1);
+
+    let mut vars = VarRegistry::new();
+    let plan = url_plan("/health", &mut vars);
+    let num_vars = vars.len();
+
+    // 10 concurrent exchanges on a single-slot pool. The round-robin
+    // try_lock loop will fail on the one slot, and the .lock().await
+    // fallback kicks in — exactly the path this test exercises.
+    let mut futs = Vec::with_capacity(10);
+    for seed in 0..10u64 {
+        let pool = pool.clone();
+        let plan = plan.clone();
+        futs.push(async move {
+            let mut ctx = ScenarioContext::new(num_vars, from_seed(seed));
+            pool.exchange(&plan, &mut ctx).await
+        });
+    }
+
+    let results = futures_util::future::join_all(futs).await;
+    for (i, r) in results.into_iter().enumerate() {
+        let resp = r.unwrap_or_else(|e| panic!("exchange {i} failed: {e:?}"));
+        assert_eq!(resp.status, 200);
+        match resp.body {
+            ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"pong"),
+            _ => panic!("expected buffered body"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot invalidation after timeout (Fix 7c — covers Fix 2 behaviour).
+// ---------------------------------------------------------------------------
+
+#[compio::test]
+async fn slot_is_invalidated_after_timeout() {
+    // Single-slot pool against a never-responding server. The first
+    // exchange times out; the next exchange on the same slot must
+    // surface a clean error (not hang, not panic) because the slot's
+    // sender was nulled out by the timeout branch.
+    let addr = spawn_hanging_server().await;
+    let target = target_for(addr);
+    let opts = TransportOpts {
+        max_conns: 1,
+        connect_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_millis(200),
+        ..TransportOpts::default()
+    };
+
+    let pool = Http1Pool::new(&target, &opts).await.expect("pool");
+    let mut vars = VarRegistry::new();
+    let plan = url_plan("/", &mut vars);
+    let mut ctx = ScenarioContext::new(vars.len(), from_seed(1));
+
+    // First exchange: times out.
+    let err1 = pool.exchange(&plan, &mut ctx).await.expect_err("timeout");
+    assert!(
+        matches!(err1, TransportError::Timeout),
+        "expected Timeout, got {err1:?}"
+    );
+
+    // Second exchange: slot was invalidated (guard.sender = None), so we
+    // must surface a *fast*, well-typed error — not hang waiting on a
+    // dead connection. v0.0.1 does not lazy-reconnect; TransportError::
+    // Connect ("slot N unavailable") is the documented behaviour.
+    let t0 = std::time::Instant::now();
+    let err2 = pool
+        .exchange(&plan, &mut ctx)
+        .await
+        .expect_err("slot should be dead");
+    let elapsed = t0.elapsed();
+
+    assert!(
+        matches!(err2, TransportError::Connect(_)),
+        "after a timeout, subsequent exchanges should fail with Connect (slot invalidated); got {err2:?}"
+    );
+    // If we accidentally tried to reuse the dead sender, the test would
+    // hang on compio::time::timeout; assert that we returned promptly.
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "second exchange should fail immediately, took {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transport trait impl (Fix 8).
+// ---------------------------------------------------------------------------
+
+#[compio::test]
+async fn transport_trait_build_client_and_exchange() {
+    use zerobench_core::Transport;
+    use zerobench_http::HttpTransport;
+
+    // Exercises HttpTransport through the Transport trait rather than
+    // the inherent Http1Pool API — covers the trait wiring that the
+    // dispatcher will use in Phase C.
+    let addr = spawn_echo_server(b"trait-ok").await;
+    let target = target_for(addr);
+    let opts = TransportOpts {
+        max_conns: 2,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        ..TransportOpts::default()
+    };
+
+    let client = <HttpTransport as Transport>::build_client(&target, &opts)
+        .await
+        .expect("build_client");
+
+    let mut vars = VarRegistry::new();
+    let plan = url_plan("/trait", &mut vars);
+    let mut ctx = ScenarioContext::new(vars.len(), from_seed(7));
+
+    let resp = <HttpTransport as Transport>::exchange(&client, &plan, &mut ctx)
+        .await
+        .expect("exchange");
+    assert_eq!(resp.status, 200);
+    match resp.body {
+        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"trait-ok"),
+        _ => panic!("expected buffered body"),
+    }
 }
