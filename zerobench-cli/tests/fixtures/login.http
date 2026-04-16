@@ -1,0 +1,7 @@
+# Sample login request. Used as a fixture for multi-scenario tests.
+POST /login HTTP/1.1
+Host: example.com
+Content-Type: application/json
+X-Run: {{uuid}}
+
+{"user":"alice","password":"{{rand_hex:16}}"}

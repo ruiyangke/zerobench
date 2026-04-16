@@ -1,0 +1,7 @@
+[[scenario]]
+file = "login.http"
+weight = 0.1
+
+[[scenario]]
+file = "browse.http"
+weight = 0.9

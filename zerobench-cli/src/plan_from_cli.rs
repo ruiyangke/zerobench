@@ -1,9 +1,9 @@
 //! Convert a parsed [`CliArgs`] into a runnable
 //! ([`Plan`], [`Target`], [`TransportOpts`]) triple.
 //!
-//! The conversion is pure — no IO beyond an optional `--body-file`
-//! read — which makes it easy to unit-test without standing up a
-//! runtime.
+//! The conversion is pure — no IO beyond optional `--body-file` /
+//! `--request-file` / `--requests` reads — which makes it easy to
+//! unit-test without standing up a runtime.
 
 use std::fs;
 
@@ -11,6 +11,9 @@ use http::Method;
 use smallvec::SmallVec;
 use zerobench_core::plan::{
     Assertion, BodySource, Plan, RateProfile, RequestPlan, Scenario, Step,
+};
+use zerobench_core::request_file::{
+    parse_request_bytes, parse_scenario_dir, RequestFileError,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TargetError, TransportOpts};
@@ -32,6 +35,10 @@ pub enum BuildError {
     InvalidMethod(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("request file: {0}")]
+    RequestFile(#[from] RequestFileError),
+    #[error("either a URL, --request-file, or --requests is required")]
+    MissingInput,
 }
 
 // ---------------------------------------------------------------------------
@@ -39,10 +46,14 @@ pub enum BuildError {
 // ---------------------------------------------------------------------------
 
 /// Build a runnable plan + connection target + transport opts.
+///
+/// Three input modes:
+/// 1. Positional URL — the Phase C path; one scenario, one request.
+/// 2. `--request-file PATH` — parse a single `.http` file; one scenario.
+/// 3. `--requests DIR` — parse every `.http` file in the directory;
+///    one scenario per file, weighted per `scenarios.toml`.
 pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError> {
-    let target = Target::parse(&args.url)?;
-
-    // Transport opts.
+    // Transport opts are shared across all input modes.
     let opts = TransportOpts {
         connect_timeout: args.connect_timeout,
         request_timeout: args.request_timeout,
@@ -50,6 +61,28 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         tcp_nodelay: true,
         insecure_tls: args.insecure,
     };
+
+    if let Some(path) = &args.request_file {
+        return build_from_request_file(args, &opts, path);
+    }
+    if let Some(dir) = &args.requests {
+        return build_from_request_dir(args, &opts, dir);
+    }
+
+    let url = args.url.as_deref().ok_or(BuildError::MissingInput)?;
+    build_from_url(args, &opts, url)
+}
+
+// ---------------------------------------------------------------------------
+// Single-URL mode (Phase C classic behaviour)
+// ---------------------------------------------------------------------------
+
+fn build_from_url(
+    args: &CliArgs,
+    opts: &TransportOpts,
+    url: &str,
+) -> Result<(Plan, Target, TransportOpts), BuildError> {
+    let target = Target::parse(url)?;
 
     // HTTP method — infer POST if the user passed a body but no -X.
     let method_raw = if args.body.is_some() || args.body_file.is_some() {
@@ -68,7 +101,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
 
     // Build the registry + URL template.
     let mut vars = VarRegistry::new();
-    let url_tpl = Template::compile(&args.url, &mut vars)?;
+    let url_tpl = Template::compile(url, &mut vars)?;
 
     // Headers — both sides through the template engine.
     let mut headers: SmallVec<[(Template, Template); 8]> = SmallVec::new();
@@ -88,18 +121,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         None
     };
 
-    // Assertions.
-    let mut checks: Vec<Assertion> = Vec::new();
-    if let Some(code) = args.expect_status {
-        checks.push(Assertion::StatusEq(code));
-    }
-    if let Some(list) = &args.expect_status_in {
-        let mut codes: SmallVec<[u16; 4]> = SmallVec::new();
-        for c in &list.0 {
-            codes.push(*c);
-        }
-        checks.push(Assertion::StatusIn(codes));
-    }
+    let checks = build_checks(args);
 
     let request = RequestPlan {
         method,
@@ -110,22 +132,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         checks,
     };
 
-    // Rate profile.
-    let rate = if args.saturate {
-        RateProfile::Saturate {
-            max_concurrency: args.connections,
-        }
-    } else if let Some(rps) = args.rate {
-        RateProfile::Constant(rps)
-    } else {
-        // No mode given — default to saturate for a zero-flag
-        // invocation (`zerobench URL`). This is consistent with how
-        // wrk/hey behave; the user can ask for open-loop with `-r`.
-        RateProfile::Saturate {
-            max_concurrency: args.connections,
-        }
-    };
-
+    let rate = pick_rate_profile(args, 1.0);
     let scenario = Scenario {
         name: "cli".into(),
         rate,
@@ -139,7 +146,167 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         warmup: None,
     };
 
-    Ok((plan, target, opts))
+    Ok((plan, target, opts.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Single .http file mode
+// ---------------------------------------------------------------------------
+
+fn build_from_request_file(
+    args: &CliArgs,
+    opts: &TransportOpts,
+    path: &std::path::Path,
+) -> Result<(Plan, Target, TransportOpts), BuildError> {
+    let bytes = fs::read(path)?;
+    let source_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("request-file");
+
+    let mut vars = VarRegistry::new();
+    let parsed = parse_request_bytes(&bytes, source_name, &mut vars)?;
+    let target = parsed.target.clone();
+
+    let checks = build_checks(args);
+
+    let request = RequestPlan {
+        method: parsed.method,
+        url: parsed.url,
+        headers: parsed.headers,
+        body: parsed.body,
+        extract: Vec::new(),
+        checks,
+    };
+
+    let rate = pick_rate_profile(args, 1.0);
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("request")
+        .to_string();
+    let scenario = Scenario {
+        name,
+        rate,
+        steps: vec![Step::Request(request)],
+    };
+    let plan = Plan {
+        scenarios: vec![scenario],
+        vars,
+        duration: args.duration,
+        warmup: None,
+    };
+
+    Ok((plan, target, opts.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Directory-of-.http mode
+// ---------------------------------------------------------------------------
+//
+// Design choice for `--saturate` + `--requests`:
+//   - Each scenario shares the same connection pool (i.e. every
+//     scenario gets `RateProfile::Saturate { max_concurrency: -c }`).
+//     Workers pick a scenario at random (Phase C uniform selection);
+//     this means the effective per-scenario share is ~equal across
+//     scenarios, independent of weights.
+//   - The weights matter for open-loop (`-r TOTAL`) mode where each
+//     scenario's rate = `TOTAL * weight`.
+//
+// The alternative — split the saturate pool by weight — was rejected
+// because it makes the user's `-c N` flag mean something different
+// from "N concurrent connections total"; that invariant is more
+// valuable than proportional scenario mixing under saturate.
+fn build_from_request_dir(
+    args: &CliArgs,
+    opts: &TransportOpts,
+    dir: &std::path::Path,
+) -> Result<(Plan, Target, TransportOpts), BuildError> {
+    let entries = parse_scenario_dir(dir)?;
+    if entries.is_empty() {
+        return Err(BuildError::MissingInput);
+    }
+
+    let checks = build_checks(args);
+    let mut vars = VarRegistry::new();
+    let mut scenarios: Vec<Scenario> = Vec::with_capacity(entries.len());
+    let mut target_from_first: Option<Target> = None;
+
+    for entry in &entries {
+        let bytes = fs::read(&entry.file)?;
+        let source_name = entry
+            .file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("request-file");
+        let parsed = parse_request_bytes(&bytes, source_name, &mut vars)?;
+
+        if target_from_first.is_none() {
+            target_from_first = Some(parsed.target.clone());
+        }
+
+        let request = RequestPlan {
+            method: parsed.method,
+            url: parsed.url,
+            headers: parsed.headers,
+            body: parsed.body,
+            extract: Vec::new(),
+            checks: checks.clone(),
+        };
+        let rate = pick_rate_profile(args, entry.weight as f64);
+        scenarios.push(Scenario {
+            name: entry.name.clone(),
+            rate,
+            steps: vec![Step::Request(request)],
+        });
+    }
+
+    let target = target_from_first.expect("at least one scenario");
+    let plan = Plan {
+        scenarios,
+        vars,
+        duration: args.duration,
+        warmup: None,
+    };
+    Ok((plan, target, opts.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn build_checks(args: &CliArgs) -> Vec<Assertion> {
+    let mut checks: Vec<Assertion> = Vec::new();
+    if let Some(code) = args.expect_status {
+        checks.push(Assertion::StatusEq(code));
+    }
+    if let Some(list) = &args.expect_status_in {
+        let mut codes: SmallVec<[u16; 4]> = SmallVec::new();
+        for c in &list.0 {
+            codes.push(*c);
+        }
+        checks.push(Assertion::StatusIn(codes));
+    }
+    checks
+}
+
+/// Pick a rate profile for a scenario whose weight is `weight` in
+/// `[0, 1]` (for single-scenario invocations, `weight = 1.0`).
+fn pick_rate_profile(args: &CliArgs, weight: f64) -> RateProfile {
+    if args.saturate {
+        // Every scenario shares the same concurrency pool; see the
+        // module-level comment.
+        RateProfile::Saturate {
+            max_concurrency: args.connections,
+        }
+    } else if let Some(total_rps) = args.rate {
+        RateProfile::Constant(total_rps * weight)
+    } else {
+        // No mode given — default to saturate.
+        RateProfile::Saturate {
+            max_concurrency: args.connections,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

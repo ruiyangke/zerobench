@@ -1,0 +1,4 @@
+GET /browse?page=1 HTTP/1.1
+Host: example.com
+Accept: application/json
+

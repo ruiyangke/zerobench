@@ -235,3 +235,60 @@ fn cli_rate_flag_runs_open_loop_and_reports_rate() {
     );
 }
 
+/// Write a `.http` fixture whose Host line includes `addr`. Returns the
+/// path to a tempfile that the caller should pass to `--request-file`.
+fn write_request_fixture(addr: std::net::SocketAddr) -> std::path::PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "zerobench-cli-simple-{pid}-{nanos}.http"
+    ));
+    let body = format!(
+        "GET /ping HTTP/1.1\r\nHost: {addr}\r\nAccept: text/plain\r\n\r\n"
+    );
+    std::fs::write(&path, body).expect("write fixture");
+    path
+}
+
+#[test]
+fn cli_request_file_against_local_server_succeeds() {
+    let addr = spawn_server(200, b"pong");
+    let fixture = write_request_fixture(addr);
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--request-file",
+            fixture.to_str().unwrap(),
+            "--saturate",
+            "-c",
+            "1",
+            "-d",
+            "500ms",
+            "--color",
+            "never",
+        ])
+        .output()
+        .expect("run zerobench");
+
+    // Delete fixture before assertion so a failed test doesn't leak.
+    let _ = std::fs::remove_file(&fixture);
+
+    assert!(
+        out.status.success(),
+        "zerobench --request-file failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // We should have completed at least one request against the local
+    // server — "actual rate" line must not report 0.0.
+    assert!(
+        !stdout.contains("actual rate    0.0"),
+        "expected non-zero rate, got:\n{stdout}"
+    );
+}
+

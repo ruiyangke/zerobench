@@ -18,8 +18,22 @@ use clap::{ArgAction, Parser, ValueEnum};
     about = "Fast, correct HTTP benchmarking — open-loop, HDR-precise, io_uring-native"
 )]
 pub struct CliArgs {
-    /// Target URL.
-    pub url: String,
+    /// Target URL. Optional when `--request-file` or `--requests` is
+    /// passed — the URL is derived from the `.http` file's Host header
+    /// (or from an absolute URL in the request line).
+    pub url: Option<String>,
+
+    /// Parse a single `.http` request file (curl `--trace-ascii` format).
+    /// Mutually exclusive with `--requests` and with providing a URL
+    /// positional argument.
+    #[arg(long = "request-file", conflicts_with = "requests")]
+    pub request_file: Option<PathBuf>,
+
+    /// Parse every `*.http` in the given directory as a scenario. An
+    /// optional `scenarios.toml` in the same directory assigns per-
+    /// scenario weights; when absent, weights are equal.
+    #[arg(long = "requests", conflicts_with = "request_file")]
+    pub requests: Option<PathBuf>,
 
     /// Max concurrent connections / worker tasks (closed-loop) or
     /// pool ceiling (open-loop).
@@ -37,7 +51,7 @@ pub struct CliArgs {
     pub saturate: bool,
 
     /// Open-loop target rate in req/s (e.g. `100`, `10k`, `1.5k`).
-    /// Mutually exclusive with `--saturate`. Task 10 wires this flag.
+    /// Mutually exclusive with `--saturate`.
     #[arg(short = 'r', long = "rate", value_parser = parse_rate_flag)]
     pub rate: Option<f64>,
 
@@ -106,7 +120,9 @@ pub enum CliColor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliFormat {
+    /// Human-readable summary (default).
     Terminal,
+    /// Full JSON summary written at end-of-run.
     Json,
 }
 
@@ -277,7 +293,36 @@ mod tests {
         assert!(args.saturate);
         assert_eq!(args.connections, 10);
         assert_eq!(args.duration, Duration::from_secs(5));
-        assert_eq!(args.url, "http://127.0.0.1:1234/");
+        assert_eq!(args.url.as_deref(), Some("http://127.0.0.1:1234/"));
+    }
+
+    #[test]
+    fn args_request_file_implies_no_url_needed() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--request-file",
+            "/tmp/foo.http",
+            "--saturate",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.request_file.as_deref().unwrap().to_str(),
+            Some("/tmp/foo.http"),
+        );
+        assert!(args.url.is_none());
+    }
+
+    #[test]
+    fn args_requests_dir_mutex_with_request_file() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--request-file",
+            "/tmp/a.http",
+            "--requests",
+            "/tmp/dir",
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot be used"));
     }
 
     #[test]

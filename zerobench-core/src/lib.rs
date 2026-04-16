@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod plan;
 pub mod rate;
 pub mod report;
+pub mod request_file;
 pub mod rng;
 pub mod scenario_context;
 pub mod stats;
@@ -21,6 +22,10 @@ pub use plan::{
 };
 pub use rate::{run_open_loop, run_scheduler, KeepupCounter, Token};
 pub use report::{print_json, print_terminal, ColorChoice};
+pub use request_file::{
+    parse_request_bytes, parse_request_file, parse_scenario_dir, ParsedRequest,
+    RequestFileError, ScenarioEntry,
+};
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
 pub use stats::{ErrorCounters, ErrorKind, ScenarioStats, Summary, TaskStats};
