@@ -24,11 +24,10 @@
 //!
 //! # Terminal restoration
 //!
-//! [`run_tui`] installs a panic hook on entry and restores it on exit.
-//! If anything panics mid-run the hook invokes the ratatui-provided
-//! `restore` before re-raising, so the user's terminal isn't left in
-//! raw-mode/alt-screen. On a clean exit the hook is swapped out before
-//! we ourselves restore the terminal.
+//! [`ratatui::try_init`] installs its own panic hook that calls
+//! `restore` before re-raising — so the user's terminal isn't left in
+//! raw-mode/alt-screen on a panic. On a clean exit we call
+//! [`ratatui::restore`] ourselves from the outer wrapper.
 
 pub mod state;
 pub mod ui;
@@ -74,25 +73,14 @@ pub async fn run_tui(
     total_duration: Duration,
     url_label: String,
 ) -> io::Result<()> {
-    // Install our panic hook *before* switching the terminal into
-    // raw+alt-screen, so any panic during setup also restores.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|info| {
-        // `ratatui::restore` prints any error to stderr but does not
-        // panic itself — exactly what we want from a panic hook.
-        ratatui::restore();
-        // Re-print with the standard formatter so cargo-test /
-        // bin-main still see a normal panic line.
-        eprintln!("{info}");
-    }));
-
+    // `ratatui::try_init` installs its own panic hook that invokes
+    // `restore()` before the previous hook runs, so a mid-run panic
+    // leaves the terminal usable without any extra plumbing here.
     let result = run_tui_inner(snapshot, stop, target_rate, total_duration, url_label).await;
 
-    // Always restore, even if the run errored. Then put the user's
-    // original panic hook back so subsequent panics aren't silently
-    // swallowed by ours.
+    // Clean-exit restore. Ratatui's own panic hook handles the crash
+    // path.
     ratatui::restore();
-    std::panic::set_hook(prev_hook);
 
     result
 }
@@ -165,12 +153,10 @@ async fn run_tui_inner(
         }
     }
 
-    // Drain one final tick so any samples that came in after the last
-    // swap aren't lost. We don't render again — the outer caller will
-    // print the standard terminal report.
-    let tick = snapshot.swap_and_snapshot();
-    state.ingest(tick);
-
+    // No final drain: `LiveSnapshot` is only for live display. The
+    // authoritative counters live in `TaskStats` via the dispatcher
+    // path; the outer caller prints the standard terminal report from
+    // those.
     Ok(())
 }
 
