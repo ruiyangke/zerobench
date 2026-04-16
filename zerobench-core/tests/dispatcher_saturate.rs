@@ -12,8 +12,6 @@
 //! the HTTP crate's compile-test surface. One real-HTTP smoke test
 //! lives in `zerobench-cli/tests/cli_smoke.rs` (Task 9).
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -384,13 +382,3 @@ async fn saturate_pause_step_slows_throughput() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Use-count sanity — suppress unused-crate warnings from Rc/Cell imports.
-// These are not referenced by tests above, but keeping the imports in the
-// header block keeps the test file shape consistent with future tests
-// that will need a single-threaded shared handle (Task 10).
-// ---------------------------------------------------------------------------
-#[allow(dead_code)]
-fn _shape_check() {
-    let _ = Rc::new(Cell::new(0u64));
-}
