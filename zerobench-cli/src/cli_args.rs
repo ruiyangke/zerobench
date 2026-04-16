@@ -114,6 +114,22 @@ pub struct CliArgs {
     /// mismatch). No-op for http:// targets.
     #[arg(short = 'k', long = "insecure", action = ArgAction::SetTrue)]
     pub insecure: bool,
+
+    /// Preferred HTTP protocol version.
+    ///
+    /// - `auto` (default): HTTP → H1; HTTPS → ALPN-negotiated (resolves
+    ///   to H1 until TLS wiring is complete).
+    /// - `h1`: always HTTP/1.1.
+    /// - `h2`: always HTTP/2. Requires the binary to be built with the
+    ///   `h2` feature; otherwise the run exits with a clear error.
+    ///
+    /// With `-c N` the meaning of `N` depends on the version picked:
+    /// for H1, `N` is the number of pre-opened TCP connections; for H2,
+    /// `N` is the number of concurrent streams multiplexed over a single
+    /// connection.
+    #[arg(long = "http-version", value_enum,
+          default_value_t = CliHttpVersion::Auto)]
+    pub http_version: CliHttpVersion,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +141,22 @@ pub enum CliColor {
     Always,
     Auto,
     Never,
+}
+
+/// Surface name for `zerobench_core::HttpVersionPref`.
+///
+/// Kept as its own enum rather than re-using the core one because clap's
+/// `ValueEnum` derive needs to own the type (coherence rules), and we
+/// also want the CLI surface to be stable even if the core enum grows
+/// new variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliHttpVersion {
+    /// Let the transport decide (default).
+    Auto,
+    /// Force HTTP/1.1.
+    H1,
+    /// Force HTTP/2. Requires the `h2` feature.
+    H2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

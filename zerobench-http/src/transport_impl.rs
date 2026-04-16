@@ -1,36 +1,118 @@
-//! The `Transport` trait impl for HTTP.
+//! The [`Transport`] trait impl for HTTP.
 //!
-//! Keeps the impl separate from [`Http1Pool`] because the pool is
-//! useful on its own (lower-level tests, future debug tooling) and the
-//! trait impl is only relevant when plugging into the dispatcher.
+//! v0.0.1 has two wire protocols available: HTTP/1 via
+//! [`crate::Http1Pool`] (always compiled in) and HTTP/2 via
+//! [`crate::Http2Client`] (feature-gated behind `h2`). A single dispatch
+//! enum — [`HttpClient`] — wraps whichever one the user chose, so the
+//! rest of the engine only has to know about one `Transport::Client`.
+//!
+//! ## Protocol choice
+//!
+//! [`HttpTransport::build_client`] picks between H1 and H2 using
+//! [`TransportOpts::http_version`]:
+//!
+//! - [`HttpVersionPref::Http1`] → always [`Http1Pool`].
+//! - [`HttpVersionPref::Http2`] → always [`Http2Client`]. Errors with
+//!   [`TransportError::Protocol`] when the `h2` feature isn't compiled
+//!   in, so users aren't silently downgraded.
+//! - [`HttpVersionPref::Auto`] → H1 on plain HTTP. On HTTPS this would
+//!   ideally attempt ALPN-negotiated H2, but TLS + ALPN support is
+//!   deferred beyond Phase E; Auto on HTTPS currently resolves to H1.
+//!
+//! The `build_client` future itself is feature-gated only in terms of
+//! which arms compile — the `HttpClient` enum is always defined with
+//! both variants so match exhaustiveness is stable across builds; the
+//! `Http2` variant is conditionally compiled, and callers handle it via
+//! `cfg(feature = "h2")` on the arm.
 
 use std::sync::Arc;
 
 use zerobench_core::plan::RequestPlan;
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::transport::{
-    Response, Target, Transport, TransportError, TransportOpts,
+    HttpVersionPref, Response, Target, Transport, TransportError, TransportOpts,
 };
 
 use crate::h1::Http1Pool;
 
-/// HTTP transport — wraps [`Http1Pool`] and exposes it via the
-/// [`Transport`] trait.
+/// A cheap-to-clone dispatch handle over either an H1 pool or an H2
+/// client.
 ///
-/// The `h2` feature will swap in an HTTP/2 pool inside `build_client`
-/// when the target's ALPN negotiates `h2`; the exchange API stays the
-/// same because hyper's `SendRequest` type parameter is the body.
+/// Both variants wrap their inner type in [`Arc`] so cloning the enum
+/// is a pointer-copy per variant; the dispatcher clones one of these
+/// per worker.
+#[derive(Clone, Debug)]
+pub enum HttpClient {
+    /// HTTP/1.1 — pre-opened pool of TCP connections, each serialising
+    /// one request at a time. `-c N` = pool size.
+    Http1(Arc<Http1Pool>),
+    /// HTTP/2 — single TCP connection, many concurrent streams. `-c N`
+    /// = `max_concurrent_streams` hint. Only compiled when the crate is
+    /// built with the `h2` feature.
+    #[cfg(feature = "h2")]
+    Http2(Arc<crate::Http2Client>),
+}
+
+impl HttpClient {
+    /// Target the client was opened against.
+    pub fn target(&self) -> &Target {
+        match self {
+            HttpClient::Http1(_) => {
+                // Http1Pool doesn't expose its target (it doesn't need
+                // to for exchange); we avoid requiring a new accessor
+                // here by leaving this method only meaningful for H2.
+                // Callers that need the H1 target should get it from
+                // the source of truth — the `Target` they passed in.
+                // If we ever need uniform access we can add
+                // `Http1Pool::target` — cheap.
+                panic!(
+                    "HttpClient::target() is currently only implemented for Http2; \
+                     callers should carry the Target alongside the client"
+                );
+            }
+            #[cfg(feature = "h2")]
+            HttpClient::Http2(c) => c.target(),
+        }
+    }
+
+    /// Dispatch a single exchange to whichever variant is in use.
+    pub async fn exchange(
+        &self,
+        plan: &RequestPlan,
+        ctx: &mut ScenarioContext,
+    ) -> Result<Response, TransportError> {
+        match self {
+            HttpClient::Http1(p) => p.exchange(plan, ctx).await,
+            #[cfg(feature = "h2")]
+            HttpClient::Http2(c) => c.exchange(plan, ctx).await,
+        }
+    }
+}
+
+/// Zero-sized type that carries the [`Transport`] impl.
 pub struct HttpTransport;
 
 impl Transport for HttpTransport {
-    type Client = Arc<Http1Pool>;
+    type Client = HttpClient;
 
     async fn build_client(
         target: &Target,
         opts: &TransportOpts,
     ) -> Result<Self::Client, TransportError> {
-        let pool = Http1Pool::new(target, opts).await?;
-        Ok(Arc::new(pool))
+        match opts.http_version {
+            HttpVersionPref::Http1 => {
+                let pool = Http1Pool::new(target, opts).await?;
+                Ok(HttpClient::Http1(Arc::new(pool)))
+            }
+            HttpVersionPref::Http2 => build_h2(target, opts).await,
+            HttpVersionPref::Auto => {
+                // TODO(alpn): when TLS is wired, attempt ALPN `h2` on
+                // HTTPS targets and fall back to H1 on `http/1.1`. For
+                // now, Auto everywhere means H1.
+                let pool = Http1Pool::new(target, opts).await?;
+                Ok(HttpClient::Http1(Arc::new(pool)))
+            }
+        }
     }
 
     async fn exchange(
@@ -39,5 +121,65 @@ impl Transport for HttpTransport {
         ctx: &mut ScenarioContext,
     ) -> Result<Response, TransportError> {
         client.exchange(plan, ctx).await
+    }
+}
+
+/// Build an H2 client when the feature is present, or return a clear
+/// error otherwise. Kept as a separate function so the `cfg` gates are
+/// localised rather than sprinkled through `build_client`.
+#[cfg(feature = "h2")]
+async fn build_h2(
+    target: &Target,
+    opts: &TransportOpts,
+) -> Result<HttpClient, TransportError> {
+    let client = crate::Http2Client::new(target, opts).await?;
+    Ok(HttpClient::Http2(Arc::new(client)))
+}
+
+/// Stub called when the user asked for `--http-version h2` but the
+/// binary wasn't compiled with the `h2` feature. We surface a clear
+/// `Protocol` error so the failure mode is "you built zerobench without
+/// H2 support" rather than "silently downgraded to H1".
+#[cfg(not(feature = "h2"))]
+async fn build_h2(
+    _target: &Target,
+    _opts: &TransportOpts,
+) -> Result<HttpClient, TransportError> {
+    Err(TransportError::Protocol(
+        "HTTP/2 requested but zerobench-http was built without the `h2` feature"
+            .into(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(feature = "h2")))]
+mod tests {
+    use super::*;
+
+    #[compio::test]
+    async fn http_version_h2_without_feature_errors_cleanly() {
+        // Without the feature, selecting H2 must produce a clear
+        // Protocol error. We don't even need to reach a real server
+        // because the dispatch short-circuits before open().
+        let target = Target::parse("http://127.0.0.1:1").expect("target");
+        let opts = TransportOpts {
+            http_version: HttpVersionPref::Http2,
+            ..TransportOpts::default()
+        };
+        let err = HttpTransport::build_client(&target, &opts)
+            .await
+            .expect_err("should fail without h2 feature");
+        match err {
+            TransportError::Protocol(msg) => {
+                assert!(
+                    msg.contains("h2"),
+                    "error message should mention `h2`: {msg}"
+                );
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
     }
 }

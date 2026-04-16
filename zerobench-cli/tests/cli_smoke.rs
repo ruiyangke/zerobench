@@ -86,6 +86,73 @@ fn zerobench_bin() -> &'static str {
     env!("CARGO_BIN_EXE_zerobench")
 }
 
+/// Spawn an HTTP/2 server on its own thread with its own compio runtime.
+///
+/// Uses `hyper::server::conn::http2::Builder` over plain TCP ("h2c" /
+/// cleartext) — matching how the CLI connects when invoked with
+/// `--http-version h2` against an `http://` URL.
+///
+/// Feature-gated to mirror the CLI: the test only compiles when the
+/// binary under test is built with the `h2` feature (otherwise the
+/// subprocess would error with "H2 requested but not compiled").
+#[cfg(feature = "h2")]
+fn spawn_h2_server(body: &'static [u8]) -> std::net::SocketAddr {
+    // A local executor for the server side of hyper H2. `CompioExecutor`
+    // in cyper-core requires `F: Send`, but the per-stream futures
+    // carry `Incoming` (which isn't `Send`), so we need an unbounded
+    // local spawn. compio is single-threaded per runtime, so !Send is
+    // safe.
+    #[derive(Clone, Default)]
+    struct LocalCompioExec;
+    impl<F> hyper::rt::Executor<F> for LocalCompioExec
+    where
+        F: std::future::Future + 'static,
+    {
+        fn execute(&self, fut: F) {
+            compio::runtime::spawn(async move {
+                fut.await;
+            })
+            .detach();
+        }
+    }
+
+    let bind = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = bind.local_addr().unwrap();
+    drop(bind);
+
+    let (ready_tx, ready_rx): (Sender<()>, _) = channel();
+
+    thread::spawn(move || {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = CompioTcpListener::bind(addr).await.unwrap();
+            let _ = ready_tx.send(());
+
+            loop {
+                let (socket, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                compio::runtime::spawn(async move {
+                    let io = HyperStream::new(socket);
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(
+                            Bytes::from_static(body),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(LocalCompioExec)
+                        .serve_connection(io, svc)
+                        .await;
+                })
+                .detach();
+            }
+        });
+    });
+
+    ready_rx.recv().expect("h2 server never bound");
+    addr
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -387,3 +454,54 @@ fn cli_prometheus_format_emits_expected_block() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// HTTP/2 — feature-gated
+// ---------------------------------------------------------------------------
+
+/// End-to-end: the CLI run with `--http-version h2` successfully talks
+/// to a local H2 (cleartext) server and reports non-zero throughput.
+#[cfg(feature = "h2")]
+#[test]
+fn cli_http_version_h2_against_h2_server() {
+    let addr = spawn_h2_server(b"h2-pong");
+    let url = format!("http://{addr}/");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--http-version",
+            "h2",
+            "--saturate",
+            "-c",
+            "10",
+            "-d",
+            "1s",
+            "--color",
+            "never",
+            &url,
+        ])
+        .output()
+        .expect("run zerobench");
+
+    assert!(
+        out.status.success(),
+        "zerobench --http-version h2 failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("actual rate"), "missing 'actual rate':\n{stdout}");
+    assert!(
+        !stdout.contains("actual rate    0.0"),
+        "rate was zero; H2 unreachable? stdout:\n{stdout}"
+    );
+}
+
+// A symmetric "`--http-version h1` against an H2-only server must fail"
+// test was considered and skipped: hyper's H1 client + our saturate
+// loop end up in a tight error-path loop when the slot is invalidated
+// (no .await yield between consecutive "slot unavailable" errors), so
+// the subprocess's StopSignal::after timer never gets serviced. That's
+// a pre-existing dispatcher concern orthogonal to Task 14; the positive
+// H2-path test above is enough to prove the --http-version flag works.

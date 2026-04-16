@@ -36,6 +36,7 @@ pub use stats::{ErrorCounters, ErrorKind, ScenarioStats, Summary, TaskStats};
 pub use stop::StopSignal;
 pub use template::{ExpandCtx, Template, TemplateError};
 pub use transport::{
-    Response, ResponseBody, Target, TargetError, Transport, TransportError, TransportOpts,
+    HttpVersionPref, Response, ResponseBody, Target, TargetError, Transport, TransportError,
+    TransportOpts,
 };
 pub use var::{VarError, VarRegistry, VarSlot};

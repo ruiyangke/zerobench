@@ -45,7 +45,7 @@ thiserror = { workspace = true }
 yansi = { workspace = true }
 
 [dev-dependencies]
-hyper = { workspace = true, features = ["http1", "server"] }
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 cyper-core = { workspace = true }

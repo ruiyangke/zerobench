@@ -16,10 +16,10 @@ use zerobench_core::request_file::{
     parse_request_bytes, parse_scenario_dir, RequestFileError,
 };
 use zerobench_core::template::Template;
-use zerobench_core::transport::{Target, TargetError, TransportOpts};
+use zerobench_core::transport::{HttpVersionPref, Target, TargetError, TransportOpts};
 use zerobench_core::var::VarRegistry;
 
-use crate::cli_args::CliArgs;
+use crate::cli_args::{CliArgs, CliHttpVersion};
 
 // ---------------------------------------------------------------------------
 // Error
@@ -66,6 +66,11 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         max_conns: args.connections,
         tcp_nodelay: true,
         insecure_tls: args.insecure,
+        http_version: match args.http_version {
+            CliHttpVersion::Auto => HttpVersionPref::Auto,
+            CliHttpVersion::H1 => HttpVersionPref::Http1,
+            CliHttpVersion::H2 => HttpVersionPref::Http2,
+        },
     };
 
     if let Some(path) = &args.request_file {
@@ -538,6 +543,39 @@ mod tests {
             }
             other => panic!("expected MultipleHosts, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_default_http_version_is_auto() {
+        let args = parse(&["zerobench", "--saturate", "http://h:1/"]);
+        let (_plan, _target, opts) = build(&args).unwrap();
+        assert_eq!(opts.http_version, HttpVersionPref::Auto);
+    }
+
+    #[test]
+    fn build_honours_http_version_h1() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--http-version",
+            "h1",
+            "http://h:1/",
+        ]);
+        let (_plan, _target, opts) = build(&args).unwrap();
+        assert_eq!(opts.http_version, HttpVersionPref::Http1);
+    }
+
+    #[test]
+    fn build_honours_http_version_h2() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--http-version",
+            "h2",
+            "http://h:1/",
+        ]);
+        let (_plan, _target, opts) = build(&args).unwrap();
+        assert_eq!(opts.http_version, HttpVersionPref::Http2);
     }
 
     #[test]

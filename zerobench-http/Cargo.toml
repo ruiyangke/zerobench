@@ -26,7 +26,7 @@ cyper-core = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
-hyper = { workspace = true, features = ["http1", "server"] }
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
 
 [lints]
 workspace = true

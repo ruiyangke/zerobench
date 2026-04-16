@@ -210,6 +210,16 @@ pub struct TransportOpts {
     /// mismatch). Only wired in through `compio-tls` / `rustls` — users
     /// who need it opt in explicitly with `-k` / `--insecure`.
     pub insecure_tls: bool,
+    /// Preferred HTTP protocol version for the client side.
+    ///
+    /// For v0.0.1 this is honoured by `HttpTransport` only. On plain
+    /// HTTP, [`HttpVersionPref::Auto`] picks H1 (H2 cleartext requires
+    /// explicit opt-in because servers don't advertise). On HTTPS, Auto
+    /// will try to negotiate H2 via ALPN and fall back to H1 if the
+    /// server only offers it — but TLS + ALPN wiring is deferred beyond
+    /// Phase E and Auto-on-HTTPS today resolves to H1 until the TLS
+    /// path lands.
+    pub http_version: HttpVersionPref,
 }
 
 impl Default for TransportOpts {
@@ -220,8 +230,30 @@ impl Default for TransportOpts {
             max_conns: 100,
             tcp_nodelay: true,
             insecure_tls: false,
+            http_version: HttpVersionPref::Auto,
         }
     }
+}
+
+/// User preference for the HTTP wire protocol version.
+///
+/// The enum carries *all* variants regardless of feature flags so
+/// downstream code (the CLI parser, front-ends) can use a single type;
+/// `HttpTransport::build_client` returns [`TransportError::Protocol`] if
+/// the request variant isn't wired up in the current build (e.g. `Http2`
+/// was requested but the `h2` feature wasn't enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpVersionPref {
+    /// Let the transport pick. HTTP → H1, HTTPS → ALPN negotiation
+    /// (currently resolves to H1 until TLS+ALPN lands).
+    #[default]
+    Auto,
+    /// Force HTTP/1.1. Always available.
+    Http1,
+    /// Force HTTP/2. Available when the `h2` feature is compiled into
+    /// `zerobench-http`; the dispatcher surfaces a clear error if the
+    /// feature is absent rather than silently downgrading.
+    Http2,
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +586,12 @@ mod tests {
         assert_eq!(o.max_conns, 100);
         assert!(o.tcp_nodelay);
         assert!(!o.insecure_tls);
+        assert_eq!(o.http_version, HttpVersionPref::Auto);
+    }
+
+    #[test]
+    fn http_version_pref_default_is_auto() {
+        assert_eq!(HttpVersionPref::default(), HttpVersionPref::Auto);
     }
 
     #[test]
