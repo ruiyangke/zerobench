@@ -216,7 +216,12 @@ fn missing_request_line_errors() {
     let src = "# only a comment\n\n";
     let mut vars = VarRegistry::new();
     let err = parse_request_file(src, "c.http", &mut vars).unwrap_err();
-    assert!(matches!(err, RequestFileError::MissingRequestLine));
+    match err {
+        RequestFileError::MissingRequestLine { file } => {
+            assert_eq!(file, "c.http");
+        }
+        other => panic!("expected MissingRequestLine, got {other:?}"),
+    }
 }
 
 #[test]
@@ -224,7 +229,13 @@ fn malformed_request_line_errors() {
     let src = "NOT A REQUEST LINE\nHost: h\n\n";
     let mut vars = VarRegistry::new();
     let err = parse_request_file(src, "m.http", &mut vars).unwrap_err();
-    assert!(matches!(err, RequestFileError::InvalidRequestLine(_)));
+    match err {
+        RequestFileError::InvalidRequestLine(s) => {
+            assert!(s.contains("m.http"));
+            assert!(s.contains(":1"), "expected source:line prefix, got {s}");
+        }
+        other => panic!("expected InvalidRequestLine, got {other:?}"),
+    }
 }
 
 #[test]
@@ -232,7 +243,13 @@ fn http_2_rejected() {
     let src = "GET / HTTP/2\nHost: h\n\n";
     let mut vars = VarRegistry::new();
     let err = parse_request_file(src, "h2.http", &mut vars).unwrap_err();
-    assert!(matches!(err, RequestFileError::UnsupportedVersion(_)));
+    match err {
+        RequestFileError::UnsupportedVersion(s) => {
+            assert!(s.contains("h2.http"));
+            assert!(s.contains("HTTP/2"));
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
 }
 
 #[test]
@@ -240,7 +257,12 @@ fn missing_host_errors_for_relative_path() {
     let src = "GET /foo HTTP/1.1\nX-Other: 1\n\n";
     let mut vars = VarRegistry::new();
     let err = parse_request_file(src, "no-host.http", &mut vars).unwrap_err();
-    assert!(matches!(err, RequestFileError::MissingHost));
+    match err {
+        RequestFileError::MissingHost { file } => {
+            assert_eq!(file, "no-host.http");
+        }
+        other => panic!("expected MissingHost, got {other:?}"),
+    }
 }
 
 #[test]
@@ -249,7 +271,12 @@ fn malformed_header_without_colon_errors() {
     let mut vars = VarRegistry::new();
     let err = parse_request_file(src, "bad.http", &mut vars).unwrap_err();
     match err {
-        RequestFileError::MalformedHeader(line) => assert!(line.contains("NotAHeader")),
+        RequestFileError::MalformedHeader(detail) => {
+            assert!(detail.contains("NotAHeader"));
+            assert!(detail.contains("bad.http"));
+            // Header is on line 3 (line 1 = request line).
+            assert!(detail.contains(":3"), "expected line 3 prefix, got {detail}");
+        }
         other => panic!("expected MalformedHeader, got {other:?}"),
     }
 }
@@ -273,6 +300,22 @@ Authorization: {{env:ZEROBENCH_NEVER_SET_IN_TESTS_X7}}
             assert_eq!(name, "ZEROBENCH_NEVER_SET_IN_TESTS_X7");
         }
         other => panic!("expected Template MissingEnv, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_blank_line_with_trailing_body_errors_with_source() {
+    // Headers terminated by a single newline, then a body — no blank
+    // line. This is the ambiguous shape: we can't tell whether the
+    // trailing line is another header or the body. Expect MissingBlankLine.
+    let src = "POST /foo HTTP/1.1\nHost: h\n{\"x\":1}";
+    let mut vars = VarRegistry::new();
+    let err = parse_request_file(src, "nobody.http", &mut vars).unwrap_err();
+    match err {
+        RequestFileError::MissingBlankLine { file } => {
+            assert_eq!(file, "nobody.http");
+        }
+        other => panic!("expected MissingBlankLine, got {other:?}"),
     }
 }
 

@@ -71,28 +71,39 @@ pub enum RequestFileError {
     /// No request line was found. In practice this means either the file
     /// only contained comments, or the user accidentally included only
     /// headers without the leading `METHOD PATH HTTP/1.x` line.
-    #[error("missing request line (expected `METHOD PATH HTTP/1.x`)")]
-    MissingRequestLine,
+    #[error("{file}: missing request line (expected `METHOD PATH HTTP/1.x`)")]
+    MissingRequestLine {
+        /// Source identifier (file name or `"request-file"`).
+        file: String,
+    },
     /// The request line was malformed: not three space-separated tokens,
-    /// or the method/path couldn't be parsed.
+    /// or the method/path couldn't be parsed. The inner string carries
+    /// the source name, line number, and offending text.
     #[error("invalid request line: {0}")]
     InvalidRequestLine(String),
     /// `HTTP/2` or later in the request line. Phase D only speaks HTTP/1.x.
     #[error("unsupported HTTP version: {0}")]
     UnsupportedVersion(String),
-    /// A header line did not contain a `:` separator.
+    /// A header line did not contain a `:` separator. The inner string
+    /// carries the source name, line number, and offending text.
     #[error("malformed header: {0}")]
     MalformedHeader(String),
-    /// The parser walked through the whole file without finding the
-    /// blank line that separates headers from the body. This is only
-    /// an error when a body was *expected*; a file that ends cleanly
-    /// after its last header (with no body) parses fine.
-    #[error("missing blank line between headers and body")]
-    MissingBlankLine,
+    /// The parser found headers but never reached the blank line that
+    /// separates headers from the body, and there are trailing bytes
+    /// that look like a body. A file that ends cleanly after its last
+    /// header (with no body) parses fine.
+    #[error("{file}: missing blank line between headers and body")]
+    MissingBlankLine {
+        /// Source identifier (file name or `"request-file"`).
+        file: String,
+    },
     /// No `Host:` header and the request line didn't carry an absolute
     /// URL. Without one of those we don't know where to connect.
-    #[error("missing required Host header")]
-    MissingHost,
+    #[error("{file}: missing required Host header")]
+    MissingHost {
+        /// Source identifier (file name or `"request-file"`).
+        file: String,
+    },
     /// Template compilation failed inside one of the request's fields.
     #[error("template compile failed in {field}: {error}")]
     Template {
@@ -165,7 +176,6 @@ pub fn parse_request_bytes(
     source_name: &str,
     vars: &mut VarRegistry,
 ) -> Result<ParsedRequest, RequestFileError> {
-    let _ = source_name; // reserved for future error messages
     if bytes.is_empty() {
         return Err(RequestFileError::Empty);
     }
@@ -176,29 +186,33 @@ pub fn parse_request_bytes(
     // Header region has to be valid UTF-8 (we need to trim / split on
     // colons / compare prefixes). Body is kept as raw bytes.
     let (header_end, body_start) = find_header_body_split(bytes);
+    let has_blank_line_terminator = body_start > header_end;
 
     // Attempt UTF-8 decode of the header region.
     let header_bytes = &bytes[..header_end];
     let header_text = std::str::from_utf8(header_bytes).map_err(|_| {
-        RequestFileError::InvalidRequestLine(
-            "header region is not valid UTF-8".into(),
-        )
+        RequestFileError::InvalidRequestLine(format!(
+            "{source_name}: header region is not valid UTF-8"
+        ))
     })?;
 
-    // Split into logical lines, accepting both CRLF and LF.
-    let lines = header_text.lines();
-
+    // Split into logical lines, accepting both CRLF and LF. Track the
+    // 1-based line number of each so we can surface it in errors.
+    // `str::lines()` is happy with either line ending; enumerate() gives
+    // us the index.
+    //
     // Locate the first non-empty, non-comment line — that's the request
     // line. Lines before it may be comments or blanks.
-    let mut request_line: Option<&str> = None;
-    let mut header_lines: Vec<&str> = Vec::new();
-    for line in lines {
+    let mut request_line: Option<(usize, &str)> = None;
+    let mut header_lines: Vec<(usize, &str)> = Vec::new();
+    for (i, line) in header_text.lines().enumerate() {
+        let line_no = i + 1;
         let trimmed = line.trim();
         if request_line.is_none() {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            request_line = Some(trimmed);
+            request_line = Some((line_no, trimmed));
         } else {
             if trimmed.is_empty() {
                 // Blank line inside the header region before EOF —
@@ -212,15 +226,20 @@ pub fn parse_request_bytes(
             if trimmed.starts_with('#') {
                 continue;
             }
-            header_lines.push(line);
+            header_lines.push((line_no, line));
         }
     }
 
-    let request_line = request_line.ok_or(RequestFileError::MissingRequestLine)?;
+    let (_req_line_no, request_line) = request_line.ok_or_else(|| {
+        RequestFileError::MissingRequestLine {
+            file: source_name.to_string(),
+        }
+    })?;
 
     // ---- Parse the request line -----------------------------------------
-    let (method, raw_target, version) = parse_request_line(request_line)?;
-    validate_version(version)?;
+    let (method, raw_target, version) =
+        parse_request_line(request_line, source_name, _req_line_no)?;
+    validate_version(version, source_name, _req_line_no)?;
 
     // ---- Parse headers --------------------------------------------------
     // We preserve header order. Values are *not* trimmed (HTTP leaves
@@ -229,13 +248,17 @@ pub fn parse_request_bytes(
     // space to match curl's behaviour and no more.
     let mut raw_headers: Vec<(&str, &str)> = Vec::with_capacity(header_lines.len());
     let mut host_value: Option<&str> = None;
-    for line in header_lines {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| RequestFileError::MalformedHeader(line.to_string()))?;
+    for (line_no, line) in header_lines {
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            RequestFileError::MalformedHeader(format!(
+                "{source_name}:{line_no}: {line}"
+            ))
+        })?;
         let name_trimmed = name.trim();
         if name_trimmed.is_empty() {
-            return Err(RequestFileError::MalformedHeader(line.to_string()));
+            return Err(RequestFileError::MalformedHeader(format!(
+                "{source_name}:{line_no}: {line}"
+            )));
         }
         // Strip the conventional single space after the colon, if any,
         // but preserve every other byte.
@@ -244,6 +267,31 @@ pub fn parse_request_bytes(
             host_value = Some(value);
         }
         raw_headers.push((name_trimmed, value));
+    }
+
+    // If the parser saw headers but never reached a blank-line
+    // separator AND there are non-whitespace bytes remaining that look
+    // like a body, that's a missing blank line. We only surface this
+    // when it actually matters: header lines present + no terminator +
+    // trailing content. A bare `GET /health HTTP/1.1\nHost: h\n`
+    // continues to parse cleanly.
+    if !has_blank_line_terminator && !raw_headers.is_empty() {
+        // Find the last CRLF/LF in the input; if there are bytes after
+        // the final line ending, those bytes were clearly intended as a
+        // body — but without the blank-line separator we can't tell
+        // them apart from a continuation of the header block. Report a
+        // clear error.
+        let last_newline = bytes.iter().rposition(|b| *b == b'\n');
+        let trailing_start = match last_newline {
+            Some(i) => i + 1,
+            None => bytes.len(),
+        };
+        let trailing = &bytes[trailing_start..];
+        if !trailing.is_empty() && !trailing.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(RequestFileError::MissingBlankLine {
+                file: source_name.to_string(),
+            });
+        }
     }
 
     // ---- Determine the connection target --------------------------------
@@ -260,9 +308,15 @@ pub fn parse_request_bytes(
         (target, raw_target.to_string())
     } else {
         // Relative form: Host header must be present.
-        let host = host_value.ok_or(RequestFileError::MissingHost)?.trim();
+        let host = host_value
+            .ok_or_else(|| RequestFileError::MissingHost {
+                file: source_name.to_string(),
+            })?
+            .trim();
         if host.is_empty() {
-            return Err(RequestFileError::MissingHost);
+            return Err(RequestFileError::MissingHost {
+                file: source_name.to_string(),
+            });
         }
         // We assume plain HTTP for relative paths. TLS users should either
         // use an absolute URL in the request line or wrap with `--url`
@@ -275,7 +329,7 @@ pub fn parse_request_bytes(
     // ---- Compile templates ----------------------------------------------
     let url_tpl =
         Template::compile(&full_url, vars).map_err(|e| RequestFileError::Template {
-            field: "url".into(),
+            field: format!("{source_name}: url"),
             error: e,
         })?;
 
@@ -283,12 +337,12 @@ pub fn parse_request_bytes(
     for (name, value) in raw_headers {
         let name_tpl =
             Template::compile(name, vars).map_err(|e| RequestFileError::Template {
-                field: format!("header name {name:?}"),
+                field: format!("{source_name}: header name {name:?}"),
                 error: e,
             })?;
         let value_tpl =
             Template::compile(value, vars).map_err(|e| RequestFileError::Template {
-                field: format!("header value for {name:?}"),
+                field: format!("{source_name}: header value for {name:?}"),
                 error: e,
             })?;
         headers.push((name_tpl, value_tpl));
@@ -304,7 +358,7 @@ pub fn parse_request_bytes(
         let body_str = std::str::from_utf8(body_bytes).expect("validated above");
         let body_tpl =
             Template::compile(body_str, vars).map_err(|e| RequestFileError::Template {
-                field: "body".into(),
+                field: format!("{source_name}: body"),
                 error: e,
             })?;
         Some(BodySource::Template(body_tpl))
@@ -327,36 +381,42 @@ pub fn parse_request_bytes(
 // Helpers — request-line parsing
 // ---------------------------------------------------------------------------
 
-fn parse_request_line(line: &str) -> Result<(Method, &str, &str), RequestFileError> {
+fn parse_request_line<'a>(
+    line: &'a str,
+    source: &str,
+    line_no: usize,
+) -> Result<(Method, &'a str, &'a str), RequestFileError> {
+    let mk_err = || {
+        RequestFileError::InvalidRequestLine(format!("{source}:{line_no}: {line}"))
+    };
+
     // Expect exactly three whitespace-separated tokens.
     let mut parts = line.split_whitespace();
-    let method_str = parts
-        .next()
-        .ok_or_else(|| RequestFileError::InvalidRequestLine(line.to_string()))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| RequestFileError::InvalidRequestLine(line.to_string()))?;
-    let version = parts
-        .next()
-        .ok_or_else(|| RequestFileError::InvalidRequestLine(line.to_string()))?;
+    let method_str = parts.next().ok_or_else(mk_err)?;
+    let target = parts.next().ok_or_else(mk_err)?;
+    let version = parts.next().ok_or_else(mk_err)?;
     if parts.next().is_some() {
-        return Err(RequestFileError::InvalidRequestLine(line.to_string()));
+        return Err(mk_err());
     }
 
-    let method = method_str
-        .parse::<Method>()
-        .map_err(|_| RequestFileError::InvalidRequestLine(line.to_string()))?;
+    let method = method_str.parse::<Method>().map_err(|_| mk_err())?;
 
     Ok((method, target, version))
 }
 
-fn validate_version(version: &str) -> Result<(), RequestFileError> {
+fn validate_version(
+    version: &str,
+    source: &str,
+    line_no: usize,
+) -> Result<(), RequestFileError> {
     match version {
         "HTTP/1.1" | "HTTP/1.0" => Ok(()),
         // curl sometimes emits lowercase `http/1.1` in its trace output.
         // Accept both.
         v if v.eq_ignore_ascii_case("HTTP/1.1") || v.eq_ignore_ascii_case("HTTP/1.0") => Ok(()),
-        other => Err(RequestFileError::UnsupportedVersion(other.to_string())),
+        other => Err(RequestFileError::UnsupportedVersion(format!(
+            "{source}:{line_no}: {other}"
+        ))),
     }
 }
 
@@ -621,18 +681,23 @@ mod tests {
 
     #[test]
     fn validate_version_accepts_http_1_x() {
-        assert!(validate_version("HTTP/1.1").is_ok());
-        assert!(validate_version("HTTP/1.0").is_ok());
+        assert!(validate_version("HTTP/1.1", "t.http", 1).is_ok());
+        assert!(validate_version("HTTP/1.0", "t.http", 1).is_ok());
     }
 
     #[test]
     fn validate_version_rejects_http_2() {
+        let err = validate_version("HTTP/2", "t.http", 3).unwrap_err();
+        match err {
+            RequestFileError::UnsupportedVersion(s) => {
+                assert!(s.contains("t.http"));
+                assert!(s.contains(":3"));
+                assert!(s.contains("HTTP/2"));
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
         assert!(matches!(
-            validate_version("HTTP/2"),
-            Err(RequestFileError::UnsupportedVersion(_))
-        ));
-        assert!(matches!(
-            validate_version("HTTP/3"),
+            validate_version("HTTP/3", "t.http", 1),
             Err(RequestFileError::UnsupportedVersion(_))
         ));
     }
