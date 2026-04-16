@@ -122,6 +122,12 @@ impl Http1Pool {
         self.slots.is_empty()
     }
 
+    /// Target this pool was opened against. Cheap — returns a borrow of
+    /// the [`Target`] stored at construction time.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
     /// Send one request through the pool.
     ///
     /// Expands the URL / header / body templates using `ctx`, acquires

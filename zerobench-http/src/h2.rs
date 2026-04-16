@@ -251,13 +251,6 @@ impl Http2Client {
     pub fn target(&self) -> &Target {
         &self.target
     }
-
-    /// `true` iff the peer has closed the connection. Cheap; used by
-    /// dispatchers that want a fast-fail path without queueing another
-    /// doomed request.
-    pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
 }
 
 // ---------------------------------------------------------------------------

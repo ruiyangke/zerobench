@@ -54,22 +54,12 @@ pub enum HttpClient {
 }
 
 impl HttpClient {
-    /// Target the client was opened against.
+    /// Target the client was opened against. Cheap — a borrow of the
+    /// [`Target`] stored at construction time, regardless of whether
+    /// the underlying client is H1 or H2.
     pub fn target(&self) -> &Target {
         match self {
-            HttpClient::Http1(_) => {
-                // Http1Pool doesn't expose its target (it doesn't need
-                // to for exchange); we avoid requiring a new accessor
-                // here by leaving this method only meaningful for H2.
-                // Callers that need the H1 target should get it from
-                // the source of truth — the `Target` they passed in.
-                // If we ever need uniform access we can add
-                // `Http1Pool::target` — cheap.
-                panic!(
-                    "HttpClient::target() is currently only implemented for Http2; \
-                     callers should carry the Target alongside the client"
-                );
-            }
+            HttpClient::Http1(p) => p.target(),
             #[cfg(feature = "h2")]
             HttpClient::Http2(c) => c.target(),
         }
