@@ -1,0 +1,19 @@
+[package]
+name = "zerobench-sse"
+description = "Server-Sent Events transport for zerobench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zerobench-core = { workspace = true }
+zerobench-http = { workspace = true }
+compio = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+
+[lints]
+workspace = true

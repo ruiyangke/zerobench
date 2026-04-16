@@ -1,0 +1,43 @@
+[package]
+name = "zerobench"
+description = "Fast, correct, modern HTTP benchmarking tool — open-loop, HDR-precise, compio/io_uring-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "zerobench"
+path = "src/main.rs"
+
+[features]
+default = ["h1", "sse", "ws"]
+# Protocol features — flow through to zerobench-http
+h1 = []
+h2 = ["zerobench-http/h2"]
+h3 = ["zerobench-http/h3"]
+# Protocol modes
+ws = ["dep:zerobench-ws"]
+sse = ["dep:zerobench-sse"]
+# Front-ends
+tui = ["dep:zerobench-tui"]
+script = ["dep:zerobench-rhai"]
+# Everything
+all = ["h2", "h3", "ws", "sse", "tui", "script"]
+
+[dependencies]
+zerobench-core = { workspace = true }
+zerobench-http = { workspace = true }
+zerobench-ws = { workspace = true, optional = true }
+zerobench-sse = { workspace = true, optional = true }
+zerobench-rhai = { workspace = true, optional = true }
+zerobench-tui = { workspace = true, optional = true }
+
+clap = { workspace = true }
+compio = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

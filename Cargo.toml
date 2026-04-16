@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "zerobench-core",
+    "zerobench-http",
+    "zerobench-ws",
+    "zerobench-sse",
+    "zerobench-rhai",
+    "zerobench-tui",
+    "zerobench-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/zeroship-dev/zerobench"
+authors = ["Ruiyang Ke"]
+
+[workspace.dependencies]
+# Local crates
+zerobench-core = { path = "zerobench-core", version = "0.0.1" }
+zerobench-http = { path = "zerobench-http", version = "0.0.1" }
+zerobench-ws   = { path = "zerobench-ws",   version = "0.0.1" }
+zerobench-sse  = { path = "zerobench-sse",  version = "0.0.1" }
+zerobench-rhai = { path = "zerobench-rhai", version = "0.0.1" }
+zerobench-tui  = { path = "zerobench-tui",  version = "0.0.1" }
+
+# Async runtime
+compio = { version = "0.18", features = ["io", "net", "runtime", "macros", "time", "tls"] }
+compio-tls = { version = "0.9", features = ["rustls"] }
+futures-util = "0.3"
+
+# HTTP
+hyper = { version = "1.4", features = ["client"] }
+http = "1"
+httparse = "1"
+cyper-core = "0.8"
+
+# Core utils
+bytes = "1"
+smallvec = { version = "1", features = ["union"] }
+
+# Stats / measurement
+hdrhistogram = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Scripting
+rhai = { version = "1.19", features = ["sync"] }
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.28"
+
+# Concurrency
+parking_lot = "0.12"
+
+# System / platform
+libc = "0.2"
+socket2 = "0.6"
+
+# TLS primitives
+rustls = { version = "0.23", features = ["ring"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+debug = true         # keep frame pointers + symbols for profilers
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

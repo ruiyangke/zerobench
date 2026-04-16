@@ -1,0 +1,16 @@
+[package]
+name = "zerobench-rhai"
+description = "Rhai plan-builder for zerobench — compile-time scenario DSL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zerobench-core = { workspace = true }
+rhai = { workspace = true }
+
+[lints]
+workspace = true

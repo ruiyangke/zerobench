@@ -1,0 +1,23 @@
+[package]
+name = "zerobench-core"
+description = "Core plan model, transport trait, dispatcher, and recorder for zerobench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+compio = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+hdrhistogram = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

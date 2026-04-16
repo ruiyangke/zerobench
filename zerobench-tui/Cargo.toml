@@ -1,0 +1,17 @@
+[package]
+name = "zerobench-tui"
+description = "Live terminal dashboard for zerobench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zerobench-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[lints]
+workspace = true
