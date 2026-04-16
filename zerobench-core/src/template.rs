@@ -254,7 +254,10 @@ fn compile_template(src: &str, vars: &mut VarRegistry) -> Result<Template, Templ
             })?;
 
             flush(&mut literal, &mut parts, &mut estimated);
-            let (part, size_hint) = parse_expression(expr.trim(), vars)?;
+            // Note: do NOT pre-trim `expr` here. `parse_expression` trims
+            // each argument component selectively — the DEFAULT in
+            // `{{env:NAME:DEFAULT}}` must preserve trailing whitespace.
+            let (part, size_hint) = parse_expression(expr, vars)?;
             estimated += size_hint;
             parts.push(part);
             i = expr_end + 2; // past `}}`
@@ -349,12 +352,20 @@ fn estimate_dynamic(p: &Part) -> usize {
 /// Parse a single `expr` (contents between `{{` and `}}`) into a `Part`.
 ///
 /// Returns the part and a size hint to feed the estimator.
+///
+/// Whitespace rule: we trim space around every name-like component
+/// (prefix, NAME, MIN/MAX, etc.) so `{{var: token}}` and
+/// `{{rand_int: 1 : 2}}` behave like their no-space forms. The sole
+/// exception is the DEFAULT for `{{env:NAME:DEFAULT}}`, which is
+/// preserved verbatim — a user might legitimately want spaces in a
+/// default value.
 fn parse_expression(
     expr: &str,
     vars: &mut VarRegistry,
 ) -> Result<(Part, usize), TemplateError> {
-    // Simple (no-arg) variables.
-    match expr {
+    // Simple (no-arg) variables — match against the trimmed expression so
+    // `{{ uuid }}` is equivalent to `{{uuid}}`.
+    match expr.trim() {
         "uuid" => return Ok((Part::Uuid, 36)),
         "uuid4" => return Ok((Part::Uuid4, 36)),
         "now_ms" => return Ok((Part::NowMs, 13)),
@@ -367,14 +378,15 @@ fn parse_expression(
 
     // Parameterized variables: prefix:args.
     if let Some((head, tail)) = expr.split_once(':') {
+        let head = head.trim();
         match head {
             "env" => {
                 // `env:NAME` or `env:NAME:DEFAULT`. NAME is the segment
                 // before the first ':'; DEFAULT is the rest (may contain
                 // more colons).
                 let (name, default) = match tail.split_once(':') {
-                    Some((n, d)) => (n, Some(d)),
-                    None => (tail, None),
+                    Some((n, d)) => (n.trim(), Some(d)),
+                    None => (tail.trim(), None),
                 };
                 let value = match std::env::var(name) {
                     Ok(v) => v,
@@ -390,9 +402,11 @@ fn parse_expression(
                     TemplateError::InvalidRandInt(tail.to_string())
                 })?;
                 let min: i64 = a
+                    .trim()
                     .parse()
                     .map_err(|_| TemplateError::InvalidRandInt(tail.to_string()))?;
                 let max: i64 = b
+                    .trim()
                     .parse()
                     .map_err(|_| TemplateError::InvalidRandInt(tail.to_string()))?;
                 if min > max {
@@ -402,18 +416,20 @@ fn parse_expression(
             }
             "rand_hex" => {
                 let bytes: usize = tail
+                    .trim()
                     .parse()
                     .map_err(|_| TemplateError::InvalidRandArgs(format!("rand_hex:{tail}")))?;
                 return Ok((Part::RandHex { bytes }, bytes * 2));
             }
             "rand_str" => {
                 let len: usize = tail
+                    .trim()
                     .parse()
                     .map_err(|_| TemplateError::InvalidRandArgs(format!("rand_str:{tail}")))?;
                 return Ok((Part::RandStr { len }, len));
             }
             "var" => {
-                let slot = vars.allocate(tail)?;
+                let slot = vars.allocate(tail.trim())?;
                 return Ok((Part::VarRef(slot), 32));
             }
             "line" => {
@@ -423,7 +439,7 @@ fn parse_expression(
         }
     }
 
-    Err(TemplateError::UnknownVariable(expr.to_string()))
+    Err(TemplateError::UnknownVariable(expr.trim().to_string()))
 }
 
 // ---------------------------------------------------------------------------

@@ -371,3 +371,56 @@ fn compile_is_idempotent_for_var_registry() {
     let _ = Template::compile("{{var:y}}", &mut vars).unwrap();
     assert_eq!(vars.len(), 2);
 }
+
+#[test]
+fn whitespace_around_expression_is_trimmed() {
+    // `{{ uuid }}` should behave like `{{uuid}}` — 36-char hyphenated UUID.
+    let mut vars = VarRegistry::new();
+    let t = Template::compile("{{ uuid }}", &mut vars).unwrap();
+    let mut h = Harness::new();
+    let out = expand(&t, &mut h);
+    let s = std::str::from_utf8(&out).unwrap();
+    assert_eq!(s.len(), 36);
+}
+
+#[test]
+fn whitespace_around_var_name_is_trimmed() {
+    // `{{var: token}}` must register the var as `token`, not ` token`.
+    let mut vars = VarRegistry::new();
+    let _ = Template::compile("{{var: token}}", &mut vars).unwrap();
+    assert_eq!(vars.len(), 1);
+    // Allocating the plain name should share the slot, proving the
+    // whitespace was stripped at compile time.
+    let slot = vars.allocate("token").unwrap();
+    assert_eq!(slot.0, 0);
+    assert_eq!(vars.len(), 1);
+}
+
+#[test]
+fn whitespace_around_rand_int_bounds_is_trimmed() {
+    let mut vars = VarRegistry::new();
+    let t = Template::compile("{{rand_int: 1 : 10}}", &mut vars).unwrap();
+    let mut h = Harness::new();
+    for _ in 0..100 {
+        let mut out = Vec::new();
+        let mut ctx = h.ctx();
+        t.expand_into(&mut out, &mut ctx);
+        let n: i64 = std::str::from_utf8(&out).unwrap().parse().unwrap();
+        assert!((1..=10).contains(&n), "out of bounds: {n}");
+    }
+}
+
+#[test]
+fn env_default_preserves_internal_and_trailing_whitespace() {
+    // The DEFAULT of `{{env:NAME:DEFAULT}}` is preserved verbatim — a
+    // user legitimately may want spaces inside a default value.
+    let mut vars = VarRegistry::new();
+    let t = Template::compile(
+        "{{env:ZEROBENCH_SPACE_DEFAULT_42: with spaces }}",
+        &mut vars,
+    )
+    .unwrap();
+    let mut h = Harness::new();
+    let out = expand(&t, &mut h);
+    assert_eq!(out, b" with spaces ");
+}
