@@ -32,7 +32,10 @@
 //! timeout boundary would invalidate the slot (see `Http1Pool::exchange`
 //! timeout handling) and skew stats with spurious errors.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rand::Rng;
 
@@ -46,6 +49,51 @@ use crate::step_exec::{
 };
 use crate::stop::StopSignal;
 use crate::transport::Transport;
+
+/// Cooperatively yield once to the runtime.
+///
+/// Returns `Pending` on first poll (after arranging for its own waker
+/// to be scheduled), then `Ready` on the second. This is the minimal
+/// "let other tasks run before I continue" primitive.
+///
+/// # Why not `compio::time::sleep(Duration::ZERO)`?
+///
+/// `compio::time::sleep` bottoms out in `TimerRuntime::insert`, which
+/// **drops** timers whose deadline is already in the past and returns
+/// synchronously without ever yielding. So `sleep(Duration::ZERO)` is a
+/// no-op — exactly the opposite of what we want in the error branch of
+/// the worker loop, where we need to surrender the thread so
+/// `StopSignal::after`'s own timer task can fire.
+///
+/// # Why not `compio::runtime::yield_now`?
+///
+/// compio 0.18 doesn't export a `yield_now`. A hand-rolled 8-line
+/// future is the simplest dependency-free fix.
+struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            // Wake ourselves so the runtime re-polls us after draining
+            // other ready tasks. Without this, a cooperative-only
+            // scheduler could park us indefinitely.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// Return a future that yields control to the runtime exactly once.
+fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
 
 // ---------------------------------------------------------------------------
 // Public API — saturate-mode dispatcher
@@ -181,6 +229,17 @@ pub(crate) async fn execute_steps<T: Transport>(
                         if let Some(l) = live {
                             record_transport_error_live(l, kind);
                         }
+                        // If every slot in the pool is dead (e.g. H1-only
+                        // client against an H2-only server), `T::exchange`
+                        // returns `Err` *synchronously* without hitting a
+                        // real `.await` on a socket. On a single-threaded
+                        // runtime, that starves every other task — notably
+                        // `StopSignal::after`'s timer — so the worker loop
+                        // spins forever. A cooperative yield here restores
+                        // forward progress for the rest of the runtime
+                        // without changing behaviour on the happy path
+                        // (real IO already yields).
+                        yield_now().await;
                         // Don't execute further steps — their templates
                         // may rely on an extract we didn't get to run.
                         break;

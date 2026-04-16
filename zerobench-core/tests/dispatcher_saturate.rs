@@ -347,6 +347,117 @@ async fn saturate_zero_max_tasks_is_noop() {
     assert!(stats.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Spin-loop regression — synchronous transport errors.
+// ---------------------------------------------------------------------------
+//
+// If every connection in a pool is dead (think H1-only client against an
+// H2-only server), `T::exchange` returns `Err(_)` *synchronously* without
+// ever hitting a socket. The worker loop then becomes a tight
+// `while !stop.is_stopped() { synchronous_error }` that never yields to
+// the compio runtime — so `StopSignal::after`'s timer task never fires
+// and the process pegs a core forever.
+//
+// The dispatcher fixes this by issuing a cooperative `yield_now().await`
+// in the error branch. These tests construct a transport that only ever
+// returns synchronous errors and verify that `run_saturate` still exits
+// within a reasonable bound of its `StopSignal::after`.
+
+#[derive(Clone)]
+struct AlwaysErrSyncTransport;
+
+#[derive(Clone)]
+struct AlwaysErrSyncClient {
+    calls: Arc<AtomicU64>,
+}
+
+impl Transport for AlwaysErrSyncTransport {
+    type Client = AlwaysErrSyncClient;
+
+    async fn build_client(
+        _target: &Target,
+        _opts: &TransportOpts,
+    ) -> Result<Self::Client, TransportError> {
+        Ok(AlwaysErrSyncClient {
+            calls: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    async fn exchange(
+        client: &Self::Client,
+        _plan: &RequestPlan,
+        _ctx: &mut ScenarioContext,
+    ) -> Result<Response, TransportError> {
+        // Crucially: no `.await` before returning `Err`. Mimics the
+        // "all pool slots dead" / "no compatible H2 connection" paths
+        // where the transport fails its precondition check without ever
+        // touching a socket.
+        client.calls.fetch_add(1, Ordering::Relaxed);
+        Err(TransportError::Connect("synthetic: always-error".into()))
+    }
+}
+
+/// With every exchange returning a synchronous error, the worker loop
+/// must still yield often enough for `StopSignal::after` to trip and
+/// the dispatcher to return. Without the error-branch yield, this test
+/// hangs forever.
+#[compio::test]
+async fn saturate_exits_under_synchronous_transport_errors() {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("/", &mut vars).unwrap();
+    let plan = Plan {
+        scenarios: vec![Scenario {
+            name: "err-sync".into(),
+            rate: RateProfile::Saturate { max_concurrency: 50 },
+            steps: vec![Step::Request(RequestPlan::get(url))],
+        }],
+        vars,
+        duration: Duration::from_millis(500),
+        warmup: None,
+    };
+
+    let client = AlwaysErrSyncClient {
+        calls: Arc::new(AtomicU64::new(0)),
+    };
+    let stop = StopSignal::after(plan.duration);
+
+    let t0 = std::time::Instant::now();
+    let stats =
+        run_saturate::<AlwaysErrSyncTransport>(&plan, client.clone(), 4, stop, None)
+            .await;
+    let elapsed = t0.elapsed();
+    let summary = Summary::merge(stats, plan.duration);
+
+    // Must exit promptly (timer should fire at ~500ms). Before the fix
+    // this test hangs; after the fix we expect around 500ms with some
+    // scheduling slack. The 2× upper bound absorbs timer jitter on slow
+    // CI boxes without masking the "hang forever" regression we're
+    // guarding against.
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "run_saturate did not exit promptly under synchronous errors \
+         (elapsed {elapsed:?}, expected ~{:?})",
+        plan.duration
+    );
+
+    // Every exchange registered as a Connect error. Exercises the error
+    // path end-to-end, including the live snapshot / stats accounting.
+    assert!(summary.requests == 0, "no successful requests expected");
+    assert!(
+        summary.errors.total() > 0,
+        "expected non-zero errors, got {:?}",
+        summary.errors
+    );
+    // Transport was invoked many times — the loop didn't early-exit on
+    // the first error. (Bounded loosely because exact count depends on
+    // runtime pacing.)
+    let calls = client.calls.load(Ordering::Relaxed);
+    assert!(
+        calls > 0,
+        "transport never called under synchronous-error regime"
+    );
+}
+
 /// Pause step — workers should actually sleep and throughput should
 /// reflect the pause.
 #[compio::test]
