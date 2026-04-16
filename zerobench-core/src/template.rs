@@ -78,6 +78,19 @@ pub enum TemplateError {
     /// More than 256 distinct named variables were declared in this plan.
     #[error(transparent)]
     TooManyVars(#[from] VarError),
+
+    /// A parameterized expression was given with an empty operand — e.g.
+    /// `{{var:}}` (no name) or `{{env::default}}` (empty name). The
+    /// contained `&'static str` is the prefix ("var", "env", ...).
+    #[error("empty operand for `{{{{{0}:...}}}}` — name is required")]
+    EmptyOperand(&'static str),
+
+    /// `{{env:NAME}}` was used with a NAME that isn't in the environment
+    /// and no default was supplied. Previously this surfaced as a
+    /// misleading `UnknownVariable("env:NAME")` — the prefix was spelled
+    /// correctly; only the environment lookup failed.
+    #[error("env variable not set and no default supplied: {0}")]
+    MissingEnv(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -388,11 +401,14 @@ fn parse_expression(
                     Some((n, d)) => (n.trim(), Some(d)),
                     None => (tail.trim(), None),
                 };
+                if name.is_empty() {
+                    return Err(TemplateError::EmptyOperand("env"));
+                }
                 let value = match std::env::var(name) {
                     Ok(v) => v,
                     Err(_) => default
                         .map(|d| d.to_string())
-                        .ok_or_else(|| TemplateError::UnknownVariable(format!("env:{name}")))?,
+                        .ok_or_else(|| TemplateError::MissingEnv(name.to_string()))?,
                 };
                 let size = value.len();
                 return Ok((Part::Literal(Bytes::from(value)), size));
@@ -429,7 +445,11 @@ fn parse_expression(
                 return Ok((Part::RandStr { len }, len));
             }
             "var" => {
-                let slot = vars.allocate(tail.trim())?;
+                let name = tail.trim();
+                if name.is_empty() {
+                    return Err(TemplateError::EmptyOperand("var"));
+                }
+                let slot = vars.allocate(name)?;
                 return Ok((Part::VarRef(slot), 32));
             }
             "line" => {

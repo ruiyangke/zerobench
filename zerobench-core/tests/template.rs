@@ -90,8 +90,8 @@ fn env_missing_without_default_errors() {
     let err =
         Template::compile("{{env:ZEROBENCH_MISSING_NO_DEFAULT_42}}", &mut vars).unwrap_err();
     match err {
-        TemplateError::UnknownVariable(s) => assert!(s.starts_with("env:")),
-        other => panic!("unexpected: {other:?}"),
+        TemplateError::MissingEnv(s) => assert_eq!(s, "ZEROBENCH_MISSING_NO_DEFAULT_42"),
+        other => panic!("expected MissingEnv, got {other:?}"),
     }
 }
 
@@ -423,4 +423,47 @@ fn env_default_preserves_internal_and_trailing_whitespace() {
     let mut h = Harness::new();
     let out = expand(&t, &mut h);
     assert_eq!(out, b" with spaces ");
+}
+
+#[test]
+fn var_with_empty_name_errors() {
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{var:}}", &mut vars).unwrap_err();
+    match err {
+        TemplateError::EmptyOperand(prefix) => assert_eq!(prefix, "var"),
+        other => panic!("expected EmptyOperand(\"var\"), got {other:?}"),
+    }
+    assert_eq!(vars.len(), 0, "no slot should have been allocated");
+}
+
+#[test]
+fn var_with_whitespace_only_name_errors() {
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{var:   }}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::EmptyOperand("var")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn env_with_empty_name_errors() {
+    // `{{env:}}` — prefix but no NAME.
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{env:}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::EmptyOperand("env")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn env_with_empty_name_and_default_errors() {
+    // `{{env::default}}` — empty NAME, default present. Must still error.
+    let mut vars = VarRegistry::new();
+    let err = Template::compile("{{env::default}}", &mut vars).unwrap_err();
+    assert!(
+        matches!(err, TemplateError::EmptyOperand("env")),
+        "got {err:?}"
+    );
 }
