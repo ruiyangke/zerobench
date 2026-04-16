@@ -278,12 +278,13 @@ pub enum ResponseBody {
     /// transports will use [`ResponseBody::Stream`].
     Buffered(bytes::Bytes),
     /// Incrementally produced body chunks. The stream is `!Send` because
-    /// it typically wraps compio IO types, which aren't `Send`.
+    /// it typically wraps compio IO types, which aren't `Send`. compio
+    /// runs a dedicated runtime per worker thread; the stream is produced
+    /// and consumed on the same thread, so a `Send` bound would only
+    /// rule out correct implementations.
     Stream(
         std::pin::Pin<
-            Box<
-                dyn futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send,
-            >,
+            Box<dyn futures_util::Stream<Item = std::io::Result<bytes::Bytes>>>,
         >,
     ),
 }
