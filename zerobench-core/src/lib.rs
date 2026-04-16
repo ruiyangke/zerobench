@@ -13,5 +13,5 @@ pub use plan::{
 };
 pub use rng::BenchRng;
 pub use stats::{ErrorCounters, ErrorKind, ScenarioStats, Summary, TaskStats};
-pub use template::{ExpandCtx, Part, Template, TemplateError};
+pub use template::{ExpandCtx, Template, TemplateError};
 pub use var::{VarError, VarRegistry, VarSlot};

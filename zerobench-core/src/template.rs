@@ -157,8 +157,12 @@ impl Template {
 ///
 /// Parts with configuration (ranges, lengths, slot indices) carry it
 /// inline so expansion needs no lookups beyond the part itself.
+///
+/// This type is internal to the crate — the public surface is
+/// [`Template`] and [`Template::compile`]. `Part` is not part of the
+/// API contract; variants may change as the template vocabulary grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Part {
+pub(crate) enum Part {
     /// Raw bytes emitted verbatim.
     Literal(Bytes),
 
@@ -229,13 +233,11 @@ fn compile_template(src: &str, vars: &mut VarRegistry) -> Result<Template, Templ
     let bytes = src.as_bytes();
     let mut parts: Vec<Part> = Vec::new();
     let mut literal: Vec<u8> = Vec::new();
-    let mut estimated = 0usize;
 
     // Flush the current literal buffer into a Literal part, if non-empty.
     // (fn-as-closure rather than a helper because it mutates local state.)
-    let flush = |literal: &mut Vec<u8>, parts: &mut Vec<Part>, estimated: &mut usize| {
+    let flush = |literal: &mut Vec<u8>, parts: &mut Vec<Part>| {
         if !literal.is_empty() {
-            *estimated += literal.len();
             parts.push(Part::Literal(Bytes::from(std::mem::take(literal))));
         }
     };
@@ -266,12 +268,11 @@ fn compile_template(src: &str, vars: &mut VarRegistry) -> Result<Template, Templ
                 )
             })?;
 
-            flush(&mut literal, &mut parts, &mut estimated);
+            flush(&mut literal, &mut parts);
             // Note: do NOT pre-trim `expr` here. `parse_expression` trims
             // each argument component selectively — the DEFAULT in
             // `{{env:NAME:DEFAULT}}` must preserve trailing whitespace.
-            let (part, size_hint) = parse_expression(expr, vars)?;
-            estimated += size_hint;
+            let (part, _size_hint) = parse_expression(expr, vars)?;
             parts.push(part);
             i = expr_end + 2; // past `}}`
             continue;
@@ -295,11 +296,12 @@ fn compile_template(src: &str, vars: &mut VarRegistry) -> Result<Template, Templ
         i += 1;
     }
 
-    flush(&mut literal, &mut parts, &mut estimated);
+    flush(&mut literal, &mut parts);
     // After flush, if there's residual template with `{{` but no closer, we
     // would have already errored above; nothing to check here.
 
-    // Fold adjacent literals (can happen after escape + literal sequences).
+    // Fold adjacent literals (can happen after escape + literal sequences)
+    // and compute the final size estimate from the settled part list.
     let parts = coalesce_literals(parts);
     let estimated_size = parts
         .iter()

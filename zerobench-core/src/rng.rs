@@ -8,7 +8,7 @@
 //! `{{rand_hex}}`, and `{{rand_str}}` bodies (load-generation payloads),
 //! but the WebSocket masking code (Task 15) must use `getrandom` directly.
 
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 /// Alias to the concrete engine used throughout zerobench. Kept as a type
@@ -27,22 +27,10 @@ pub fn from_seed(seed: u64) -> BenchRng {
     Xoshiro256PlusPlus::seed_from_u64(seed)
 }
 
-/// Ergonomic alias so template code reads `rng.gen_range(...)`.
-///
-/// This is a thin re-export of [`rand::Rng::gen_range`] kept local so
-/// consumers don't need to pull in the `rand` trait in their use-clauses.
-pub fn gen_range<T, R>(rng: &mut BenchRng, range: R) -> T
-where
-    T: rand::distributions::uniform::SampleUniform,
-    R: rand::distributions::uniform::SampleRange<T>,
-{
-    rng.gen_range(range)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use rand::{Rng, RngCore};
 
     #[test]
     fn seeded_rng_is_deterministic() {
@@ -54,9 +42,11 @@ mod tests {
 
     #[test]
     fn gen_range_in_bounds() {
+        // Sanity check that the underlying `rand::Rng::gen_range` works
+        // as template.rs expects.
         let mut rng = from_seed(1);
         for _ in 0..1000 {
-            let n: i64 = gen_range(&mut rng, 1..=10);
+            let n: i64 = rng.gen_range(1..=10);
             assert!((1..=10).contains(&n));
         }
     }
