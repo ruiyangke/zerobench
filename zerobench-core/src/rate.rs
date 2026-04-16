@@ -30,7 +30,7 @@ use crate::live_snapshot::LiveSnapshot;
 use crate::plan::{Plan, RateProfile, Step};
 use crate::rng::from_entropy;
 use crate::scenario_context::ScenarioContext;
-use crate::stats::TaskStats;
+use crate::stats::{ErrorKind, TaskStats};
 use crate::step_exec::{
     classify_transport_error, process_response, record_transport_error_live,
 };
@@ -87,6 +87,11 @@ impl KeepupCounter {
 /// behind (worker starvation, slow schedulers, etc.), we catch up by
 /// emitting multiple tokens back-to-back rather than waiting — which
 /// is what keeps the target rate honest.
+///
+/// `live` is the optional shared [`LiveSnapshot`] used by the JSONL
+/// streaming path; when present, each token dropped due to channel
+/// saturation increments `errors.keepup` on the next tick so real-time
+/// monitors see backpressure when it happens, not just at end-of-run.
 pub async fn run_scheduler(
     scenario_id: u16,
     profile: RateProfile,
@@ -94,16 +99,28 @@ pub async fn run_scheduler(
     started_at: Instant,
     stop: StopSignal,
     keepup: KeepupCounter,
+    live: Option<Arc<LiveSnapshot>>,
 ) {
     match profile {
         RateProfile::Constant(rps) => {
-            run_constant(scenario_id, rps, sender, started_at, stop, keepup).await
+            run_constant(scenario_id, rps, sender, started_at, stop, keepup, live).await
         }
         RateProfile::Ramp { from, to, over } => {
-            run_ramp(scenario_id, from, to, over, sender, started_at, stop, keepup).await
+            run_ramp(
+                scenario_id,
+                from,
+                to,
+                over,
+                sender,
+                started_at,
+                stop,
+                keepup,
+                live,
+            )
+            .await
         }
         RateProfile::Stepped(steps) => {
-            run_stepped(scenario_id, steps, sender, started_at, stop, keepup).await
+            run_stepped(scenario_id, steps, sender, started_at, stop, keepup, live).await
         }
         RateProfile::Saturate { .. } => {
             // Saturate mode doesn't use the scheduler — the dispatcher
@@ -116,6 +133,16 @@ pub async fn run_scheduler(
     }
 }
 
+/// Bump the keepup counter and, if a `LiveSnapshot` is attached, record
+/// a per-window `ErrorKind::Keepup` so the next JSONL tick reflects the
+/// drop. Called from every scheduler on `TrySendError::Full`.
+fn record_keepup_drop(keepup: &KeepupCounter, live: Option<&Arc<LiveSnapshot>>) {
+    keepup.inc();
+    if let Some(l) = live {
+        l.record_error(ErrorKind::Keepup);
+    }
+}
+
 async fn run_constant(
     scenario_id: u16,
     rps: f64,
@@ -123,6 +150,7 @@ async fn run_constant(
     started_at: Instant,
     stop: StopSignal,
     keepup: KeepupCounter,
+    live: Option<Arc<LiveSnapshot>>,
 ) {
     if rps <= 0.0 {
         return;
@@ -142,7 +170,7 @@ async fn run_constant(
         }) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => {
-                keepup.inc();
+                record_keepup_drop(&keepup, live.as_ref());
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 break;
@@ -161,6 +189,7 @@ async fn run_ramp(
     started_at: Instant,
     stop: StopSignal,
     keepup: KeepupCounter,
+    live: Option<Arc<LiveSnapshot>>,
 ) {
     // r(t) = from + (to-from)*t/over. Integrate to get
     // N(t) = from*t + (to-from)*t²/(2*over) during the ramp, and
@@ -184,7 +213,7 @@ async fn run_ramp(
         }) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => {
-                keepup.inc();
+                record_keepup_drop(&keepup, live.as_ref());
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 break;
@@ -256,6 +285,7 @@ async fn run_stepped(
     started_at: Instant,
     stop: StopSignal,
     keepup: KeepupCounter,
+    live: Option<Arc<LiveSnapshot>>,
 ) {
     steps.sort_by_key(|(t, _)| *t);
     // Walk the step schedule. Between steps, behave like `run_constant`.
@@ -296,7 +326,9 @@ async fn run_stepped(
             intended_start: intended,
         }) {
             Ok(()) => {}
-            Err(flume::TrySendError::Full(_)) => keepup.inc(),
+            Err(flume::TrySendError::Full(_)) => {
+                record_keepup_drop(&keepup, live.as_ref());
+            }
             Err(flume::TrySendError::Disconnected(_)) => break,
         }
         segment_index = segment_index.wrapping_add(1);
@@ -344,7 +376,10 @@ pub async fn run_open_loop<T: Transport>(
         .collect();
     let started_at = Instant::now();
 
-    // Spawn one scheduler per non-Saturate scenario.
+    // Spawn one scheduler per non-Saturate scenario. Each scheduler
+    // gets a clone of the shared `LiveSnapshot` so its `keepup` drops
+    // land in the next per-second JSONL tick (not only in the final
+    // summary).
     let mut scheduler_handles = Vec::new();
     for (i, scenario) in plan.scenarios.iter().enumerate() {
         if matches!(scenario.rate, RateProfile::Saturate { .. }) {
@@ -355,8 +390,18 @@ pub async fn run_open_loop<T: Transport>(
         let stop = stop.clone();
         let keepup = scenario_keepup[i].clone();
         let profile = scenario.rate.clone();
+        let live_for_scheduler = live.clone();
         let h = compio::runtime::spawn(async move {
-            run_scheduler(id, profile, tx, started_at, stop, keepup).await;
+            run_scheduler(
+                id,
+                profile,
+                tx,
+                started_at,
+                stop,
+                keepup,
+                live_for_scheduler,
+            )
+            .await;
         });
         scheduler_handles.push(h);
     }

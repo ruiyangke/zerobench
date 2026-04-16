@@ -193,9 +193,19 @@ async fn jsonl_ticker(
         next += interval;
     }
 
-    // Flush one final tick so stragglers aren't lost.
+    // Flush one final tick so stragglers aren't lost. We emit even
+    // when `tick.requests == 0` — a trailing partial window may still
+    // carry non-zero error counters (especially keepup under
+    // backpressure) or a short burst of samples that wouldn't reach a
+    // full integer-second boundary. The only case we suppress is the
+    // "completely empty" tick (no requests, no errors, no bytes) —
+    // emitting that would just be noise for downstream pipelines.
     let tick = live.swap_and_snapshot();
-    if tick.requests > 0 {
+    let has_anything = tick.requests > 0
+        || tick.bytes_sent > 0
+        || tick.bytes_recv > 0
+        || tick.errors.total() > 0;
+    if has_anything {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);

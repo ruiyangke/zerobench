@@ -261,6 +261,44 @@ async fn open_loop_keepup_is_attributed_per_scenario() {
 }
 
 #[compio::test]
+async fn open_loop_keepup_is_forwarded_to_live_snapshot() {
+    // Same shape as `open_loop_keepup_counter_fires_on_overload`, but
+    // hooks a `LiveSnapshot` in and asserts the keepup count shows up
+    // on a tick swap — the JSONL streaming path depends on this.
+    let plan = constant_plan(100_000.0, Duration::from_millis(400));
+    let client = FakeClient::new();
+    client.service_time_us.store(200, Ordering::Relaxed);
+    let stop = StopSignal::after(plan.duration);
+    let live = zerobench_core::LiveSnapshot::new();
+
+    let stats = zerobench_core::run_open_loop::<FakeTransport>(
+        &plan,
+        client.clone(),
+        5,
+        stop,
+        Some(live.clone()),
+    )
+    .await;
+    let summary = Summary::merge(stats, plan.duration);
+
+    // Sanity: the per-run summary still reflects backpressure.
+    assert!(
+        summary.errors.keepup > 0,
+        "summary.errors.keepup should be nonzero under overload, got {}",
+        summary.errors.keepup
+    );
+
+    // And the live-tick snapshot must have seen at least one of those
+    // drops land in the per-window counter.
+    let tick = live.swap_and_snapshot();
+    assert!(
+        tick.errors.keepup > 0,
+        "LiveTick should reflect keepup drops; got tick.errors = {:?}",
+        tick.errors
+    );
+}
+
+#[compio::test]
 async fn open_loop_saturate_scenario_produces_no_tokens() {
     // A plan whose only scenario is Saturate should not be run by the
     // open-loop dispatcher — returns empty stats.
