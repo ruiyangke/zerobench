@@ -259,11 +259,6 @@ pub struct WsPlan {
     /// body; servers that echo return the same bytes. Defaults to
     /// `b"ping"` in the CLI.
     pub message: Bytes,
-    /// Messages sent per iteration of the inner loop. `None` is
-    /// equivalent to 1. Included as a hook for future stress tests
-    /// that want to amortise the handshake cost across many
-    /// messages — but v0.0.1 sticks with one-message-per-RTT-sample.
-    pub iterations: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,14 +395,10 @@ fn classify_open_error(
 }
 
 /// Classify a mid-session error. All non-clean-close errors land here.
-fn classify_io_error(e: &WsError, stats: &mut WsStats, live: Option<&LiveSnapshot>) {
+fn classify_io_error(_e: &WsError, stats: &mut WsStats, live: Option<&LiveSnapshot>) {
     stats.errors_io += 1;
     if let Some(l) = live {
-        let kind = match e {
-            WsError::Io(_) => zerobench_core::stats::ErrorKind::Read,
-            _ => zerobench_core::stats::ErrorKind::Read,
-        };
-        l.record_error(kind);
+        l.record_error(zerobench_core::stats::ErrorKind::Read);
     }
 }
 

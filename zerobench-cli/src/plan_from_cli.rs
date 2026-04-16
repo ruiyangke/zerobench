@@ -403,7 +403,6 @@ pub fn build_ws_plan(
         path,
         headers: args.headers.clone(),
         message: bytes::Bytes::copy_from_slice(args.ws_message.as_bytes()),
-        iterations: None,
     };
 
     Ok((plan, opts))

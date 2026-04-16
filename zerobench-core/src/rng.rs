@@ -4,9 +4,12 @@
 //! Xoshiro256++ (via [`rand_xoshiro`]) — a small-state, fast, non-crypto
 //! PRNG. Each worker owns its own [`BenchRng`] so there is zero contention.
 //!
-//! Security: this RNG is **not** a CSPRNG. It's fine for `{{rand_int}}`,
-//! `{{rand_hex}}`, and `{{rand_str}}` bodies (load-generation payloads),
-//! but the WebSocket masking code (Task 15) must use `getrandom` directly.
+//! Security: this RNG is **not** a CSPRNG in the authentication sense.
+//! It's fine for load-generation payloads (`{{rand_int}}`, `{{rand_hex}}`,
+//! `{{rand_str}}`) and for WebSocket frame-mask generation (RFC 6455 §10.3),
+//! where the threat model is cache-poisoning by naive intermediaries rather
+//! than key-recovery — Xoshiro256++ seeded from OS entropy is immune to that
+//! class of attack absent memory disclosure.
 
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;

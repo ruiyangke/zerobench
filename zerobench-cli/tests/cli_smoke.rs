@@ -887,9 +887,17 @@ fn cli_ws_flag_runs_and_reports_messages() {
         stdout.contains("messages"),
         "missing 'messages' line:\n{stdout}"
     );
-    // 0 received means the runner never got a response.
-    assert!(
-        !stdout.contains("0 received"),
-        "reported 0 messages received:\n{stdout}"
-    );
+    // Parse the "messages  N sent  M received ..." line and assert M > 0.
+    // Earlier versions used `contains("0 received")` which falsely matched
+    // any count ending in 0 (e.g. `"100 received"`).
+    let received = stdout
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim_start().strip_prefix("messages")?;
+            let (_sent, after) = rest.trim_start().split_once(" sent")?;
+            let (count, _tail) = after.trim_start().split_once(" received")?;
+            count.trim().replace(',', "").parse::<u64>().ok()
+        })
+        .expect("messages line must have a parsable `received` count");
+    assert!(received > 0, "reported 0 messages received:\n{stdout}");
 }
