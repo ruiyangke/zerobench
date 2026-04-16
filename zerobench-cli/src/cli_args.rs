@@ -124,6 +124,12 @@ pub enum CliFormat {
     Terminal,
     /// Full JSON summary written at end-of-run.
     Json,
+    /// Stream one JSON line per second during the run; final terminal
+    /// summary is written to stderr so stdout stays pure JSONL.
+    Jsonl,
+    /// Prometheus textfile format emitted at end-of-run (no output
+    /// during the run).
+    Prom,
 }
 
 // ---------------------------------------------------------------------------

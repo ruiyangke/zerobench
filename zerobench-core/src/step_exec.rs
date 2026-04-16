@@ -14,8 +14,11 @@
 //! All items are `pub(crate)`: they're internal implementation detail
 //! shared between the two dispatcher modules.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
+use crate::live_snapshot::LiveSnapshot;
 use crate::plan::{Assertion, Extract, RequestPlan};
 use crate::scenario_context::ScenarioContext;
 use crate::stats::{ErrorKind, TaskStats};
@@ -25,6 +28,8 @@ use crate::transport::{Response, TransportError};
 ///
 /// - Tallies 4xx/5xx into the task's per-kind error counters.
 /// - Records latency/TTFB/bytes into the task stats.
+/// - If `live` is `Some`, also feeds the sample into the shared
+///   [`LiveSnapshot`] so the per-second JSONL ticker sees it.
 /// - Applies extracts so later steps' templates can reference them.
 /// - Runs assertions; a failed assertion bumps
 ///   [`ErrorKind::AssertionFailed`] but does not abort the iteration.
@@ -34,14 +39,21 @@ pub(crate) fn process_response(
     resp: &Response,
     ctx: &mut ScenarioContext,
     stats: &mut TaskStats,
+    live: Option<&Arc<LiveSnapshot>>,
 ) {
     // Status-class error tracking first — 4xx / 5xx are countable
     // errors even though the request completed on the wire.
     let status = resp.status;
     if (400..500).contains(&status) {
         stats.record_error(scenario_id, ErrorKind::Status4xx);
+        if let Some(l) = live {
+            l.record_error(ErrorKind::Status4xx);
+        }
     } else if (500..600).contains(&status) {
         stats.record_error(scenario_id, ErrorKind::Status5xx);
+        if let Some(l) = live {
+            l.record_error(ErrorKind::Status5xx);
+        }
     }
 
     // Record the successful wire-level exchange (latency/TTFB/bytes).
@@ -52,6 +64,13 @@ pub(crate) fn process_response(
         resp.bytes_sent,
         resp.bytes_received,
     );
+    if let Some(l) = live {
+        l.record(
+            resp.total.as_nanos().min(u128::from(u64::MAX)) as u64,
+            resp.bytes_sent,
+            resp.bytes_received,
+        );
+    }
 
     // Apply extracts.
     for extract in &req.extract {
@@ -63,8 +82,19 @@ pub(crate) fn process_response(
     for check in &req.checks {
         if !check_assertion(check, resp) {
             stats.record_error(scenario_id, ErrorKind::AssertionFailed);
+            if let Some(l) = live {
+                l.record_error(ErrorKind::AssertionFailed);
+            }
         }
     }
+}
+
+/// Report a transport-level error to the shared [`LiveSnapshot`], in
+/// addition to the usual task-stats record. Caller is responsible for
+/// having already classified the error via [`classify_transport_error`]
+/// and passed the category to `TaskStats::record_error`.
+pub(crate) fn record_transport_error_live(live: &Arc<LiveSnapshot>, kind: ErrorKind) {
+    live.record_error(kind);
 }
 
 /// Write an [`Extract`]'s result into the scenario context.

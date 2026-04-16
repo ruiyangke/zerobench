@@ -46,13 +46,56 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Stand up the transport client.
     let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
 
+    // Set up live streaming for `--format jsonl`.
+    // `LiveSnapshot::new` already returns an `Arc`, so we keep it as
+    // is rather than double-wrapping.
+    let live = match args.format {
+        CliFormat::Jsonl => Some(zerobench_core::LiveSnapshot::new()),
+        _ => None,
+    };
+
+    // Spawn the per-second ticker task if we're streaming JSONL. The
+    // ticker writes one line per second to stdout; the final summary
+    // goes to stderr so pipelines capturing stdout get clean JSONL.
+    let ticker_stop = StopSignal::new();
+    let ticker_handle = if let Some(live) = &live {
+        let live = live.clone();
+        let stop = ticker_stop.clone();
+        Some(compio::runtime::spawn(
+            async move { jsonl_ticker(live, stop).await },
+        ))
+    } else {
+        None
+    };
+
     // Run.
     let stop = StopSignal::after(plan.duration);
     let stats = if open_loop {
-        run_open_loop::<HttpTransport>(&plan, client, args.connections, stop).await
+        run_open_loop::<HttpTransport>(
+            &plan,
+            client,
+            args.connections,
+            stop,
+            live.clone(),
+        )
+        .await
     } else {
-        run_saturate::<HttpTransport>(&plan, client, args.connections, stop).await
+        run_saturate::<HttpTransport>(
+            &plan,
+            client,
+            args.connections,
+            stop,
+            live.clone(),
+        )
+        .await
     };
+
+    // Stop the ticker and let it flush its final tick.
+    ticker_stop.stop();
+    if let Some(h) = ticker_handle {
+        let _ = h.await;
+    }
+
     let summary = Summary::merge(stats, plan.duration);
 
     // Render.
@@ -61,15 +104,31 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         CliColor::Auto => ColorChoice::Auto,
         CliColor::Never => ColorChoice::Never,
     };
-    let stdout = std::io::stdout();
-    let is_tty = stdout.is_terminal();
-    let mut out = stdout.lock();
     match args.format {
         CliFormat::Terminal => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
             print_terminal(&summary, &plan, color, is_tty, &mut out)?;
         }
         CliFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
             print_json(&summary, &plan, &mut out)?;
+        }
+        CliFormat::Jsonl => {
+            // JSONL lines were already streamed to stdout; emit the
+            // final terminal summary to stderr so stdout stays pure
+            // JSONL for downstream pipelines.
+            let stderr = std::io::stderr();
+            let is_tty = stderr.is_terminal();
+            let mut out = stderr.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Prom => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
         }
     }
 
@@ -85,5 +144,53 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Per-second ticker: wakes on integer-second boundaries relative to
+/// the `LiveSnapshot` start, calls `swap_and_snapshot`, emits one JSONL
+/// line to stdout. Exits when `stop` trips; emits one last tick on
+/// exit so any residual samples aren't lost.
+async fn jsonl_ticker(
+    live: std::sync::Arc<zerobench_core::LiveSnapshot>,
+    stop: StopSignal,
+) {
+    use std::io::Write;
+    let start = live.start();
+    let interval = std::time::Duration::from_secs(1);
+    let mut next = start + interval;
+    while !stop.is_stopped() {
+        let now = std::time::Instant::now();
+        let wait = if next > now {
+            next - now
+        } else {
+            std::time::Duration::ZERO
+        };
+        // Cap individual sleep at ~100ms so we wake promptly when
+        // `stop` trips between ticks.
+        let poll_wait = wait.min(std::time::Duration::from_millis(100));
+        compio::time::sleep(poll_wait).await;
+        if stop.is_stopped() {
+            break;
+        }
+        if std::time::Instant::now() < next {
+            // Hasn't been a full second yet — loop and poll again.
+            continue;
+        }
+        let tick = live.swap_and_snapshot();
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);
+        let _ = out.flush();
+        next += interval;
+    }
+
+    // Flush one final tick so stragglers aren't lost.
+    let tick = live.swap_and_snapshot();
+    if tick.requests > 0 {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);
+        let _ = out.flush();
     }
 }

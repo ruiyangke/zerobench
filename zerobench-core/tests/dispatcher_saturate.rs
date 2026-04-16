@@ -141,7 +141,7 @@ async fn saturate_single_scenario_fires_many_requests() {
 
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     // Transport-level request counter matches the stats total.
@@ -185,7 +185,7 @@ async fn saturate_multi_scenario_exercises_every_scenario() {
 
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 8, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 8, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     assert_eq!(summary.per_scenario.len(), 2);
@@ -226,7 +226,7 @@ async fn saturate_counts_assertion_failures_but_still_counts_requests() {
 
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     assert!(summary.requests > 0);
@@ -271,7 +271,7 @@ async fn saturate_extract_status_propagates_through_chained_url() {
     // default 200 status. Status::new default already sets 200.
     client.echo_status_header = None;
     let stop = StopSignal::after(plan.duration);
-    let _stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop).await;
+    let _stats = run_saturate::<FakeTransport>(&plan, client.clone(), 4, stop, None).await;
 
     // Every "second" URL observed must carry the 200 that the first
     // request emitted via Extract::StatusCode.
@@ -308,7 +308,7 @@ async fn saturate_respects_prefired_stop_signal() {
     let stop = StopSignal::new();
     stop.stop(); // trip before spawning
 
-    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 2, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 2, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
     // Workers check the flag before their first iteration, so requests
     // should be 0. The guard lives at the top of the loop; a tripped
@@ -323,7 +323,7 @@ async fn saturate_empty_plan_is_noop() {
     let plan = Plan::new();
     let client = FakeClient::new(200);
     let stop = StopSignal::after(Duration::from_millis(10));
-    let stats = run_saturate::<FakeTransport>(&plan, client, 4, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client, 4, stop, None).await;
     assert!(stats.is_empty());
 }
 
@@ -343,7 +343,7 @@ async fn saturate_zero_max_tasks_is_noop() {
     };
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<FakeTransport>(&plan, client, 0, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client, 0, stop, None).await;
     assert!(stats.is_empty());
 }
 
@@ -369,7 +369,7 @@ async fn saturate_pause_step_slows_throughput() {
 
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 1, stop).await;
+    let stats = run_saturate::<FakeTransport>(&plan, client.clone(), 1, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     // With a 20ms pause per iteration and a 250ms window, a single

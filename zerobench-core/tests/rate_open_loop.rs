@@ -124,7 +124,7 @@ async fn open_loop_constant_rate_matches_target() {
     client.service_time_us.store(100, Ordering::Relaxed);
     let stop = StopSignal::after(plan.duration);
 
-    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 50, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 50, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     let total = summary.requests;
@@ -162,7 +162,7 @@ async fn open_loop_captures_queue_time_in_latency() {
     client.slow_time_us.store(200_000, Ordering::Relaxed); // 200ms stall
     let stop = StopSignal::after(plan.duration);
 
-    let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     let p99 = summary.latency_p(99.0);
@@ -183,7 +183,7 @@ async fn open_loop_keepup_counter_fires_on_overload() {
     client.service_time_us.store(200, Ordering::Relaxed);
     let stop = StopSignal::after(plan.duration);
 
-    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 5, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 5, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     assert!(
@@ -200,7 +200,7 @@ async fn open_loop_empty_plan_is_noop() {
     let plan = Plan::new();
     let client = FakeClient::new();
     let stop = StopSignal::after(Duration::from_millis(10));
-    let stats = run_open_loop::<FakeTransport>(&plan, client, 4, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client, 4, stop, None).await;
     assert!(stats.is_empty());
 }
 
@@ -234,7 +234,7 @@ async fn open_loop_keepup_is_attributed_per_scenario() {
     client.service_time_us.store(500, Ordering::Relaxed);
     let stop = StopSignal::after(plan.duration);
 
-    let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client, 1, stop, None).await;
     let summary = Summary::merge(stats, plan.duration);
 
     assert_eq!(summary.per_scenario.len(), 2);
@@ -278,7 +278,7 @@ async fn open_loop_saturate_scenario_produces_no_tokens() {
     };
     let client = FakeClient::new();
     let stop = StopSignal::after(plan.duration);
-    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 4, stop).await;
+    let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 4, stop, None).await;
     assert!(stats.is_empty());
     assert_eq!(client.requests.load(Ordering::Relaxed), 0);
 }

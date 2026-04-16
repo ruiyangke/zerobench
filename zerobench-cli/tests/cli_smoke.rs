@@ -292,3 +292,98 @@ fn cli_request_file_against_local_server_succeeds() {
     );
 }
 
+#[test]
+fn cli_jsonl_format_streams_per_second_lines() {
+    let addr = spawn_server(200, b"pong");
+    let url = format!("http://{addr}/");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--saturate",
+            "-c",
+            "4",
+            "-d",
+            "3s",
+            "--color",
+            "never",
+            "--format",
+            "jsonl",
+            &url,
+        ])
+        .output()
+        .expect("run zerobench");
+
+    assert!(
+        out.status.success(),
+        "zerobench --format jsonl failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // stdout should be pure JSONL.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "expected at least 2 JSONL lines over 3s, got {}:\n{stdout}",
+        lines.len()
+    );
+
+    // Each line must parse as valid JSON.
+    let mut saw_nonzero_rps = false;
+    for l in &lines {
+        let v: serde_json::Value = serde_json::from_str(l).expect("valid json");
+        assert!(v.get("rps").is_some(), "missing rps in line: {l}");
+        if v["rps"].as_u64().unwrap_or(0) > 0 {
+            saw_nonzero_rps = true;
+        }
+    }
+    assert!(saw_nonzero_rps, "no JSONL line with nonzero rps:\n{stdout}");
+
+    // The terminal summary went to stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("actual rate") || stderr.contains("latency"),
+        "missing terminal summary on stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn cli_prometheus_format_emits_expected_block() {
+    let addr = spawn_server(200, b"pong");
+    let url = format!("http://{addr}/");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--saturate",
+            "-c",
+            "4",
+            "-d",
+            "500ms",
+            "--color",
+            "never",
+            "--format",
+            "prom",
+            &url,
+        ])
+        .output()
+        .expect("run zerobench");
+
+    assert!(
+        out.status.success(),
+        "zerobench --format prom failed: status={:?}\nstdout:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("zerobench_requests_total"),
+        "missing requests_total metric:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("zerobench_latency_seconds"),
+        "missing latency_seconds metric:\n{stdout}"
+    );
+}
+

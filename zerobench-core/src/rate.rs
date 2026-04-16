@@ -26,11 +26,14 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 
+use crate::live_snapshot::LiveSnapshot;
 use crate::plan::{Plan, RateProfile, Step};
 use crate::rng::from_entropy;
 use crate::scenario_context::ScenarioContext;
 use crate::stats::TaskStats;
-use crate::step_exec::{classify_transport_error, process_response};
+use crate::step_exec::{
+    classify_transport_error, process_response, record_transport_error_live,
+};
 use crate::stop::StopSignal;
 use crate::transport::{Response, Transport};
 
@@ -318,6 +321,7 @@ pub async fn run_open_loop<T: Transport>(
     client: T::Client,
     max_conns: usize,
     stop: StopSignal,
+    live: Option<Arc<LiveSnapshot>>,
 ) -> Vec<TaskStats> {
     if plan.scenarios.is_empty() || max_conns == 0 {
         return Vec::new();
@@ -371,8 +375,9 @@ pub async fn run_open_loop<T: Transport>(
         let client = client.clone();
         let rx = rx.clone();
         let stop = stop.clone();
+        let live = live.clone();
         let h = compio::runtime::spawn(async move {
-            worker_open_loop::<T>(plan, client, rx, stop, num_scenarios).await
+            worker_open_loop::<T>(plan, client, rx, stop, num_scenarios, live).await
         });
         worker_handles.push(h);
     }
@@ -424,6 +429,7 @@ async fn worker_open_loop<T: Transport>(
     rx: flume::Receiver<Token>,
     stop: StopSignal,
     num_scenarios: usize,
+    live: Option<Arc<LiveSnapshot>>,
 ) -> TaskStats {
     let mut stats = TaskStats::new(num_scenarios);
     let mut ctx = ScenarioContext::new(plan.vars.len(), from_entropy());
@@ -453,6 +459,7 @@ async fn worker_open_loop<T: Transport>(
             &mut ctx,
             &mut stats,
             token.intended_start,
+            live.as_ref(),
         )
         .await;
         ctx.clear_all();
@@ -472,6 +479,7 @@ async fn execute_steps_open_loop<T: Transport>(
     ctx: &mut ScenarioContext,
     stats: &mut TaskStats,
     intended_start: Instant,
+    live: Option<&Arc<LiveSnapshot>>,
 ) {
     let mut first_request = true;
     for step in steps {
@@ -485,14 +493,18 @@ async fn execute_steps_open_loop<T: Transport>(
                             total: patched,
                             ..resp
                         };
-                        process_response(scenario_id, req, &resp, ctx, stats);
+                        process_response(scenario_id, req, &resp, ctx, stats, live);
                         first_request = false;
                     } else {
-                        process_response(scenario_id, req, &resp, ctx, stats);
+                        process_response(scenario_id, req, &resp, ctx, stats, live);
                     }
                 }
                 Err(e) => {
-                    stats.record_error(scenario_id, classify_transport_error(&e));
+                    let kind = classify_transport_error(&e);
+                    stats.record_error(scenario_id, kind);
+                    if let Some(l) = live {
+                        record_transport_error_live(l, kind);
+                    }
                     break;
                 }
             },

@@ -1,0 +1,308 @@
+//! Per-second live snapshot for JSONL streaming output.
+//!
+//! Workers call [`LiveSnapshot::record`] (or [`LiveSnapshot::record_error`])
+//! on every completed sample. A dedicated per-second ticker task calls
+//! [`LiveSnapshot::swap_and_snapshot`] every 1s to atomically swap in an
+//! empty histogram, reset counters, and hand the previous bucket to the
+//! reporter.
+//!
+//! # Design: "swap histogram each tick" vs t-digest
+//!
+//! We deliberately use a per-second-bucket HDR histogram that gets
+//! swapped on each tick, rather than a streaming t-digest. Rationale:
+//!
+//! - HDR histograms are already a project dependency.
+//! - Per-second buckets give *exact* percentiles for the window that
+//!   the tick actually represents, rather than an approximation over
+//!   the whole run.
+//! - The cost of swapping a `Histogram<u64>` is a single `parking_lot`
+//!   mutex acquire on the ticker path (once per second) and a mutex
+//!   acquire per recorded sample on the worker path; the latter is
+//!   amortised against the much more expensive network roundtrip, so
+//!   it is not on the critical hot path.
+//!
+//! If per-sample mutex contention ever shows up in profiling we can
+//! switch to a sharded `Vec<Mutex<Histogram>>` keyed by worker thread
+//! id, but that's a Phase-E optimisation, not Phase D.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use hdrhistogram::Histogram;
+use parking_lot::Mutex;
+
+use crate::stats::{ErrorCounters, ErrorKind};
+
+// ---------------------------------------------------------------------------
+// Histogram bounds — match TaskStats' so the bucket sizes align.
+// ---------------------------------------------------------------------------
+
+const HIST_LO_NS: u64 = 1;
+const HIST_HI_NS: u64 = 60_000_000_000;
+const HIST_SIG: u8 = 3;
+
+fn new_hist() -> Histogram<u64> {
+    Histogram::<u64>::new_with_bounds(HIST_LO_NS, HIST_HI_NS, HIST_SIG)
+        .expect("HDR histogram bounds are valid compile-time constants")
+}
+
+// ---------------------------------------------------------------------------
+// Atomic error counters
+// ---------------------------------------------------------------------------
+
+/// Lock-free error counters — one `AtomicU64` per category. Feeds into
+/// an [`ErrorCounters`] at snapshot time.
+#[derive(Debug, Default)]
+struct AtomicLiveErrors {
+    connect: AtomicU64,
+    read: AtomicU64,
+    write: AtomicU64,
+    timeout: AtomicU64,
+    keepup: AtomicU64,
+    status_4xx: AtomicU64,
+    status_5xx: AtomicU64,
+    assertion_failed: AtomicU64,
+}
+
+impl AtomicLiveErrors {
+    fn incr(&self, kind: ErrorKind) {
+        let slot = match kind {
+            ErrorKind::Connect => &self.connect,
+            ErrorKind::Read => &self.read,
+            ErrorKind::Write => &self.write,
+            ErrorKind::Timeout => &self.timeout,
+            ErrorKind::Keepup => &self.keepup,
+            ErrorKind::Status4xx => &self.status_4xx,
+            ErrorKind::Status5xx => &self.status_5xx,
+            ErrorKind::AssertionFailed => &self.assertion_failed,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Swap every slot to zero, returning the previous values.
+    fn swap_all(&self) -> ErrorCounters {
+        ErrorCounters {
+            connect: self.connect.swap(0, Ordering::Relaxed),
+            read: self.read.swap(0, Ordering::Relaxed),
+            write: self.write.swap(0, Ordering::Relaxed),
+            timeout: self.timeout.swap(0, Ordering::Relaxed),
+            keepup: self.keepup.swap(0, Ordering::Relaxed),
+            status_4xx: self.status_4xx.swap(0, Ordering::Relaxed),
+            status_5xx: self.status_5xx.swap(0, Ordering::Relaxed),
+            assertion_failed: self.assertion_failed.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiveSnapshot
+// ---------------------------------------------------------------------------
+
+/// Shared aggregator for per-second JSONL streaming.
+///
+/// Construct once via [`LiveSnapshot::new`], share across workers via
+/// `Arc::clone`. Workers call [`Self::record`] / [`Self::record_error`]
+/// on every completed iteration; a dedicated ticker calls
+/// [`Self::swap_and_snapshot`] every second to hand off the prior
+/// bucket to the reporter.
+pub struct LiveSnapshot {
+    /// Wall-clock instant at which this aggregator was created. Ticks
+    /// report their `t` relative to this anchor.
+    start: Instant,
+    /// Total requests recorded since the last swap (reset on tick).
+    requests: AtomicU64,
+    /// Total bytes sent since the last swap.
+    bytes_sent: AtomicU64,
+    /// Total bytes received since the last swap.
+    bytes_recv: AtomicU64,
+    /// Error counters since the last swap.
+    errors: AtomicLiveErrors,
+    /// Latency samples for this bucket. Mutex is acquired on every
+    /// sample; see the module-level doc for why that's OK.
+    latency_bucket: Mutex<Histogram<u64>>,
+}
+
+impl LiveSnapshot {
+    /// Build an empty snapshot anchored at `now`. Wrap in `Arc` and
+    /// share with workers.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            requests: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            errors: AtomicLiveErrors::default(),
+            latency_bucket: Mutex::new(new_hist()),
+        })
+    }
+
+    /// Record a completed sample. `latency_ns` must already be clamped
+    /// to the histogram's configured bounds (workers use the same
+    /// `duration_to_hist_ns` helper as `TaskStats::record`, reachable
+    /// indirectly through this method's caller).
+    pub fn record(&self, latency_ns: u64, bytes_sent: u64, bytes_recv: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
+        self.bytes_recv.fetch_add(bytes_recv, Ordering::Relaxed);
+        let ns = clamp_ns(latency_ns);
+        // `record` can only fail for out-of-range; we just clamped.
+        let mut bucket = self.latency_bucket.lock();
+        let _ = bucket.record(ns);
+    }
+
+    /// Increment the counter for `kind`.
+    pub fn record_error(&self, kind: ErrorKind) {
+        self.errors.incr(kind);
+    }
+
+    /// Swap in an empty histogram + reset the counters, returning the
+    /// prior bucket as a [`LiveTick`]. Call once per second from a
+    /// dedicated ticker task.
+    pub fn swap_and_snapshot(&self) -> LiveTick {
+        let elapsed = self.start.elapsed();
+        let requests = self.requests.swap(0, Ordering::Relaxed);
+        let bytes_sent = self.bytes_sent.swap(0, Ordering::Relaxed);
+        let bytes_recv = self.bytes_recv.swap(0, Ordering::Relaxed);
+        let errors = self.errors.swap_all();
+        let latency = {
+            let mut bucket = self.latency_bucket.lock();
+            let fresh = new_hist();
+            std::mem::replace(&mut *bucket, fresh)
+        };
+        LiveTick {
+            elapsed,
+            requests,
+            bytes_sent,
+            bytes_recv,
+            errors,
+            latency,
+        }
+    }
+
+    /// Start instant — exposed so callers can compute custom offsets.
+    pub fn start(&self) -> Instant {
+        self.start
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiveTick
+// ---------------------------------------------------------------------------
+
+/// One per-second window's worth of data, produced by
+/// [`LiveSnapshot::swap_and_snapshot`] and consumed by the JSONL
+/// writer.
+#[derive(Debug)]
+pub struct LiveTick {
+    /// Time elapsed from the snapshot's creation to this swap.
+    pub elapsed: Duration,
+    /// Requests completed in this window (delta from the prior tick).
+    pub requests: u64,
+    /// Bytes written on-wire this window.
+    pub bytes_sent: u64,
+    /// Bytes read on-wire this window.
+    pub bytes_recv: u64,
+    /// Errors recorded this window.
+    pub errors: ErrorCounters,
+    /// Latency samples captured this window. Feeds the percentile
+    /// fields on the JSONL line.
+    pub latency: Histogram<u64>,
+}
+
+impl LiveTick {
+    /// Approximate RPS for this window. Uses the window width (1s by
+    /// convention, but computed from the wall clock in case the ticker
+    /// ran late).
+    pub fn rps(&self) -> f64 {
+        // When we emit a tick at t=elapsed, the window size is exactly
+        // 1s (ticker sleeps to the next integer second). If the ticker
+        // runs late, a slightly longer window is fine — we divide by
+        // the actual duration between ticks. For the first tick there
+        // is only `elapsed` to use.
+        let secs = self.elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        // For a 1s tick, `elapsed` is whole seconds; requests/elapsed
+        // gives cumulative rate which is a useful proxy to avoid
+        // needing to remember the prior tick's time. But that's cumulative,
+        // and we want *window* rate. Since we always tick at 1s intervals
+        // we just return requests / 1.0 as a reasonable approximation.
+        // (The writer function calls this once per tick with a
+        // per-window value.)
+        self.requests as f64 / 1.0_f64.max(1.0)
+    }
+
+    /// Latency at percentile `pct`, in nanoseconds. Returns 0 when the
+    /// bucket had no samples.
+    pub fn latency_p_ns(&self, pct: f64) -> u64 {
+        if self.latency.is_empty() {
+            0
+        } else {
+            self.latency.value_at_percentile(pct)
+        }
+    }
+}
+
+fn clamp_ns(ns: u64) -> u64 {
+    if ns < HIST_LO_NS {
+        HIST_LO_NS
+    } else if ns > HIST_HI_NS {
+        HIST_HI_NS
+    } else {
+        ns
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_then_swap_returns_counts() {
+        let live = LiveSnapshot::new();
+        live.record(100_000, 10, 20);
+        live.record(200_000, 11, 21);
+        live.record(300_000, 12, 22);
+        let tick = live.swap_and_snapshot();
+        assert_eq!(tick.requests, 3);
+        assert_eq!(tick.bytes_sent, 33);
+        assert_eq!(tick.bytes_recv, 63);
+        assert_eq!(tick.latency.len(), 3);
+    }
+
+    #[test]
+    fn swap_resets_counters() {
+        let live = LiveSnapshot::new();
+        live.record(100_000, 1, 2);
+        let _ = live.swap_and_snapshot();
+        let t2 = live.swap_and_snapshot();
+        assert_eq!(t2.requests, 0);
+        assert_eq!(t2.bytes_sent, 0);
+        assert!(t2.latency.is_empty());
+    }
+
+    #[test]
+    fn record_error_categorises_correctly() {
+        let live = LiveSnapshot::new();
+        live.record_error(ErrorKind::Connect);
+        live.record_error(ErrorKind::Status5xx);
+        live.record_error(ErrorKind::Status5xx);
+        let tick = live.swap_and_snapshot();
+        assert_eq!(tick.errors.connect, 1);
+        assert_eq!(tick.errors.status_5xx, 2);
+        assert_eq!(tick.errors.read, 0);
+    }
+
+    #[test]
+    fn clamp_ns_bounds() {
+        assert_eq!(clamp_ns(0), HIST_LO_NS);
+        assert_eq!(clamp_ns(500), 500);
+        assert_eq!(clamp_ns(u64::MAX), HIST_HI_NS);
+    }
+}

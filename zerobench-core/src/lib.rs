@@ -3,6 +3,7 @@
 //! See `docs/design.md` in the repo root for the architectural overview.
 
 pub mod dispatcher;
+pub mod live_snapshot;
 pub mod plan;
 pub mod rate;
 pub mod report;
@@ -17,11 +18,14 @@ pub mod transport;
 pub mod var;
 
 pub use dispatcher::run_saturate;
+pub use live_snapshot::{LiveSnapshot, LiveTick};
 pub use plan::{
     Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
 pub use rate::{run_open_loop, run_scheduler, KeepupCounter, Token};
-pub use report::{print_json, print_terminal, ColorChoice};
+pub use report::{
+    print_json, print_jsonl_tick, print_prometheus, print_terminal, ColorChoice,
+};
 pub use request_file::{
     parse_request_bytes, parse_request_file, parse_scenario_dir, ParsedRequest,
     RequestFileError, ScenarioEntry,

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use yansi::{Condition, Paint};
 
+use crate::live_snapshot::LiveTick;
 use crate::plan::Plan;
 use crate::stats::Summary;
 
@@ -317,6 +318,204 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
     serde_json::to_writer_pretty(&mut *out, &blob)?;
     writeln!(out)?;
     out.flush()
+}
+
+// ---------------------------------------------------------------------------
+// JSONL tick reporter
+// ---------------------------------------------------------------------------
+
+/// Render one per-second tick as a single JSON line. Used by the
+/// streaming `--format jsonl` path: the CLI calls this once per second
+/// during the run, piping to stdout while the terminal summary goes
+/// to stderr at end-of-run.
+///
+/// Format is stable; see docs/plans/2026-04-16-v0.0.1-impl.md Task 12.
+/// Consumers (Grafana, kibana, ad-hoc jq pipelines) must be able to
+/// round-trip every field as JSON — no NaN, no Infinity.
+pub fn print_jsonl_tick(tick: &LiveTick, out: &mut impl Write) -> io::Result<()> {
+    let t_secs = tick.elapsed.as_secs_f64();
+    let rps = if t_secs > 0.0 {
+        // The aggregator's window is always 1s by construction (the
+        // ticker wakes at integer second boundaries). RPS is just the
+        // per-window request count.
+        tick.requests as f64
+    } else {
+        0.0
+    };
+
+    let blob = serde_json::json!({
+        "t": round2(t_secs),
+        "rps": rps as u64,
+        "requests_delta": tick.requests,
+        "bytes_sent": tick.bytes_sent,
+        "bytes_recv": tick.bytes_recv,
+        "p50_ns":  tick.latency_p_ns(50.0),
+        "p90_ns":  tick.latency_p_ns(90.0),
+        "p99_ns":  tick.latency_p_ns(99.0),
+        "p99_9_ns": tick.latency_p_ns(99.9),
+        "errors": {
+            "connect": tick.errors.connect,
+            "read": tick.errors.read,
+            "write": tick.errors.write,
+            "timeout": tick.errors.timeout,
+            "keepup": tick.errors.keepup,
+            "status_4xx": tick.errors.status_4xx,
+            "status_5xx": tick.errors.status_5xx,
+            "assertion_failed": tick.errors.assertion_failed,
+        },
+    });
+    // Compact, single-line JSON — jq-friendly, one record per line.
+    serde_json::to_writer(&mut *out, &blob)?;
+    writeln!(out)?;
+    out.flush()
+}
+
+/// Round a float to 2 decimal places for stable JSON output.
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus textfile reporter
+// ---------------------------------------------------------------------------
+
+/// Render the final summary as a Prometheus textfile-format block.
+///
+/// One block, newline-separated, ready to drop into a
+/// `textfile_collector` directory or to scrape via `prometheus-file-sd`.
+/// Emits the four canonical metric families zerobench tracks:
+///
+/// - `zerobench_requests_total` (counter)
+/// - `zerobench_latency_seconds` (summary with p50/p90/p99/p99.9,
+///   plus `_sum` and `_count`)
+/// - `zerobench_errors_total{category=...}` (counter, one series per
+///   error category)
+/// - `zerobench_bytes_sent_total` / `zerobench_bytes_received_total`
+///   (counters)
+pub fn print_prometheus(
+    summary: &Summary,
+    _plan: &Plan,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    // requests_total
+    writeln!(
+        out,
+        "# HELP zerobench_requests_total Total HTTP requests executed."
+    )?;
+    writeln!(out, "# TYPE zerobench_requests_total counter")?;
+    writeln!(out, "zerobench_requests_total {}", summary.requests)?;
+    writeln!(out)?;
+
+    // latency_seconds — Prometheus convention is seconds-not-ns.
+    writeln!(
+        out,
+        "# HELP zerobench_latency_seconds HTTP request latency."
+    )?;
+    writeln!(out, "# TYPE zerobench_latency_seconds summary")?;
+    let p50 = ns_to_seconds(pct_ns(summary, 50.0));
+    let p90 = ns_to_seconds(pct_ns(summary, 90.0));
+    let p99 = ns_to_seconds(pct_ns(summary, 99.0));
+    let p999 = ns_to_seconds(pct_ns(summary, 99.9));
+    writeln!(
+        out,
+        "zerobench_latency_seconds{{quantile=\"0.5\"}} {}",
+        format_f64(p50)
+    )?;
+    writeln!(
+        out,
+        "zerobench_latency_seconds{{quantile=\"0.9\"}} {}",
+        format_f64(p90)
+    )?;
+    writeln!(
+        out,
+        "zerobench_latency_seconds{{quantile=\"0.99\"}} {}",
+        format_f64(p99)
+    )?;
+    writeln!(
+        out,
+        "zerobench_latency_seconds{{quantile=\"0.999\"}} {}",
+        format_f64(p999)
+    )?;
+    // Compute sum as mean(count) * count. HDR doesn't retain exact
+    // samples; we approximate with mean.
+    let mean_ns = summary.latency.mean();
+    let count = summary.requests;
+    let sum_seconds = (mean_ns / 1e9) * count as f64;
+    writeln!(
+        out,
+        "zerobench_latency_seconds_sum {}",
+        format_f64(sum_seconds)
+    )?;
+    writeln!(out, "zerobench_latency_seconds_count {count}")?;
+    writeln!(out)?;
+
+    // errors_total by category
+    writeln!(out, "# HELP zerobench_errors_total Errors by category.")?;
+    writeln!(out, "# TYPE zerobench_errors_total counter")?;
+    let e = &summary.errors;
+    let pairs = [
+        ("connect", e.connect),
+        ("read", e.read),
+        ("write", e.write),
+        ("timeout", e.timeout),
+        ("keepup", e.keepup),
+        ("status_4xx", e.status_4xx),
+        ("status_5xx", e.status_5xx),
+        ("assertion_failed", e.assertion_failed),
+    ];
+    for (cat, n) in pairs {
+        writeln!(
+            out,
+            "zerobench_errors_total{{category=\"{cat}\"}} {n}"
+        )?;
+    }
+    writeln!(out)?;
+
+    // bytes counters
+    writeln!(
+        out,
+        "# HELP zerobench_bytes_sent_total Request bytes sent on-wire."
+    )?;
+    writeln!(out, "# TYPE zerobench_bytes_sent_total counter")?;
+    writeln!(out, "zerobench_bytes_sent_total {}", summary.bytes_sent)?;
+    writeln!(out)?;
+
+    writeln!(
+        out,
+        "# HELP zerobench_bytes_received_total Response bytes received on-wire."
+    )?;
+    writeln!(out, "# TYPE zerobench_bytes_received_total counter")?;
+    writeln!(
+        out,
+        "zerobench_bytes_received_total {}",
+        summary.bytes_recv
+    )?;
+
+    out.flush()
+}
+
+fn pct_ns(summary: &Summary, pct: f64) -> u64 {
+    if summary.latency.is_empty() {
+        0
+    } else {
+        summary.latency.value_at_percentile(pct)
+    }
+}
+
+fn ns_to_seconds(ns: u64) -> f64 {
+    ns as f64 / 1e9
+}
+
+/// Prometheus-friendly f64 — no NaN / Infinity (both map to 0), fixed
+/// decimal with enough precision for a ns-scale value in seconds.
+fn format_f64(x: f64) -> String {
+    if !x.is_finite() {
+        "0".to_string()
+    } else if x == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{x:.6}")
+    }
 }
 
 // ---------------------------------------------------------------------------
