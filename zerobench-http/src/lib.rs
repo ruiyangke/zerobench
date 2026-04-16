@@ -3,3 +3,7 @@
 //! Built directly on `hyper` (via `cyper-core`'s compio↔hyper IO bridge),
 //! not on the high-level `cyper` client. Owning the connection lifecycle
 //! lets us pre-open pools, measure TTFB, and count wire bytes exactly.
+
+pub mod counting_stream;
+
+pub use counting_stream::CountingStream;
