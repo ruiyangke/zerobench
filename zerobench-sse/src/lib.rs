@@ -373,9 +373,13 @@ impl SseRunner {
             let frame = match compio::time::timeout(remaining, frame_fut).await {
                 Ok(Some(Ok(f))) => f,
                 Ok(Some(Err(_e))) => {
-                    // Network / protocol error mid-stream.
+                    // Network / protocol error mid-stream. Break rather
+                    // than early-return so the post-loop
+                    // `bytes_received` accumulation still runs — bytes
+                    // read before the error are real traffic and
+                    // belong in the stats.
                     stats.errors_read += 1;
-                    return;
+                    break;
                 }
                 Ok(None) => {
                     // Server closed the stream.
