@@ -244,6 +244,105 @@ fn pause_flag_does_not_break_rendering() {
     assert!(content.contains("PAUSED"), "missing pause indicator:\n{content}");
 }
 
+/// The errors panel must show every field on `ErrorCounters` — the spec
+/// lists all eight categories. A previous version forgot the
+/// `assertion_failed` row; this test guards that.
+#[test]
+fn errors_panel_shows_assertion_failed_row() {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut state = DashboardState::new(None, Duration::from_secs(10), "http://x".into());
+    let mut e = ErrorCounters::default();
+    e.assertion_failed = 42;
+    let mut h = fresh_hist();
+    let _ = h.record(1_000);
+    state.ingest(LiveTick {
+        elapsed: Duration::from_secs(1),
+        requests: 1,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        errors: e,
+        latency: h,
+    });
+
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let content = buffer_to_string(terminal.backend().buffer());
+
+    assert!(
+        content.contains("assert"),
+        "errors panel missing assertion_failed row:\n{content}"
+    );
+    // The counted value should also appear. `42` is safely non-ambiguous
+    // because all other seeded counters were 0.
+    assert!(
+        content.contains("42"),
+        "assertion_failed count (42) missing from render:\n{content}"
+    );
+}
+
+/// A p99.9 regression across the rolling-lookback window should
+/// produce the ▲ glyph with a positive percentage. Seeds enough ticks
+/// at a low latency to populate the baseline, then pushes high-latency
+/// ticks to produce a measurable regression.
+#[test]
+fn delta_indicator_renders_up_glyph_on_regression() {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut state = DashboardState::new(None, Duration::from_secs(60), "http://x".into());
+
+    // 10 ticks at 1ms so the baseline rolling window is fully populated
+    // at ~1ms when DELTA_LOOKBACK hits.
+    for i in 0..10 {
+        state.ingest(tick(i, 100, 1_000_000));
+    }
+    // Push 5 more ticks at 20ms so the current rolling window is
+    // entirely at 20ms while the DELTA_LOOKBACK-ago baseline was 1ms.
+    for i in 10..15 {
+        state.ingest(tick(i, 100, 20_000_000));
+    }
+
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let content = buffer_to_string(terminal.backend().buffer());
+
+    assert!(
+        content.contains("▲"),
+        "regression should render ▲ glyph:\n{content}"
+    );
+    assert!(
+        content.contains("%"),
+        "delta indicator should include a percent sign:\n{content}"
+    );
+}
+
+/// A p99.9 improvement across the rolling-lookback window should
+/// produce the ▼ glyph.
+#[test]
+fn delta_indicator_renders_down_glyph_on_improvement() {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut state = DashboardState::new(None, Duration::from_secs(60), "http://x".into());
+
+    // 10 slow ticks (baseline at 20ms).
+    for i in 0..10 {
+        state.ingest(tick(i, 100, 20_000_000));
+    }
+    // Then 5 fast ticks so current window is ~1ms vs baseline ~20ms.
+    for i in 10..15 {
+        state.ingest(tick(i, 100, 1_000_000));
+    }
+
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let content = buffer_to_string(terminal.backend().buffer());
+
+    assert!(
+        content.contains("▼"),
+        "improvement should render ▼ glyph:\n{content}"
+    );
+}
+
 #[test]
 fn log_pane_toggle_renders_extra_block() {
     let backend = TestBackend::new(120, 30);

@@ -270,6 +270,7 @@ fn render_errors(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Line::from(vec![Span::raw("write      "), counted(e.write)]),
         Line::from(vec![Span::raw("timeout    "), counted(e.timeout)]),
         Line::from(vec![Span::raw("keepup     "), counted(e.keepup)]),
+        Line::from(vec![Span::raw("assert     "), counted(e.assertion_failed)]),
         Line::from(vec![
             Span::raw("4xx/5xx    "),
             counted(e.status_4xx),

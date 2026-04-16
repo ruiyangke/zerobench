@@ -170,22 +170,24 @@ fn rolling_latency_none_when_empty() {
 fn p99_9_delta_reports_regression_after_lookback() {
     let mut s = DashboardState::new(None, Duration::from_secs(60), "x".into());
 
-    // First DELTA_LOOKBACK ticks at 1ms latency.
-    for i in 0..DELTA_LOOKBACK {
+    // Fewer than DELTA_LOOKBACK ticks — baseline not yet captured.
+    for i in 0..(DELTA_LOOKBACK - 1) {
         s.ingest(tick(i as u64, 100, 1_000_000));
     }
-    // prev_p99_9 not yet set; we need one more ingest to capture.
     assert!(s.p99_9_delta_pct().is_none());
 
-    // One more tick at 1ms → baseline captured ≈1ms.
-    s.ingest(tick(DELTA_LOOKBACK as u64, 100, 1_000_000));
+    // DELTA_LOOKBACK-th ingest captures the baseline from the oldest
+    // retained tick's cached rolling p99.9.
+    s.ingest(tick(DELTA_LOOKBACK as u64 - 1, 100, 1_000_000));
     let prev = s.prev_p99_9_ns.unwrap_or(0);
     assert!(prev > 0, "baseline should be captured");
 
-    // Now push several ticks at 10ms so the rolling window regresses.
+    // Push several ticks at 10ms so the rolling window regresses. We
+    // need at least ROLLING_LATENCY_WINDOW so the current rolling
+    // window is entirely inside the new high-latency regime.
     for i in 0..(ROLLING_LATENCY_WINDOW + 2) {
         s.ingest(tick(
-            DELTA_LOOKBACK as u64 + 1 + i as u64,
+            DELTA_LOOKBACK as u64 + i as u64,
             100,
             10_000_000,
         ));
@@ -195,6 +197,56 @@ fn p99_9_delta_reports_regression_after_lookback() {
     assert!(
         delta > 500.0,
         "expected large positive delta, got {delta}%",
+    );
+}
+
+#[test]
+fn p99_9_delta_uses_symmetric_rolling_windows() {
+    // Seed 5 early ticks at 1ms then 5 later ticks at 10ms (with a
+    // ROLLING_LATENCY_WINDOW-sized gap between them so neither window
+    // is contaminated by the other). Verify the delta reflects the
+    // rolling-vs-rolling comparison, not a single-tick spike vs
+    // rolling merge.
+    assert_eq!(ROLLING_LATENCY_WINDOW, 5);
+    assert_eq!(DELTA_LOOKBACK, 10);
+
+    let mut s = DashboardState::new(None, Duration::from_secs(60), "x".into());
+
+    // 10 ticks at 1ms. Once len == DELTA_LOOKBACK, the delta baseline
+    // becomes the cached rolling p99.9 of ticks[0], which was itself
+    // only a 1-tick window (~1ms). That's fine for this test — the
+    // rolling-vs-rolling guarantee is that *both sides* of the ratio
+    // are cached values, no longer mismatching 1-tick vs 5-tick.
+    for i in 0..DELTA_LOOKBACK {
+        s.ingest(tick(i as u64, 100, 1_000_000));
+    }
+
+    // Now push 5 more ticks at 10ms. After these, the current rolling
+    // window sits entirely at 10ms and the baseline comes from the
+    // cached rolling p99.9 of ticks[DELTA_LOOKBACK - 1 + 5 - 10] =
+    // ticks[4], whose rolling window was entirely at 1ms.
+    for i in 0..ROLLING_LATENCY_WINDOW {
+        s.ingest(tick(
+            DELTA_LOOKBACK as u64 + i as u64,
+            100,
+            10_000_000,
+        ));
+    }
+
+    let baseline = s.prev_p99_9_ns.expect("baseline should be set");
+    let current = s.rolling_p99_9_ns();
+    assert!(
+        baseline < 2_000_000,
+        "baseline should reflect the 1ms rolling window, got {baseline}ns",
+    );
+    assert!(
+        current > 5_000_000,
+        "current rolling p99.9 should reflect the 10ms regime, got {current}ns",
+    );
+    let delta = s.p99_9_delta_pct().unwrap();
+    assert!(
+        delta > 500.0 && delta < 2_000.0,
+        "expected rolling-vs-rolling delta near +900%, got {delta}%",
     );
 }
 

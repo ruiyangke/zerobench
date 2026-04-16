@@ -80,6 +80,11 @@ pub struct TickRecord {
     pub errors: ErrorCounters,
     /// Full window histogram — needed for the rolling-5s merge.
     pub latency: Histogram<u64>,
+    /// Rolling p99.9 over the `ROLLING_LATENCY_WINDOW` ticks ending at
+    /// this tick. Cached at ingest-time so the delta indicator can
+    /// compare two same-shaped rolling windows (baseline vs current)
+    /// without recomputing the baseline on every frame.
+    pub rolling_p99_9_ns: u64,
 }
 
 impl TickRecord {
@@ -101,6 +106,9 @@ impl TickRecord {
             p99_ns,
             errors: tick.errors,
             latency: tick.latency,
+            // Set by `DashboardState::ingest` once the tick has been
+            // pushed and the rolling window can be merged.
+            rolling_p99_9_ns: 0,
         }
     }
 }
@@ -131,8 +139,11 @@ pub struct DashboardState {
     /// Cumulative errors across the entire run.
     pub total_errors: ErrorCounters,
 
-    /// p99.9 from ~`DELTA_LOOKBACK` ticks ago, cached for rendering the
-    /// delta indicator. `None` until we have enough history.
+    /// Rolling-window p99.9 from `DELTA_LOOKBACK` ticks ago, cached for
+    /// rendering the delta indicator. `None` until we have enough
+    /// history. This is the *rolling* p99.9 snapshotted at that tick
+    /// (not the single-tick p99.9), so it is directly comparable to
+    /// [`Self::rolling_p99_9_ns`] for the current frame.
     pub prev_p99_9_ns: Option<u64>,
 
     /// User toggled via `p` — renderer skips `terminal.draw` when set.
@@ -168,24 +179,17 @@ impl DashboardState {
     }
 
     /// Fold a [`LiveTick`] into state. Updates cumulative counters,
-    /// appends to the ring (evicting the oldest when full), and
-    /// refreshes the p99.9 delta baseline.
+    /// appends to the ring (evicting the oldest when full), caches the
+    /// rolling p99.9 on the just-pushed tick, and refreshes the p99.9
+    /// delta baseline.
+    ///
+    /// The delta baseline is taken from the *rolling* p99.9 stored on
+    /// the tick at `len - DELTA_LOOKBACK` (which was itself computed
+    /// over the same [`ROLLING_LATENCY_WINDOW`]-sized window). That
+    /// keeps baseline and current both apples-to-apples rolling
+    /// windows, instead of comparing a single-tick baseline against a
+    /// multi-tick current.
     pub fn ingest(&mut self, tick: LiveTick) {
-        // Snapshot the "DELTA_LOOKBACK ticks ago" p99.9 *before* we
-        // push the new tick so the baseline stays aligned with the
-        // current-window number the UI will compute for this frame.
-        if self.ticks.len() >= DELTA_LOOKBACK {
-            // Tick at index `len - DELTA_LOOKBACK` is our reference.
-            let idx = self.ticks.len() - DELTA_LOOKBACK;
-            if let Some(ref_tick) = self.ticks.get(idx) {
-                self.prev_p99_9_ns = if ref_tick.latency.is_empty() {
-                    Some(0)
-                } else {
-                    Some(ref_tick.latency.value_at_percentile(99.9))
-                };
-            }
-        }
-
         self.total_requests += tick.requests;
         self.total_errors.merge(&tick.errors);
 
@@ -193,6 +197,48 @@ impl DashboardState {
         self.ticks.push_back(rec);
         while self.ticks.len() > MAX_TICKS {
             self.ticks.pop_front();
+        }
+
+        // Compute the rolling-window p99.9 *ending at the just-pushed
+        // tick* and store it on the record. This is the same
+        // calculation [`Self::rolling_latency`] performs; we duplicate
+        // a little code here to avoid borrow-checker issues around
+        // mutating the tick we just pushed while iterating the
+        // ring. Work is O(ROLLING_LATENCY_WINDOW) histogram merges
+        // once per second — trivial.
+        let rolling_p99_9 = self.compute_rolling_p99_9_ns();
+        if let Some(last) = self.ticks.back_mut() {
+            last.rolling_p99_9_ns = rolling_p99_9;
+        }
+
+        // Refresh the delta baseline: look `DELTA_LOOKBACK` ticks back
+        // and pull the already-cached rolling p99.9 (which was itself a
+        // rolling window at that time). That gives us a symmetric
+        // comparison — rolling-now vs rolling-then.
+        if self.ticks.len() >= DELTA_LOOKBACK {
+            let idx = self.ticks.len() - DELTA_LOOKBACK;
+            if let Some(ref_tick) = self.ticks.get(idx) {
+                self.prev_p99_9_ns = Some(ref_tick.rolling_p99_9_ns);
+            }
+        }
+    }
+
+    /// Internal helper: merge the rolling window of histograms and
+    /// return the p99.9 in nanoseconds. Returns 0 when the window is
+    /// empty. Used at ingest time to cache the value on `TickRecord`.
+    fn compute_rolling_p99_9_ns(&self) -> u64 {
+        if self.ticks.is_empty() {
+            return 0;
+        }
+        let mut hist = new_hist();
+        let start = self.ticks.len().saturating_sub(ROLLING_LATENCY_WINDOW);
+        for tick in self.ticks.iter().skip(start) {
+            let _ = hist.add(&tick.latency);
+        }
+        if hist.is_empty() {
+            0
+        } else {
+            hist.value_at_percentile(99.9)
         }
     }
 
@@ -276,16 +322,22 @@ impl DashboardState {
 
     /// Current-frame p99.9 in nanoseconds, derived from the rolling
     /// window. Returns 0 when no samples exist.
+    ///
+    /// After `ingest` has run, the last tick's `rolling_p99_9_ns` is
+    /// already the value we want — no need to remerge at render time.
     pub fn rolling_p99_9_ns(&self) -> u64 {
-        self.rolling_latency()
-            .map(|h| h.value_at_percentile(99.9))
-            .unwrap_or(0)
+        self.ticks.back().map(|t| t.rolling_p99_9_ns).unwrap_or(0)
     }
 
     /// Percent delta of the rolling p99.9 vs `prev_p99_9_ns`.
     /// Positive values = latency regressed (worse), negative = improved.
     /// Returns `None` until we have both a baseline and current
     /// samples.
+    ///
+    /// Both sides of the comparison are rolling-window p99.9s over the
+    /// same [`ROLLING_LATENCY_WINDOW`] — one from `DELTA_LOOKBACK`
+    /// ticks ago, one from the most recent tick. That makes the delta
+    /// reflect real drift in the tail rather than single-tick noise.
     pub fn p99_9_delta_pct(&self) -> Option<f64> {
         let baseline = self.prev_p99_9_ns?;
         if baseline == 0 {
