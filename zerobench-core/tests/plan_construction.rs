@@ -90,6 +90,7 @@ fn construct_full_plan_and_read_fields_back() {
             Assertion::StatusIn(smallvec![200, 201]),
             Assertion::LatencyUnder(Duration::from_millis(500)),
         ],
+        expect_streaming: false,
     };
 
     let fetch = RequestPlan {
@@ -102,6 +103,7 @@ fn construct_full_plan_and_read_fields_back() {
         body: None,
         extract: vec![Extract::StatusCode { into: token }],
         checks: vec![Assertion::StatusEq(200)],
+        expect_streaming: false,
     };
 
     let scenario = Scenario {
@@ -224,6 +226,7 @@ fn plan_roundtrips_through_serde_json() {
             Assertion::StatusIn(smallvec![200, 201]),
             Assertion::LatencyUnder(Duration::from_millis(500)),
         ],
+        expect_streaming: false,
     };
 
     let probe = RequestPlan {
@@ -233,6 +236,7 @@ fn plan_roundtrips_through_serde_json() {
         body: None,
         extract: vec![Extract::StatusCode { into: status_slot }],
         checks: vec![Assertion::StatusEq(200)],
+        expect_streaming: false,
     };
 
     let original = Plan {

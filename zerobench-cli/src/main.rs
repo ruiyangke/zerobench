@@ -80,7 +80,18 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let (plan, target, opts) = plan_from_cli::build(&args)?;
 
-    // Stand up the transport client.
+    // SSE takes a different path — it opens its own fresh connections
+    // per iteration rather than going through the shared `Http1Pool`.
+    // The `Response`'s single-shot shape doesn't fit the "many chunks
+    // over time" semantics of SSE, and the SseRunner wants per-chunk
+    // timing anyway. Everything else goes through the standard
+    // saturate / open-loop dispatcher below.
+    #[cfg(feature = "sse")]
+    if args.sse {
+        return run_sse(&args, &plan, &target, &opts).await;
+    }
+
+    // Stand up the transport client for the non-SSE path.
     let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
 
     // Set up live streaming for JSONL streaming OR the TUI dashboard —
@@ -297,5 +308,150 @@ fn format_url_label(target: &zerobench_core::transport::Target) -> String {
         format!("{scheme}://{}", target.host)
     } else {
         format!("{scheme}://{}:{}", target.host, target.port)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE dispatch
+// ---------------------------------------------------------------------------
+
+/// Drive the SSE benchmark loop, merge per-worker stats, and render a
+/// bespoke SSE report to stdout. Mirrors the shape of the main dispatch
+/// path, minus the open-loop / TUI / JSONL branches — those aren't
+/// wired for SSE in v0.0.1 (the design doc's §6 mentions SSE-specific
+/// stats blocks, but the live-snapshot / TUI integration is a later
+/// polish pass).
+#[cfg(feature = "sse")]
+async fn run_sse(
+    args: &CliArgs,
+    plan: &zerobench_core::plan::Plan,
+    target: &zerobench_core::transport::Target,
+    opts: &zerobench_core::transport::TransportOpts,
+) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use zerobench_core::plan::Step;
+
+    // Pull the single RequestPlan out of the single-scenario plan. The
+    // CLI always produces exactly one scenario with one Request step in
+    // SSE mode; fall back to a defensive error if that invariant is
+    // ever violated (e.g. `--requests DIR` with weighted scenarios
+    // reaches here in a future refactor).
+    let req = plan
+        .scenarios
+        .first()
+        .and_then(|s| s.steps.first())
+        .and_then(|s| match s {
+            Step::Request(r) => Some(r.clone()),
+            _ => None,
+        })
+        .ok_or("--sse requires exactly one scenario with one Request step")?;
+    let req = Arc::new(req);
+
+    let stop = StopSignal::after(plan.duration);
+    let t_start = std::time::Instant::now();
+
+    let stats = zerobench_sse::run_sse_saturate(
+        target.clone(),
+        opts.clone(),
+        req,
+        args.connections,
+        stop,
+    )
+    .await;
+    let duration = t_start.elapsed();
+    let summary = zerobench_sse::SseSummary::merge(stats, duration);
+
+    // Render the SSE report. A bespoke small block — the standard
+    // terminal reporter is built for per-request latency and doesn't
+    // surface chunks/s, inter-chunk gaps, etc.
+    render_sse_summary(&summary, args)?;
+
+    // Exit code: non-zero only on catastrophic failure — no streams
+    // started at all. Per-iteration connect errors (e.g. when the
+    // server throttles reconnects) are routine for SSE benchmarks
+    // that open fresh connections per iteration, so we don't fail on
+    // `errors_connect > 0`; the user sees the count in the report.
+    if summary.streams == 0 {
+        Ok(std::process::ExitCode::from(1))
+    } else {
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(feature = "sse")]
+fn render_sse_summary(
+    s: &zerobench_sse::SseSummary,
+    _args: &CliArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    writeln!(out, "SSE streaming")?;
+    writeln!(
+        out,
+        "  duration      {:.2}s",
+        s.duration.as_secs_f64()
+    )?;
+    writeln!(
+        out,
+        "  streams       {} started  {} completed",
+        s.streams, s.completed
+    )?;
+    writeln!(
+        out,
+        "  chunks        {} total  {:.0}/s",
+        s.chunks,
+        s.chunks_per_sec()
+    )?;
+    writeln!(
+        out,
+        "  bytes         {} received",
+        s.bytes_received
+    )?;
+
+    if !s.ttfb.is_empty() {
+        writeln!(
+            out,
+            "  TTFB          p50={}  p90={}  p99={}  max={}",
+            format_ns(s.ttfb.value_at_percentile(50.0)),
+            format_ns(s.ttfb.value_at_percentile(90.0)),
+            format_ns(s.ttfb.value_at_percentile(99.0)),
+            format_ns(s.ttfb.max()),
+        )?;
+    }
+    if !s.chunk_latency.is_empty() {
+        writeln!(
+            out,
+            "  chunk gap     p50={}  p90={}  p99={}  max={}",
+            format_ns(s.chunk_latency.value_at_percentile(50.0)),
+            format_ns(s.chunk_latency.value_at_percentile(90.0)),
+            format_ns(s.chunk_latency.value_at_percentile(99.0)),
+            format_ns(s.chunk_latency.max()),
+        )?;
+    }
+    writeln!(
+        out,
+        "  errors        connect={} read={}",
+        s.errors_connect, s.errors_read
+    )?;
+
+    Ok(())
+}
+
+/// Compact ns → human formatting (`1.23ms` / `456µs` / `789ns`).
+///
+/// Narrow helper for the SSE report; the main terminal reporter has
+/// its own formatter but that one's tied to HDR percentile queries.
+#[cfg(feature = "sse")]
+fn format_ns(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.0}µs", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
     }
 }

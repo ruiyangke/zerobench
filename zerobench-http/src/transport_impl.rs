@@ -33,7 +33,7 @@ use zerobench_core::transport::{
     HttpVersionPref, Response, Target, Transport, TransportError, TransportOpts,
 };
 
-use crate::h1::Http1Pool;
+use crate::h1::{Http1Pool, StreamingResponse};
 
 /// A cheap-to-clone dispatch handle over either an H1 pool or an H2
 /// client.
@@ -75,6 +75,32 @@ impl HttpClient {
             HttpClient::Http1(p) => p.exchange(plan, ctx).await,
             #[cfg(feature = "h2")]
             HttpClient::Http2(c) => c.exchange(plan, ctx).await,
+        }
+    }
+
+    /// Open a streaming exchange against the underlying client.
+    ///
+    /// Only HTTP/1 supports streaming in v0.0.1 — the SSE runner builds
+    /// its clients with `HttpVersionPref::Http1` explicitly, and this
+    /// method surfaces a clear `Protocol` error if called on the H2
+    /// variant (which has a different framing story that v0.0.1 doesn't
+    /// wire through).
+    ///
+    /// The caller owns the returned [`StreamingResponse`] and is
+    /// responsible for draining the body. Dropping it releases the
+    /// slot back to the pool; see [`StreamingResponse::invalidate`] for
+    /// error-path cleanup semantics.
+    pub async fn exchange_streaming(
+        &self,
+        plan: &RequestPlan,
+        ctx: &mut ScenarioContext,
+    ) -> Result<StreamingResponse, TransportError> {
+        match self {
+            HttpClient::Http1(p) => p.exchange_streaming(plan, ctx).await,
+            #[cfg(feature = "h2")]
+            HttpClient::Http2(_) => Err(TransportError::Protocol(
+                "streaming exchange is only implemented for HTTP/1 in v0.0.1".into(),
+            )),
         }
     }
 }

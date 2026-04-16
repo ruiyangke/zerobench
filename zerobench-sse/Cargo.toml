@@ -14,6 +14,14 @@ zerobench-http = { workspace = true }
 compio = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hdrhistogram = { workspace = true }
+cyper-core = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["client", "http1", "server"] }
 
 [lints]
 workspace = true

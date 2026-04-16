@@ -147,6 +147,26 @@ pub struct CliArgs {
     #[cfg(feature = "tui")]
     #[arg(long = "tui", action = ArgAction::SetTrue)]
     pub tui: bool,
+
+    /// Benchmark Server-Sent Events (SSE) streams instead of one-shot
+    /// HTTP requests.
+    ///
+    /// Each worker opens a long-lived SSE stream, reads `data:` events,
+    /// and records per-chunk latency until the stream closes or the
+    /// bench deadline fires. The reporter emits an additional block
+    /// with chunks/s, TTFB, chunk-gap percentiles, and clean-completion
+    /// count.
+    ///
+    /// With `-c N` in this mode, `N` is the number of concurrent SSE
+    /// streams. The default report's `requests` / `latency` figures are
+    /// *not* populated for SSE runs — they are stream-scoped, not
+    /// request-scoped. The SSE block is the authoritative output.
+    ///
+    /// Only available when the binary is built with `--features sse`
+    /// (on by default for the published `zerobench` crate).
+    #[cfg(feature = "sse")]
+    #[arg(long = "sse", action = ArgAction::SetTrue)]
+    pub sse: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -149,6 +149,16 @@ pub struct RequestPlan {
     /// Post-response assertions. Failure increments
     /// `errors.assertion_failed` but does not abort the scenario.
     pub checks: Vec<Assertion>,
+    /// The caller wants the response body delivered as a stream
+    /// ([`crate::transport::ResponseBody::Stream`]) rather than buffered.
+    /// Used by SSE plans so the runner can time each chunk as it arrives.
+    ///
+    /// Default `false` — the buffered path is the v0.0.1 baseline. Only
+    /// transports that advertise streaming support (`Http1Pool`, for now)
+    /// honour this flag; others transparently fall back to the buffered
+    /// path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_streaming: bool,
 }
 
 impl RequestPlan {
@@ -162,6 +172,7 @@ impl RequestPlan {
             body: None,
             extract: Vec::new(),
             checks: Vec::new(),
+            expect_streaming: false,
         }
     }
 }

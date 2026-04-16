@@ -59,18 +59,29 @@ pub enum BuildError {
 /// 3. `--requests DIR` — parse every `.http` file in the directory;
 ///    one scenario per file, weighted per `scenarios.toml`.
 pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError> {
-    // Transport opts are shared across all input modes.
+    // Transport opts are shared across all input modes. When --sse is on
+    // we force HTTP/1: v0.0.1's streaming path is only wired through
+    // `Http1Pool::exchange_streaming`, and HTTP/2 multiplexing would
+    // conflate chunk timing across concurrent streams anyway.
+    let http_version = match args.http_version {
+        CliHttpVersion::Auto => HttpVersionPref::Auto,
+        CliHttpVersion::H1 => HttpVersionPref::Http1,
+        CliHttpVersion::H2 => HttpVersionPref::Http2,
+    };
+    #[cfg(feature = "sse")]
+    let http_version = if args.sse {
+        HttpVersionPref::Http1
+    } else {
+        http_version
+    };
+
     let opts = TransportOpts {
         connect_timeout: args.connect_timeout,
         request_timeout: args.request_timeout,
         max_conns: args.connections,
         tcp_nodelay: true,
         insecure_tls: args.insecure,
-        http_version: match args.http_version {
-            CliHttpVersion::Auto => HttpVersionPref::Auto,
-            CliHttpVersion::H1 => HttpVersionPref::Http1,
-            CliHttpVersion::H2 => HttpVersionPref::Http2,
-        },
+        http_version,
     };
 
     if let Some(path) = &args.request_file {
@@ -141,6 +152,7 @@ fn build_from_url(
         body,
         extract: Vec::new(),
         checks,
+        expect_streaming: is_sse(args),
     };
 
     let rate = pick_rate_profile(args, 1.0);
@@ -188,6 +200,7 @@ fn build_from_request_file(
         body: parsed.body,
         extract: Vec::new(),
         checks,
+        expect_streaming: is_sse(args),
     };
 
     let rate = pick_rate_profile(args, 1.0);
@@ -270,6 +283,7 @@ fn build_from_request_dir(
             body: parsed.body,
             extract: Vec::new(),
             checks: checks.clone(),
+            expect_streaming: is_sse(args),
         };
         let rate = pick_rate_profile(args, entry.weight as f64);
         scenarios.push(Scenario {
@@ -319,6 +333,21 @@ fn build_from_request_dir(
 fn format_authority(t: &Target) -> String {
     let scheme = if t.tls { "https" } else { "http" };
     format!("{scheme}://{}:{}", t.host, t.port)
+}
+
+/// `true` when the user asked for SSE mode. Centralised behind a helper
+/// so the #[cfg(feature = "sse")] gate lives in one spot instead of
+/// smearing across every RequestPlan construction site.
+#[inline]
+fn is_sse(_args: &CliArgs) -> bool {
+    #[cfg(feature = "sse")]
+    {
+        _args.sse
+    }
+    #[cfg(not(feature = "sse"))]
+    {
+        false
+    }
 }
 
 fn build_checks(args: &CliArgs) -> Vec<Assertion> {

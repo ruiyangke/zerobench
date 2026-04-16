@@ -505,3 +505,127 @@ fn cli_http_version_h2_against_h2_server() {
 // the subprocess's StopSignal::after timer never gets serviced. That's
 // a pre-existing dispatcher concern orthogonal to Task 14; the positive
 // H2-path test above is enough to prove the --http-version flag works.
+
+// ---------------------------------------------------------------------------
+// SSE — feature-gated
+// ---------------------------------------------------------------------------
+
+/// Spawn a minimal SSE server that emits `chunks` `data:` events at
+/// `per_chunk` spacing, then optionally `data: [DONE]`.
+///
+/// Mirrors the sse_smoke test fixture but lives here so the CLI test
+/// doesn't depend on zerobench-sse's dev-deps.
+#[cfg(feature = "sse")]
+fn spawn_sse_server(
+    chunks: usize,
+    per_chunk: std::time::Duration,
+    send_done: bool,
+) -> std::net::SocketAddr {
+    use futures_util::stream::{self, StreamExt};
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    let bind = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = bind.local_addr().unwrap();
+    drop(bind);
+
+    let (ready_tx, ready_rx): (Sender<()>, _) = channel();
+
+    thread::spawn(move || {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = CompioTcpListener::bind(addr).await.unwrap();
+            let _ = ready_tx.send(());
+
+            loop {
+                let (socket, _peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                compio::runtime::spawn(async move {
+                    let io = HyperStream::new(socket);
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        let frames = (0..chunks).map(move |i| {
+                            let payload = format!("data: event-{i}\n\n");
+                            (payload, per_chunk)
+                        });
+                        let done = send_done.then(|| {
+                            ("data: [DONE]\n\n".to_string(), std::time::Duration::ZERO)
+                        });
+                        let chain: Vec<(String, std::time::Duration)> =
+                            frames.chain(done).collect();
+                        let s = stream::iter(chain).then(|(payload, wait)| async move {
+                            if !wait.is_zero() {
+                                compio::time::sleep(wait).await;
+                            }
+                            Ok::<_, Infallible>(Frame::data(Bytes::from(payload)))
+                        });
+                        let body = StreamBody::new(s);
+                        let mut resp = Response::new(body);
+                        resp.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("text/event-stream"),
+                        );
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                })
+                .detach();
+            }
+        });
+    });
+
+    ready_rx.recv().expect("sse server never bound");
+    addr
+}
+
+/// The CLI must dispatch `--sse` into the SseRunner path and render a
+/// block containing `chunks` / `SSE streaming` text with a non-zero
+/// count. Exit code should be 0 for a clean run where streams start
+/// and close cleanly.
+#[cfg(feature = "sse")]
+#[test]
+fn cli_sse_flag_runs_and_reports_chunks() {
+    // 20 chunks per stream, 5ms per chunk → ~100ms per stream.
+    let addr = spawn_sse_server(20, std::time::Duration::from_millis(5), true);
+    let url = format!("http://{addr}/events");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--sse",
+            "--saturate",
+            "-c",
+            "4",
+            "-d",
+            "1s",
+            "--color",
+            "never",
+            &url,
+        ])
+        .output()
+        .expect("run zerobench");
+
+    assert!(
+        out.status.success(),
+        "zerobench --sse failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SSE streaming"),
+        "missing 'SSE streaming' block:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("chunks"),
+        "missing 'chunks' line in SSE block:\n{stdout}"
+    );
+    // Should have received > 0 chunks over 1 second against a stream
+    // that emits 20 chunks per 100ms.
+    assert!(
+        !stdout.contains("chunks        0 total"),
+        "reported 0 chunks — SSE path didn't receive any events:\n{stdout}"
+    );
+}

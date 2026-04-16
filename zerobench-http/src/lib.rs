@@ -17,7 +17,7 @@ pub use conn::{Connected, open};
 pub use counting_stream::CountingStream;
 
 #[cfg(feature = "h1")]
-pub use h1::Http1Pool;
+pub use h1::{Http1Pool, StreamingResponse};
 #[cfg(feature = "h2")]
 pub use h2::Http2Client;
 #[cfg(feature = "h1")]

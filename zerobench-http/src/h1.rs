@@ -28,9 +28,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use compio::runtime::spawn;
 use cyper_core::HyperStream;
-use futures_util::lock::Mutex;
-use http::{HeaderValue, Request};
+use futures_util::lock::{Mutex, OwnedMutexGuard};
+use http::{HeaderMap, HeaderValue, Request};
 use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
 use zerobench_core::plan::{BodySource, RequestPlan};
 use zerobench_core::scenario_context::ScenarioContext;
@@ -59,13 +60,18 @@ struct Slot {
 /// Pre-opened HTTP/1 connection pool.
 ///
 /// `Arc<Http1Pool>` is the `Transport::Client` for `HttpTransport`.
+///
+/// Slots are held as `Arc<Mutex<Slot>>` (not plain `Mutex<Slot>`) so the
+/// streaming path ([`Http1Pool::exchange_streaming`]) can return an
+/// owned lock guard that outlives the immediate `&self` borrow — the
+/// stream body must own the slot until the consumer finishes draining.
 #[derive(Debug)]
 pub struct Http1Pool {
     /// One mutex per slot. `futures_util::lock::Mutex` is chosen for
     /// the async-await API and fairness; `async-lock` or
     /// `parking_lot::Mutex` + manual parking would also work but add a
     /// dep or hand-rolled machinery.
-    slots: Box<[Mutex<Slot>]>,
+    slots: Box<[Arc<Mutex<Slot>>]>,
     /// Round-robin cursor. We take `fetch_add` mod `slots.len()` as
     /// the starting slot; if it's busy, we spin to the next.
     next_idx: AtomicUsize,
@@ -97,10 +103,10 @@ impl Http1Pool {
         }
         let results = futures_util::future::join_all(pending).await;
 
-        let mut slots: Vec<Mutex<Slot>> = Vec::with_capacity(opts.max_conns);
+        let mut slots: Vec<Arc<Mutex<Slot>>> = Vec::with_capacity(opts.max_conns);
         for res in results {
             let slot = res?;
-            slots.push(Mutex::new(slot));
+            slots.push(Arc::new(Mutex::new(slot)));
         }
 
         Ok(Self {
@@ -251,6 +257,156 @@ impl Http1Pool {
             ttfb,
             total,
         })
+    }
+
+    /// Send one request through the pool and return the response headers
+    /// plus a handle to the streaming body.
+    ///
+    /// Unlike [`Self::exchange`], the response body is **not** collected
+    /// into memory before the method returns. The caller gets access to
+    /// the raw [`hyper::body::Incoming`] (pre-dechunked by hyper) and can
+    /// poll frames at its own pace. The slot's mutex is held by the
+    /// returned [`StreamingResponse`] until it is dropped, so the
+    /// connection is reserved for as long as the caller needs to consume
+    /// the stream. This is the entry point used by the SSE runner to
+    /// time per-chunk latency.
+    ///
+    /// Errors are surfaced the same way as [`Self::exchange`]: connect,
+    /// timeout, protocol, etc. Timeouts here cover only the "send request
+    /// → first response frame" window; the caller is responsible for
+    /// enforcing any overall stream deadline it cares about.
+    pub async fn exchange_streaming(
+        &self,
+        plan: &RequestPlan,
+        ctx: &mut ScenarioContext,
+    ) -> Result<StreamingResponse, TransportError> {
+        // --- Build the request (template expansion happens here) ----
+        let req = build_request(&self.target, plan, ctx)?;
+
+        // --- Acquire an owned slot guard --------------------------------
+        //
+        // The streaming path returns after response headers arrive but
+        // *before* the body is drained. We need to keep the slot locked
+        // for the duration of the stream, which outlives the `&self`
+        // borrow — hence `lock_owned` (needs `Arc<Mutex<Slot>>` on our
+        // side), and the caller holds the returned `StreamingResponse`.
+        let start_idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
+        let n = self.slots.len();
+        let mut guard_opt: Option<(usize, OwnedMutexGuard<Slot>)> = None;
+        for offset in 0..n {
+            let idx = (start_idx + offset) % n;
+            if let Some(g) = self.slots[idx].clone().try_lock_owned() {
+                guard_opt = Some((idx, g));
+                break;
+            }
+        }
+        let (slot_idx, mut guard) = match guard_opt {
+            Some(g) => g,
+            None => {
+                let idx = start_idx % n;
+                let g = self.slots[idx].clone().lock_owned().await;
+                (idx, g)
+            }
+        };
+
+        // --- Send request + await response headers -----------------------
+        let t0 = Instant::now();
+        let sender = guard
+            .sender
+            .as_mut()
+            .ok_or_else(|| TransportError::Connect(format!("slot {slot_idx} unavailable")))?;
+
+        let send_fut = sender.send_request(req);
+        let res = match compio::time::timeout(self.request_timeout, send_fut).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
+                guard.sender = None;
+                return Err(TransportError::Protocol(format!("send_request: {e}")));
+            }
+            Err(_) => {
+                guard.sender = None;
+                return Err(TransportError::Timeout);
+            }
+        };
+
+        let ttfb = t0.elapsed();
+
+        // Detach headers from the response so `body` owns its own frame
+        // stream without being tied to the response envelope.
+        let status = res.status().as_u16();
+        let headers = res.headers().clone();
+        let body = res.into_body();
+
+        Ok(StreamingResponse {
+            status,
+            headers,
+            ttfb,
+            body,
+            read_ctr: Arc::clone(&guard.read_ctr),
+            written_ctr: Arc::clone(&guard.written_ctr),
+            _guard: guard,
+        })
+    }
+}
+
+/// Response returned from [`Http1Pool::exchange_streaming`].
+///
+/// Owns the response's streaming body plus the slot guard that backs it.
+/// When the `StreamingResponse` is dropped the slot is released back to
+/// the pool. If the connection died mid-stream, the slot's internal
+/// `sender` must be nulled by the *caller* before drop (via
+/// [`Self::invalidate`]) — the pool has no way to know the stream ended
+/// in error otherwise, and a subsequent `exchange` on the same slot
+/// would try to reuse a broken `SendRequest`.
+///
+/// `body` is hyper's post-dechunked frame stream: `body.frame().await`
+/// yields data bytes already stripped of HTTP/1.1 chunked-encoding
+/// framing. See the zerobench-sse crate for the line-level SSE parsing
+/// that consumes these bytes.
+pub struct StreamingResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response headers.
+    pub headers: HeaderMap,
+    /// Time from sending the first byte to receiving the first byte of
+    /// the status line.
+    pub ttfb: Duration,
+    /// Streaming body. Call `.frame().await` (via `BodyExt`) to pull
+    /// frames; hyper de-chunks HTTP/1 `Transfer-Encoding: chunked`
+    /// internally.
+    pub body: Incoming,
+    /// Shared handle to the slot's read-bytes counter. The caller can
+    /// snapshot before/after draining the stream to compute on-wire
+    /// bytes received.
+    pub read_ctr: Arc<AtomicU64>,
+    /// Shared handle to the slot's written-bytes counter. Snapshot
+    /// before the exchange starts to compute per-request write bytes.
+    pub written_ctr: Arc<AtomicU64>,
+    /// Owned slot guard; released on drop.
+    _guard: OwnedMutexGuard<Slot>,
+}
+
+impl StreamingResponse {
+    /// Invalidate the underlying slot.
+    ///
+    /// Call this if the stream errored or you dropped it mid-frame;
+    /// otherwise a subsequent `exchange` on the same slot would try to
+    /// reuse a sender whose connection state is undefined. Harmless to
+    /// call on a cleanly-drained stream — the slot is invalidated either
+    /// way, and v0.0.1 doesn't attempt lazy reconnect.
+    pub fn invalidate(mut self) {
+        self._guard.sender = None;
+        drop(self._guard);
+    }
+}
+
+impl std::fmt::Debug for StreamingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("ttfb", &self.ttfb)
+            .finish_non_exhaustive()
     }
 }
 
