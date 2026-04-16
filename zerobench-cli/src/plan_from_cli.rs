@@ -39,6 +39,12 @@ pub enum BuildError {
     RequestFile(#[from] RequestFileError),
     #[error("either a URL, --request-file, or --requests is required")]
     MissingInput,
+    /// Multiple `.http` files in a `--requests DIR` point at different
+    /// hosts/ports. The gateway/worker fan-out assumes all scenarios
+    /// share one target; silently using the first would give wrong
+    /// results.
+    #[error("--requests DIR contains scenarios pointing at different hosts:\n{0}")]
+    MultipleHosts(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +236,11 @@ fn build_from_request_dir(
     let checks = build_checks(args);
     let mut vars = VarRegistry::new();
     let mut scenarios: Vec<Scenario> = Vec::with_capacity(entries.len());
-    let mut target_from_first: Option<Target> = None;
+    let mut first_target: Option<(String, Target)> = None;
+    // Collect every scenario's (filename, host:port) so we can report
+    // the whole mismatch set in one shot rather than erroring on the
+    // second file.
+    let mut host_summary: Vec<(String, String)> = Vec::with_capacity(entries.len());
 
     for entry in &entries {
         let bytes = fs::read(&entry.file)?;
@@ -241,8 +251,11 @@ fn build_from_request_dir(
             .unwrap_or("request-file");
         let parsed = parse_request_bytes(&bytes, source_name, &mut vars)?;
 
-        if target_from_first.is_none() {
-            target_from_first = Some(parsed.target.clone());
+        let authority = format_authority(&parsed.target);
+        host_summary.push((source_name.to_string(), authority));
+
+        if first_target.is_none() {
+            first_target = Some((source_name.to_string(), parsed.target.clone()));
         }
 
         let request = RequestPlan {
@@ -261,7 +274,28 @@ fn build_from_request_dir(
         });
     }
 
-    let target = target_from_first.expect("at least one scenario");
+    // Detect and surface multi-host inconsistency. We compare by
+    // `(host, port, tls)` because those determine which TCP endpoint
+    // the transport opens; SNI overrides are per-connection metadata,
+    // not a routing key.
+    let (first_file, first) = first_target.expect("at least one scenario");
+    let first_authority = format_authority(&first);
+    let all_match = host_summary
+        .iter()
+        .all(|(_, a)| a == &first_authority);
+    if !all_match {
+        let mut lines = Vec::with_capacity(host_summary.len());
+        lines.push(format!("  {first_file}: {first_authority}"));
+        for (name, authority) in &host_summary {
+            if name == &first_file {
+                continue;
+            }
+            lines.push(format!("  {name}: {authority}"));
+        }
+        return Err(BuildError::MultipleHosts(lines.join("\n")));
+    }
+
+    let target = first;
     let plan = Plan {
         scenarios,
         vars,
@@ -274,6 +308,13 @@ fn build_from_request_dir(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Stable string form of a target's routing key (`host:port + scheme`).
+/// Used for multi-host mismatch error rendering.
+fn format_authority(t: &Target) -> String {
+    let scheme = if t.tls { "https" } else { "http" };
+    format!("{scheme}://{}:{}", t.host, t.port)
+}
 
 fn build_checks(args: &CliArgs) -> Vec<Assertion> {
     let mut checks: Vec<Assertion> = Vec::new();
@@ -445,5 +486,95 @@ mod tests {
             // Both name and value went through the engine.
             assert!(r.headers[0].1.part_count() > 0);
         }
+    }
+
+    #[test]
+    fn build_from_requests_dir_rejects_multiple_hosts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let pid = std::process::id();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zerobench-multihost-{pid}-{seq}-{nanos}"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two scenarios pointing at *different* hosts.
+        std::fs::write(
+            dir.join("a.http"),
+            "GET /a HTTP/1.1\nHost: api-one.example.com\n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.http"),
+            "GET /b HTTP/1.1\nHost: api-two.example.com\n\n",
+        )
+        .unwrap();
+
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--requests",
+            dir.to_str().unwrap(),
+        ]);
+        let err = build(&args).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        match err {
+            BuildError::MultipleHosts(details) => {
+                assert!(
+                    details.contains("api-one.example.com"),
+                    "details should list first host, got: {details}"
+                );
+                assert!(
+                    details.contains("api-two.example.com"),
+                    "details should list conflicting host, got: {details}"
+                );
+                assert!(details.contains("a.http"));
+                assert!(details.contains("b.http"));
+            }
+            other => panic!("expected MultipleHosts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_from_requests_dir_accepts_matching_hosts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let pid = std::process::id();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zerobench-samehost-{pid}-{seq}-{nanos}"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("login.http"),
+            "POST /login HTTP/1.1\nHost: api.example.com\n\n{}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("browse.http"),
+            "GET /browse HTTP/1.1\nHost: api.example.com\n\n",
+        )
+        .unwrap();
+
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--requests",
+            dir.to_str().unwrap(),
+        ]);
+        let result = build(&args);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (plan, target, _) = result.unwrap();
+        assert_eq!(plan.scenarios.len(), 2);
+        assert_eq!(target.host, "api.example.com");
     }
 }

@@ -25,7 +25,11 @@ pub struct CliArgs {
 
     /// Target URL. Optional when `--request-file` or `--requests` is
     /// passed — the URL is derived from the `.http` file's Host header
-    /// (or from an absolute URL in the request line).
+    /// (or from an absolute URL in the request line). Mutually
+    /// exclusive with the two file-based input modes so a command like
+    /// `zerobench --request-file foo.http http://bar/` doesn't silently
+    /// ignore one of the two inputs.
+    #[arg(conflicts_with_all = ["request_file", "requests"])]
     pub url: Option<String>,
 
     /// Parse a single `.http` request file (curl `--trace-ascii` format).
@@ -158,13 +162,21 @@ pub struct DiffArgs {
     pub current: PathBuf,
 
     /// p99 regression threshold in percent. A p99 increase above this
-    /// fraction counts as a regression. Default 5%.
-    #[arg(long = "threshold-p99", default_value_t = 5.0)]
+    /// fraction counts as a regression. Default 5%. Must be ≥ 0.
+    #[arg(
+        long = "threshold-p99",
+        default_value_t = 5.0,
+        value_parser = parse_threshold_flag,
+    )]
     pub threshold_p99: f64,
 
     /// RPS regression threshold in percent. An RPS decrease above this
-    /// fraction counts as a regression. Default 2%.
-    #[arg(long = "threshold-rps", default_value_t = 2.0)]
+    /// fraction counts as a regression. Default 2%. Must be ≥ 0.
+    #[arg(
+        long = "threshold-rps",
+        default_value_t = 2.0,
+        value_parser = parse_threshold_flag,
+    )]
     pub threshold_rps: f64,
 
     /// Output format for the diff.
@@ -269,6 +281,24 @@ pub fn parse_header_flag(s: &str) -> Result<(String, String), String> {
 /// single value (rather than a list of repeated occurrences).
 #[derive(Debug, Clone)]
 pub struct StatusList(pub Vec<u16>);
+
+/// Parse an f64 threshold value, rejecting negatives and non-finite
+/// numbers. Thresholds are percent values (e.g. `5.0` for 5%) — a
+/// negative tolerance is meaningless and almost certainly a typo.
+pub fn parse_threshold_flag(s: &str) -> Result<f64, String> {
+    let n: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid threshold {s:?}: {e}"))?;
+    if !n.is_finite() {
+        return Err(format!("threshold must be finite, got {n}"));
+    }
+    if n < 0.0 {
+        return Err(format!(
+            "threshold must be >= 0 (percent), got {n}"
+        ));
+    }
+    Ok(n)
+}
 
 /// Parse a comma-separated list of status codes.
 pub fn parse_status_list(s: &str) -> Result<StatusList, String> {
@@ -456,5 +486,64 @@ mod tests {
             .unwrap();
         assert_eq!(args.duration, Duration::from_secs(30));
         assert_eq!(args.connections, 50);
+    }
+
+    #[test]
+    fn args_request_file_conflicts_with_positional_url() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--request-file",
+            "/tmp/foo.http",
+            "http://example/",
+        ])
+        .unwrap_err();
+        // clap emits a `cannot be used` message for mutually-exclusive args.
+        assert!(
+            format!("{err}").contains("cannot be used"),
+            "expected conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn args_requests_dir_conflicts_with_positional_url() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--requests",
+            "/tmp/dir",
+            "http://example/",
+        ])
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot be used"),
+            "expected conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_threshold_rejects_negative() {
+        assert!(parse_threshold_flag("-1").is_err());
+        assert!(parse_threshold_flag("-0.01").is_err());
+        assert!(parse_threshold_flag("NaN").is_err());
+        assert_eq!(parse_threshold_flag("0").unwrap(), 0.0);
+        assert_eq!(parse_threshold_flag("5").unwrap(), 5.0);
+        assert!((parse_threshold_flag("2.5").unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn args_diff_rejects_negative_threshold() {
+        // Use `=` syntax so clap doesn't interpret `-3` as a short flag.
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "diff",
+            "b.json",
+            "c.json",
+            "--threshold-p99=-3",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("threshold") || msg.contains("invalid"),
+            "expected threshold error, got: {msg}"
+        );
     }
 }
