@@ -500,11 +500,21 @@ pub fn parse_scenario_dir(dir: &Path) -> Result<Vec<ScenarioEntry>, RequestFileE
         )));
     }
 
-    // Collect *.http files (non-recursive). Sort for deterministic order.
+    // Collect *.http files (non-recursive). Skip hidden files (leading
+    // `.`) — editors like vim scatter `.foo.http.swp` / `.foo.http~`
+    // backups that we absolutely don't want to treat as scenarios.
+    // Sort for deterministic order.
     let mut http_files: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        let file_name_is_hidden = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.');
+        if file_name_is_hidden {
+            continue;
+        }
         if path.is_file()
             && path
                 .extension()
@@ -589,12 +599,17 @@ fn parse_scenarios_toml(
     text: &str,
     dir: &Path,
 ) -> Result<std::collections::HashMap<String, f32>, RequestFileError> {
+    // `deny_unknown_fields` so a typo like `wieght = 0.5` or
+    // `[[scenarios]]` (plural) fails loudly rather than being silently
+    // ignored.
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct TomlRoot {
         #[serde(default)]
         scenario: Vec<TomlScenario>,
     }
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct TomlScenario {
         file: String,
         #[serde(default)]

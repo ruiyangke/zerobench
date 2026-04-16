@@ -450,3 +450,55 @@ fn empty_directory_errors() {
     let err = parse_scenario_dir(dir.path()).unwrap_err();
     assert!(matches!(err, RequestFileError::Scenario(_)));
 }
+
+#[test]
+fn hidden_files_are_skipped() {
+    // Editors leave `.foo.http.swp` files strewn around; they must not
+    // be treated as scenarios. Similarly `.hidden.http` (user intent).
+    let dir = write_scenario_dir();
+    std::fs::write(
+        dir.path().join(".login.http.swp"),
+        "garbage that would fail to parse",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".hidden.http"),
+        "POST /secret HTTP/1.1\nHost: h\n\n",
+    )
+    .unwrap();
+
+    let entries = parse_scenario_dir(dir.path()).unwrap();
+    // Only the two real scenarios — not the hidden entries.
+    assert_eq!(entries.len(), 2, "hidden files leaked: {entries:?}");
+    assert!(entries.iter().all(|e| !e.name.starts_with('.')));
+}
+
+#[test]
+fn scenarios_toml_rejects_unknown_fields() {
+    // Typo in the field name (`wieght` vs `weight`) must be a hard
+    // error rather than silently falling back to 0.0.
+    let dir = write_scenario_dir();
+    std::fs::write(
+        dir.path().join("scenarios.toml"),
+        r#"
+[[scenario]]
+file = "login.http"
+wieght = 0.1
+
+[[scenario]]
+file = "browse.http"
+weight = 0.9
+"#,
+    )
+    .unwrap();
+    let err = parse_scenario_dir(dir.path()).unwrap_err();
+    match err {
+        RequestFileError::Scenario(msg) => {
+            assert!(
+                msg.to_lowercase().contains("unknown") || msg.contains("wieght"),
+                "expected complaint about unknown field, got: {msg}"
+            );
+        }
+        other => panic!("expected Scenario error, got {other:?}"),
+    }
+}
