@@ -350,6 +350,65 @@ fn is_sse(_args: &CliArgs) -> bool {
     }
 }
 
+/// Extract the path-and-query portion of a URL (e.g. `/echo?x=1`) for
+/// use as the HTTP Upgrade target. Falls back to `/` when absent.
+///
+/// Used by the `--ws` dispatch path, which needs the path as a separate
+/// field on [`zerobench_ws::WsPlan`] (the rest of the URL goes into
+/// [`Target`]).
+#[cfg(feature = "ws")]
+pub fn extract_path_from_url(url: &str) -> String {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return "/".to_string(),
+    };
+    match rest.find(|c: char| c == '/' || c == '?' || c == '#') {
+        Some(i) => {
+            let p = &rest[i..];
+            // Strip fragment — it's client-side only.
+            match p.find('#') {
+                Some(j) => p[..j].to_string(),
+                None => p.to_string(),
+            }
+        }
+        None => "/".to_string(),
+    }
+}
+
+/// Build a [`WsPlan`] from the parsed CLI args + the positional URL.
+///
+/// The `--ws` path doesn't go through the regular [`Plan`] construction
+/// because the WebSocket benchmark doesn't need templates, scenarios,
+/// rate profiles, or any of the other Phase-C machinery. Everything the
+/// runner needs lives directly on [`WsPlan`].
+#[cfg(feature = "ws")]
+pub fn build_ws_plan(
+    args: &CliArgs,
+) -> Result<(zerobench_ws::WsPlan, zerobench_core::transport::TransportOpts), BuildError> {
+    let url = args.url.as_deref().ok_or(BuildError::MissingInput)?;
+    let target = Target::parse(url)?;
+    let path = extract_path_from_url(url);
+
+    let opts = zerobench_core::transport::TransportOpts {
+        connect_timeout: args.connect_timeout,
+        request_timeout: args.request_timeout,
+        max_conns: args.connections,
+        tcp_nodelay: true,
+        insecure_tls: args.insecure,
+        http_version: HttpVersionPref::Http1,
+    };
+
+    let plan = zerobench_ws::WsPlan {
+        target,
+        path,
+        headers: args.headers.clone(),
+        message: bytes::Bytes::copy_from_slice(args.ws_message.as_bytes()),
+        iterations: None,
+    };
+
+    Ok((plan, opts))
+}
+
 fn build_checks(args: &CliArgs) -> Vec<Assertion> {
     let mut checks: Vec<Assertion> = Vec::new();
     if let Some(code) = args.expect_status {

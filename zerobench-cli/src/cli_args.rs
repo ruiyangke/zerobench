@@ -167,6 +167,49 @@ pub struct CliArgs {
     #[cfg(feature = "sse")]
     #[arg(long = "sse", action = ArgAction::SetTrue)]
     pub sse: bool,
+
+    /// Benchmark WebSocket connections (RFC 6455) instead of one-shot
+    /// HTTP requests.
+    ///
+    /// Each worker opens one long-lived WebSocket connection against
+    /// the target, sends a text frame, reads the response frame, and
+    /// records the per-message round-trip time. Ping frames from the
+    /// server are auto-replied to; control frames are handled
+    /// internally.
+    ///
+    /// With `-c N` in this mode, `N` is the number of concurrent
+    /// WebSocket connections. The default report's `requests` /
+    /// `latency` figures are *not* populated; instead a dedicated
+    /// WebSocket block shows handshake time, RTT percentiles, messages
+    /// per second, byte totals, and per-category error counts.
+    ///
+    /// URLs accepted: `ws://host:port/path` (plain) and `wss://...`
+    /// (TLS — deferred until the rest of the stack's TLS path lands).
+    ///
+    /// Mutually exclusive with `--sse` and with an explicit
+    /// `--http-version`. Only available when the binary is built with
+    /// `--features ws` (on by default for the published `zerobench`
+    /// crate).
+    ///
+    /// The `--http-version` check is enforced at runtime because
+    /// clap's `conflicts_with` mechanism fires against default-valued
+    /// flags too — we only want to reject *explicit* `--http-version`
+    /// combined with `--ws`.
+    #[cfg(feature = "ws")]
+    #[arg(long = "ws", action = ArgAction::SetTrue)]
+    pub ws: bool,
+
+    /// Text payload to send on each WebSocket iteration. Defaults to
+    /// `"ping"`. Only visible when the binary was built with `ws`.
+    ///
+    /// A different value is useful when benchmarking echo servers
+    /// that care about message length (e.g. testing large-payload
+    /// throughput) or servers that route on the message body. The
+    /// payload is treated as a text frame — servers see it as UTF-8
+    /// (we don't validate — it's up to the operator).
+    #[cfg(feature = "ws")]
+    #[arg(long = "message", default_value = "ping")]
+    pub ws_message: String,
 }
 
 // ---------------------------------------------------------------------------

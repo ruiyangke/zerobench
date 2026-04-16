@@ -629,3 +629,267 @@ fn cli_sse_flag_runs_and_reports_chunks() {
         "reported 0 chunks — SSE path didn't receive any events:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket — feature-gated
+// ---------------------------------------------------------------------------
+
+/// Tiny WebSocket echo server spawned on its own thread (own compio
+/// runtime). Handshakes HTTP/1.1 Upgrade + echoes masked client text
+/// frames as unmasked server text frames, using zerobench-ws's codec.
+#[cfg(feature = "ws")]
+fn spawn_ws_echo_server() -> std::net::SocketAddr {
+    use compio::buf::BufResult;
+    use compio::io::{AsyncRead, AsyncWriteExt};
+    use zerobench_ws::frame::{encode_frame, Opcode};
+    use zerobench_ws::handshake::{compute_accept, find_headers_end};
+
+    fn extract_key(raw: &[u8]) -> Option<String> {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        if req.parse(raw).ok()?.is_partial() {
+            return None;
+        }
+        for h in req.headers {
+            if h.name.eq_ignore_ascii_case("sec-websocket-key") {
+                return std::str::from_utf8(h.value).ok().map(|s| s.trim().to_string());
+            }
+        }
+        None
+    }
+
+    let bind = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = bind.local_addr().unwrap();
+    drop(bind);
+
+    let (ready_tx, ready_rx): (Sender<()>, _) = channel();
+
+    thread::spawn(move || {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = CompioTcpListener::bind(addr).await.unwrap();
+            let _ = ready_tx.send(());
+            loop {
+                let (mut stream, _peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                compio::runtime::spawn(async move {
+                    // Pull HTTP request.
+                    let mut req_buf = Vec::with_capacity(1024);
+                    loop {
+                        if find_headers_end(&req_buf).is_some() {
+                            break;
+                        }
+                        let chunk: Vec<u8> = Vec::with_capacity(1024);
+                        let BufResult(res, returned) = stream.read(chunk).await;
+                        let n = match res {
+                            Ok(n) if n > 0 => n,
+                            _ => return,
+                        };
+                        req_buf.extend_from_slice(&returned[..n]);
+                        if req_buf.len() > 16 * 1024 {
+                            return;
+                        }
+                    }
+                    let headers_end = find_headers_end(&req_buf).unwrap();
+                    let key = match extract_key(&req_buf[..headers_end]) {
+                        Some(k) => k,
+                        None => return,
+                    };
+                    let accept = compute_accept(&key);
+                    let resp = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                         Upgrade: websocket\r\n\
+                         Connection: Upgrade\r\n\
+                         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    );
+                    if stream.write_all(resp.into_bytes()).await.0.is_err() {
+                        return;
+                    }
+
+                    // Echo loop.
+                    let mut recv = Vec::with_capacity(4096);
+                    if req_buf.len() > headers_end {
+                        recv.extend_from_slice(&req_buf[headers_end..]);
+                    }
+                    loop {
+                        // Minimal inline decoder — same shape as the
+                        // smoke-test server in zerobench-ws/tests.
+                        if recv.len() < 2 {
+                            let chunk: Vec<u8> = Vec::with_capacity(1024);
+                            let BufResult(res, returned) = stream.read(chunk).await;
+                            let n = match res {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            recv.extend_from_slice(&returned[..n]);
+                            continue;
+                        }
+                        let b0 = recv[0];
+                        let b1 = recv[1];
+                        let op = b0 & 0x0f;
+                        let masked = (b1 & 0x80) != 0;
+                        if !masked {
+                            return;
+                        }
+                        let short = (b1 & 0x7f) as u64;
+                        let (plen, hlen) = match short {
+                            0..=125 => (short as usize, 2usize),
+                            126 => {
+                                if recv.len() < 4 {
+                                    let chunk: Vec<u8> = Vec::with_capacity(1024);
+                                    let BufResult(res, returned) = stream.read(chunk).await;
+                                    let n = match res {
+                                        Ok(n) if n > 0 => n,
+                                        _ => return,
+                                    };
+                                    recv.extend_from_slice(&returned[..n]);
+                                    continue;
+                                }
+                                (
+                                    u16::from_be_bytes([recv[2], recv[3]]) as usize,
+                                    4,
+                                )
+                            }
+                            _ => {
+                                if recv.len() < 10 {
+                                    let chunk: Vec<u8> = Vec::with_capacity(1024);
+                                    let BufResult(res, returned) = stream.read(chunk).await;
+                                    let n = match res {
+                                        Ok(n) if n > 0 => n,
+                                        _ => return,
+                                    };
+                                    recv.extend_from_slice(&returned[..n]);
+                                    continue;
+                                }
+                                let len = u64::from_be_bytes([
+                                    recv[2], recv[3], recv[4], recv[5], recv[6],
+                                    recv[7], recv[8], recv[9],
+                                ]);
+                                (len as usize, 10)
+                            }
+                        };
+                        if recv.len() < hlen + 4 + plen {
+                            let chunk: Vec<u8> = Vec::with_capacity(1024);
+                            let BufResult(res, returned) = stream.read(chunk).await;
+                            let n = match res {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            recv.extend_from_slice(&returned[..n]);
+                            continue;
+                        }
+                        let mask = [
+                            recv[hlen],
+                            recv[hlen + 1],
+                            recv[hlen + 2],
+                            recv[hlen + 3],
+                        ];
+                        let pstart = hlen + 4;
+                        let pend = pstart + plen;
+                        let mut payload = Vec::with_capacity(plen);
+                        for (i, b) in recv[pstart..pend].iter().enumerate() {
+                            payload.push(b ^ mask[i & 3]);
+                        }
+                        recv.drain(..pend);
+
+                        // Echo text/binary, ack ping with pong, exit on close.
+                        let opcode = match op {
+                            0x1 => Opcode::Text,
+                            0x2 => Opcode::Binary,
+                            0x8 => {
+                                // Echo close and exit.
+                                let mut out = Vec::new();
+                                encode_frame(Opcode::Close, &payload, [0; 4], &mut out);
+                                // Convert to server shape (strip MASK bit + mask bytes).
+                                let short2 = out[1] & 0x7f;
+                                let ext = match short2 {
+                                    0..=125 => 0usize,
+                                    126 => 2,
+                                    _ => 8,
+                                };
+                                let ht = 2 + ext;
+                                let mut unmasked = Vec::with_capacity(ht + payload.len());
+                                unmasked.extend_from_slice(&out[..ht]);
+                                unmasked[1] &= 0x7f;
+                                unmasked.extend_from_slice(&out[ht + 4..]);
+                                let _ = stream.write_all(unmasked).await.0;
+                                return;
+                            }
+                            0x9 => Opcode::Pong,
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        encode_frame(opcode, &payload, [0; 4], &mut out);
+                        let short2 = out[1] & 0x7f;
+                        let ext = match short2 {
+                            0..=125 => 0usize,
+                            126 => 2,
+                            _ => 8,
+                        };
+                        let ht = 2 + ext;
+                        let mut unmasked = Vec::with_capacity(ht + payload.len());
+                        unmasked.extend_from_slice(&out[..ht]);
+                        unmasked[1] &= 0x7f;
+                        unmasked.extend_from_slice(&out[ht + 4..]);
+                        if stream.write_all(unmasked).await.0.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .detach();
+            }
+        });
+    });
+
+    ready_rx.recv().expect("ws server never bound");
+    addr
+}
+
+/// End-to-end: the `--ws` CLI flag runs the WS runner, renders a
+/// WebSocket block with non-zero messages.
+#[cfg(feature = "ws")]
+#[test]
+fn cli_ws_flag_runs_and_reports_messages() {
+    let addr = spawn_ws_echo_server();
+    let url = format!("ws://{addr}/echo");
+
+    let out = Command::new(zerobench_bin())
+        .args([
+            "--ws",
+            "-c",
+            "4",
+            "-d",
+            "1s",
+            "--color",
+            "never",
+            &url,
+        ])
+        .output()
+        .expect("run zerobench");
+
+    assert!(
+        out.status.success(),
+        "zerobench --ws failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("WebSocket"),
+        "missing 'WebSocket' block:\n{stdout}"
+    );
+    assert!(stdout.contains("rtt"), "missing 'rtt' line:\n{stdout}");
+    assert!(
+        stdout.contains("messages"),
+        "missing 'messages' line:\n{stdout}"
+    );
+    // 0 received means the runner never got a response.
+    assert!(
+        !stdout.contains("0 received"),
+        "reported 0 messages received:\n{stdout}"
+    );
+}

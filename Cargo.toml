@@ -87,6 +87,10 @@ rustls = { version = "0.23", features = ["ring"] }
 # Config file parsing
 toml = "0.8"
 
+# WebSocket primitives
+sha1 = "0.10"
+base64 = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

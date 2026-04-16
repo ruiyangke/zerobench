@@ -10,8 +10,22 @@ authors.workspace = true
 
 [dependencies]
 zerobench-core = { workspace = true }
+zerobench-http = { workspace = true }
 compio = { workspace = true }
 futures-util = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+httparse = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+hdrhistogram = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+compio = { workspace = true }
+httparse = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 
 [lints]

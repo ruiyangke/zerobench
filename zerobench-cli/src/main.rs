@@ -78,6 +78,31 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
+    // WS takes a completely separate path — no hyper, no templates,
+    // no scenario engine. `build_ws_plan` produces the narrow
+    // `WsPlan` that the runner wants. The check runs *before*
+    // `plan_from_cli::build` because WS URLs (`ws://`, `wss://`) also
+    // pass `Target::parse` but the usual Plan path would then try to
+    // template and build an HTTP request — not what we want.
+    #[cfg(feature = "ws")]
+    if args.ws {
+        // We also catch --ws + --sse here since both features may
+        // be compiled in.
+        #[cfg(feature = "sse")]
+        if args.sse {
+            return Err("--ws and --sse are mutually exclusive".into());
+        }
+        // Explicit --http-version with --ws is meaningless — the
+        // Upgrade handshake is HTTP/1.1 by spec.
+        if !matches!(args.http_version, cli_args::CliHttpVersion::Auto) {
+            return Err(
+                "--ws cannot be combined with an explicit --http-version (the RFC 6455 Upgrade is HTTP/1.1 by spec)"
+                    .into(),
+            );
+        }
+        return run_ws(&args).await;
+    }
+
     let (plan, target, opts) = plan_from_cli::build(&args)?;
 
     // SSE takes a different path — it opens its own fresh connections
@@ -445,6 +470,122 @@ fn render_sse_summary(
 /// its own formatter but that one's tied to HDR percentile queries.
 #[cfg(feature = "sse")]
 fn format_ns(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.0}µs", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket dispatch
+// ---------------------------------------------------------------------------
+
+/// Drive the WebSocket benchmark loop, merge per-worker stats, and render
+/// a bespoke WS report to stdout.
+///
+/// Mirrors the SSE dispatch shape — the WS runner is its own entry point
+/// rather than going through `Transport::exchange`, because a
+/// long-lived bidi connection doesn't fit the single-shot Response
+/// model (see comments on `zerobench_ws::lib`).
+#[cfg(feature = "ws")]
+async fn run_ws(
+    args: &CliArgs,
+) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    let (plan, _opts) = plan_from_cli::build_ws_plan(args)?;
+
+    let t_start = std::time::Instant::now();
+    let stop = StopSignal::after(args.duration);
+
+    let stats = zerobench_ws::run_ws_saturate(plan, args.connections, stop, None).await;
+    let duration = t_start.elapsed();
+    let summary = zerobench_ws::WsSummary::merge(stats, duration);
+
+    render_ws_summary(&summary)?;
+
+    // Exit code policy mirrors SSE: 0 for a clean run, 1 if no
+    // connection ever started (catastrophic) OR if every connection
+    // errored on handshake. Per-connection IO errors are informational
+    // for a bench tool.
+    if summary.handshake.is_empty() {
+        Ok(std::process::ExitCode::from(1))
+    } else if summary.messages_recvd == 0 {
+        // We handshook but nothing flowed — server accepted and
+        // dropped. Signal non-zero so CI pipelines notice.
+        Ok(std::process::ExitCode::from(1))
+    } else {
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(feature = "ws")]
+fn render_ws_summary(
+    s: &zerobench_ws::WsSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    writeln!(out, "WebSocket")?;
+    writeln!(
+        out,
+        "  duration      {:.2}s",
+        s.duration.as_secs_f64()
+    )?;
+    writeln!(
+        out,
+        "  connections   {} (handshake samples)",
+        s.handshake.len()
+    )?;
+
+    if !s.handshake.is_empty() {
+        writeln!(
+            out,
+            "  handshake     p50={}  p99={}  max={}",
+            format_ns_ws(s.handshake.value_at_percentile(50.0)),
+            format_ns_ws(s.handshake.value_at_percentile(99.0)),
+            format_ns_ws(s.handshake.max()),
+        )?;
+    }
+    if !s.rtt.is_empty() {
+        writeln!(
+            out,
+            "  rtt           p50={}  p90={}  p99={}  p99.9={}  max={}",
+            format_ns_ws(s.rtt.value_at_percentile(50.0)),
+            format_ns_ws(s.rtt.value_at_percentile(90.0)),
+            format_ns_ws(s.rtt.value_at_percentile(99.0)),
+            format_ns_ws(s.rtt.value_at_percentile(99.9)),
+            format_ns_ws(s.rtt.max()),
+        )?;
+    }
+    writeln!(
+        out,
+        "  messages      {} sent  {} received  {:.0}/s",
+        s.messages_sent,
+        s.messages_recvd,
+        s.messages_per_sec(),
+    )?;
+    writeln!(
+        out,
+        "  bytes         {} sent  {} received",
+        s.bytes_sent, s.bytes_recvd,
+    )?;
+    writeln!(
+        out,
+        "  errors        connect={}  upgrade={}  io={}  close={}",
+        s.errors_connect, s.errors_upgrade, s.errors_io, s.errors_close,
+    )?;
+
+    Ok(())
+}
+
+#[cfg(feature = "ws")]
+fn format_ns_ws(ns: u64) -> String {
     if ns >= 1_000_000_000 {
         format!("{:.2}s", ns as f64 / 1_000_000_000.0)
     } else if ns >= 1_000_000 {
