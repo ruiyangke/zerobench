@@ -130,12 +130,9 @@ async fn run_constant(
     let mut i: u64 = 0;
     while !stop.is_stopped() {
         let intended = started_at + period * (i as u32);
-        // If intended is already behind, don't sleep — emit immediately
-        // and move on (the "catch-up" path).
-        let now = Instant::now();
-        if intended > now {
-            compio::time::sleep(intended - now).await;
-        }
+        // Sleep until the intended emission time. If we're already
+        // behind (catch-up), sleep_until returns immediately.
+        compio::time::sleep_until(intended).await;
         match sender.try_send(Token {
             scenario_id,
             intended_start: intended,
@@ -162,55 +159,91 @@ async fn run_ramp(
     stop: StopSignal,
     keepup: KeepupCounter,
 ) {
-    // Integrate r(t) = from + (to-from)*t/over to get target count over
-    // time: N(t) = from*t + (to-from)*t^2/(2*over). We emit tokens when
-    // N(elapsed) >= next_index + 1.
+    // r(t) = from + (to-from)*t/over. Integrate to get
+    // N(t) = from*t + (to-from)*t²/(2*over) during the ramp, and
+    // N(t) = N(over) + to*(t-over) after.
     //
-    // After `over` elapses, continue at rate `to`.
+    // To emit token `n` at its exact intended time, we need `t` such
+    // that `N(t) = n`. Sleep until that `t`, then enqueue. This gives
+    // CO-free latency measurement with no polling jitter.
     let over_s = over.as_secs_f64().max(1e-9);
-    let mut emitted: u64 = 0;
+    let mut i: u64 = 0;
     while !stop.is_stopped() {
-        let elapsed = Instant::now().saturating_duration_since(started_at);
-        let t = elapsed.as_secs_f64();
-        let target = if t < over_s {
-            from * t + (to - from) * t * t / (2.0 * over_s)
-        } else {
-            let end_target = from * over_s + (to - from) * over_s / 2.0;
-            end_target + to * (t - over_s)
-        };
-        let target_count = target.max(0.0) as u64;
-        while emitted < target_count {
-            let intended = started_at + Duration::from_secs_f64(emitted as f64 / rate_at(from, to, over_s, emitted as f64).max(1e-9));
-            match sender.try_send(Token {
-                scenario_id,
-                intended_start: intended,
-            }) {
-                Ok(()) => emitted += 1,
-                Err(flume::TrySendError::Full(_)) => {
-                    keepup.inc();
-                    emitted += 1;
-                }
-                Err(flume::TrySendError::Disconnected(_)) => return,
+        let intended_offset = intended_offset_for(from, to, over_s, i as f64);
+        let intended = started_at + Duration::from_secs_f64(intended_offset.max(0.0));
+        // Sleep until the intended emission time. If we're already
+        // behind (catch-up), sleep_until returns immediately.
+        compio::time::sleep_until(intended).await;
+
+        match sender.try_send(Token {
+            scenario_id,
+            intended_start: intended,
+        }) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                keepup.inc();
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                break;
             }
         }
-        compio::time::sleep(Duration::from_millis(1)).await;
+        i = i.wrapping_add(1);
     }
 }
 
-/// Instantaneous rate at emission index `n` under a linear ramp
-/// `from → to` over `over_s` seconds. Used only to compute
-/// `intended_start`; we accept a minor rounding inaccuracy for the sake
-/// of simple math.
-fn rate_at(from: f64, to: f64, over_s: f64, n: f64) -> f64 {
-    // Assume linear-in-time r(t); approximate the corresponding `t`
-    // for emission n by inverting N(t). For a uniform average the
-    // approximation `t ≈ n / ((from + to) / 2)` suffices at this scale.
-    let avg = (from + to) / 2.0;
-    if avg <= 0.0 {
-        return from.max(1.0);
+/// Inverse of the cumulative-count function `N(t)` for a linear ramp
+/// `from → to` over `over_s` seconds. Returns the offset (in seconds
+/// from start) at which the `n`-th token should be emitted.
+///
+/// # Math
+///
+/// During the ramp (t ≤ over_s):
+///   N(t) = from·t + (to-from)·t²/(2·over_s) = n
+///   → a·t² + b·t − n = 0, where a = (to-from)/(2·over_s), b = from.
+///   Positive root: t = (−b + √(b² + 4an)) / (2a).
+///
+/// After the ramp (t > over_s), the rate is constant at `to`:
+///   N(t) = N(over_s) + to·(t − over_s)
+///   → t = over_s + (n − N(over_s)) / to.
+///
+/// # Edge cases
+///
+/// - `from == to` (degenerate ramp): fall back to the linear case
+///   `t = n / from`.
+/// - `from == 0 && to == 0`: no tokens; returns 0 (scheduler won't
+///   emit because the `target_count` stays 0).
+/// - `over_s` is guaranteed ≥ 1e-9 by the caller.
+fn intended_offset_for(from: f64, to: f64, over_s: f64, n: f64) -> f64 {
+    // Count emitted by the end of the ramp phase.
+    let n_end = (from + to) * over_s / 2.0;
+
+    // After-ramp: constant rate `to`.
+    if n > n_end {
+        if to <= 0.0 {
+            return over_s;
+        }
+        return over_s + (n - n_end) / to;
     }
-    let t = (n / avg).min(over_s);
-    from + (to - from) * t / over_s
+
+    // Degenerate: constant rate throughout — skip the quadratic.
+    if (to - from).abs() < f64::EPSILON {
+        if from <= 0.0 {
+            return 0.0;
+        }
+        return n / from;
+    }
+
+    // Ramp phase: solve the quadratic (to-from)/(2*over_s)·t² + from·t − n = 0.
+    let a = (to - from) / (2.0 * over_s);
+    let b = from;
+    // disc = b² + 4·a·n (since we're solving a·t² + b·t − n = 0,
+    // the discriminant is b² − 4·a·(−n) = b² + 4an).
+    let disc = b * b + 4.0 * a * n;
+    let disc_sqrt = disc.max(0.0).sqrt();
+    // Positive root. When a > 0 (ramp up), this is `(-b + sqrt)/2a`.
+    // When a < 0 (ramp down), the same formula gives the relevant root
+    // in the `[0, over_s]` domain because disc ≥ 0 and n ≤ n_end.
+    (-b + disc_sqrt) / (2.0 * a)
 }
 
 async fn run_stepped(
@@ -480,15 +513,73 @@ mod tests {
     }
 
     #[test]
-    fn rate_at_constant_rate_is_constant() {
-        // from == to degenerate case.
-        assert!((rate_at(100.0, 100.0, 1.0, 50.0) - 100.0).abs() < 1e-9);
+    fn intended_offset_degenerate_constant_rate() {
+        // from == to ramp — linear.
+        // 100 rps → token 50 at t=0.5s.
+        let t = intended_offset_for(100.0, 100.0, 1.0, 50.0);
+        assert!((t - 0.5).abs() < 1e-9, "got {t}");
     }
 
     #[test]
-    fn rate_at_linear_ramp_midpoint() {
-        // ramp 0 → 200 over 1s; at n=100 (elapsed ≈ 1s) rate should be ≈ 200.
-        let r = rate_at(0.0, 200.0, 1.0, 100.0);
-        assert!((r - 200.0).abs() < 1e-6, "got {r}");
+    fn intended_offset_steep_ramp_500th_near_0_707s() {
+        // 0 → 1000 rps over 1s: the k-th token lands at
+        //   N(t) = 0·t + 1000·t²/(2·1) = 500·t² = k
+        //   → t = sqrt(k/500)
+        // For k = 500: t = sqrt(1) = 1.0s.
+        // For k = 250: t = sqrt(0.5) ≈ 0.7071s.
+        // Task doc says "500th token of a 0→1000 ramp at ≈0.707s" — that
+        // corresponds to k=250 (i.e. the halfway point in count). Verify
+        // the exact math holds.
+        let t_250 = intended_offset_for(0.0, 1000.0, 1.0, 250.0);
+        assert!(
+            (t_250 - 0.5_f64.sqrt()).abs() < 1e-6,
+            "k=250 should be sqrt(0.5)s, got {t_250}"
+        );
+        // The old approximation would put token k=250 at t = 250/500 = 0.5s.
+        // Our quadratic form must be strictly greater than 0.5 at k=250,
+        // and at least a few ms away from 0.5.
+        assert!(
+            t_250 - 0.5 > 0.005,
+            "quadratic solution should be well above linear approx; got t_250={t_250}"
+        );
+
+        let t_500 = intended_offset_for(0.0, 1000.0, 1.0, 500.0);
+        assert!(
+            (t_500 - 1.0).abs() < 1e-6,
+            "last ramp token (k=500) should be at 1s, got {t_500}"
+        );
+    }
+
+    #[test]
+    fn intended_offset_endpoints_match() {
+        // Endpoint: N(0) = 0, so k=0 → t=0.
+        let t0 = intended_offset_for(100.0, 500.0, 2.0, 0.0);
+        assert!(t0.abs() < 1e-9, "got {t0}");
+        // Endpoint: N(over) = (from+to)*over/2 = 600. k=600 → t=2.0.
+        let t_end = intended_offset_for(100.0, 500.0, 2.0, 600.0);
+        assert!((t_end - 2.0).abs() < 1e-6, "got {t_end}");
+    }
+
+    #[test]
+    fn intended_offset_after_ramp_uses_to_rate() {
+        // 0 → 100 over 1s; post-ramp at 100 rps.
+        // N(1) = 50, then N(2) = 50 + 100*1 = 150.
+        // So token 100 lands at t = 1 + (100-50)/100 = 1.5s.
+        let t = intended_offset_for(0.0, 100.0, 1.0, 100.0);
+        assert!((t - 1.5).abs() < 1e-6, "got {t}");
+    }
+
+    #[test]
+    fn intended_offset_ramp_down_also_works() {
+        // 1000 → 0 rps over 1s — symmetric to the ramp-up case.
+        // N(t) = 1000·t − 500·t². Total over the ramp = 500 tokens.
+        // Midpoint-by-count (k=250): 500·t² − 1000·t + 250 = 0
+        //   → t² − 2t + 0.5 = 0 → t = 1 − sqrt(0.5) ≈ 0.293s.
+        let t = intended_offset_for(1000.0, 0.0, 1.0, 250.0);
+        let expected = 1.0 - 0.5_f64.sqrt();
+        assert!(
+            (t - expected).abs() < 1e-6,
+            "ramp-down k=250 should be ≈{expected}, got {t}"
+        );
     }
 }
