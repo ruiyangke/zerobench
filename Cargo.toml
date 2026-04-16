@@ -39,8 +39,8 @@ httparse = "1"
 cyper-core = "0.8"
 
 # Core utils
-bytes = "1"
-smallvec = { version = "1", features = ["union"] }
+bytes = { version = "1", features = ["serde"] }
+smallvec = { version = "1", features = ["union", "serde"] }
 
 # Stats / measurement
 hdrhistogram = "7"
