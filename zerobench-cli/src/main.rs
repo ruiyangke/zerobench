@@ -164,6 +164,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         let target_rate_opt = args.rate;
         let total_duration = plan.duration;
         let url_label = format_url_label(&target);
+        let transport_info = build_transport_info(&args, &target, &opts);
         let stop_for_tui = stop.clone();
         let handle = compio::runtime::spawn(async move {
             zerobench_tui::run_tui(
@@ -172,6 +173,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 target_rate_opt,
                 total_duration,
                 url_label,
+                transport_info,
             )
             .await
         });
@@ -335,6 +337,54 @@ fn format_url_label(target: &zerobench_core::transport::Target) -> String {
         format!("{scheme}://{}", target.host)
     } else {
         format!("{scheme}://{}:{}", target.host, target.port)
+    }
+}
+
+/// Build the transport info block the TUI shows in its header row.
+///
+/// Maps CLI args + target + opts into the TUI's wire-ready
+/// `TransportInfo`. Protocol is derived from `--http-version` (Auto →
+/// "H1" / "H2" based on TLS + ALPN capability), mode comes from
+/// `--rate` vs saturate default, ALPN is the label the H2 negotiation
+/// would announce.
+#[cfg(feature = "tui")]
+fn build_transport_info(
+    args: &CliArgs,
+    target: &zerobench_core::transport::Target,
+    opts: &zerobench_core::transport::TransportOpts,
+) -> zerobench_tui::TransportInfo {
+    use zerobench_core::transport::HttpVersionPref;
+    use zerobench_tui::{RunMode, TransportInfo};
+
+    let mode = match args.rate {
+        Some(r) => RunMode::Rate(r),
+        None => RunMode::Saturate(args.connections),
+    };
+
+    // Pick a protocol label. `Auto` prefers H2 on TLS (ALPN would pick
+    // it) and H1 otherwise. The label is informational — the actual
+    // wire protocol is negotiated at connect time — but it matches
+    // what the user intended well enough for the header.
+    let (protocol, alpn) = match opts.http_version {
+        HttpVersionPref::Http1 => ("H1".to_string(), Some("http/1.1".to_string())),
+        HttpVersionPref::Http2 => ("H2".to_string(), Some("h2".to_string())),
+        HttpVersionPref::Auto => {
+            if target.tls {
+                ("H2/H1".to_string(), Some("h2,http/1.1".to_string()))
+            } else {
+                ("H1".to_string(), None)
+            }
+        }
+    };
+    // Only show ALPN when TLS is on — ALPN is strictly a TLS extension.
+    let alpn = if target.tls { alpn } else { None };
+
+    TransportInfo {
+        mode,
+        connections: args.connections,
+        protocol,
+        tls: target.tls,
+        alpn,
     }
 }
 

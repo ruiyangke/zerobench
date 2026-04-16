@@ -8,6 +8,13 @@
 //! the standard end-of-run terminal report — so users always get a
 //! pastable summary even after using `--tui`.
 //!
+//! # Layout
+//!
+//! Tabbed, chart-rich dashboard modeled after btop / k9s / ctop. Four
+//! tabs (Overview / Latency / Throughput / Errors) share a persistent
+//! header (URL + status pill + transport info + elapsed) and footer
+//! (keybind reminder). A `?` overlay shows the full keymap.
+//!
 //! # Concurrency
 //!
 //! The TUI runs inside the same compio runtime as the benchmark
@@ -16,7 +23,7 @@
 //! - A 10 Hz render tick — redraws the ratatui terminal.
 //! - A 1 Hz snapshot tick — swaps the `LiveSnapshot` bucket and
 //!   ingests the resulting [`LiveTick`] into state.
-//! - Non-blocking keyboard polling — `q` / `p` / `l`.
+//! - Non-blocking keyboard polling — see [`handle_key`].
 //!
 //! Coalescing everything into one loop (rather than spawning
 //! independent tasks) keeps the `DashboardState` owned by a single
@@ -36,11 +43,11 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::DefaultTerminal;
 use zerobench_core::{LiveSnapshot, StopSignal};
 
-pub use state::DashboardState;
+pub use state::{DashboardState, RunMode, Tab, TransportInfo};
 pub use ui::render;
 
 // ---------------------------------------------------------------------------
@@ -65,18 +72,28 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// `target_rate` should be `Some(rate)` for open-loop runs and `None`
 /// for saturate. `total_duration` is used for the progress bar;
-/// `url_label` is shown in the header.
+/// `url_label` is shown in the header. `transport` feeds the transport
+/// info line (protocol · mode · TLS).
 pub async fn run_tui(
     snapshot: Arc<LiveSnapshot>,
     stop: StopSignal,
     target_rate: Option<f64>,
     total_duration: Duration,
     url_label: String,
+    transport: TransportInfo,
 ) -> io::Result<()> {
     // `ratatui::try_init` installs its own panic hook that invokes
     // `restore()` before the previous hook runs, so a mid-run panic
     // leaves the terminal usable without any extra plumbing here.
-    let result = run_tui_inner(snapshot, stop, target_rate, total_duration, url_label).await;
+    let result = run_tui_inner(
+        snapshot,
+        stop,
+        target_rate,
+        total_duration,
+        url_label,
+        transport,
+    )
+    .await;
 
     // Clean-exit restore. Ratatui's own panic hook handles the crash
     // path.
@@ -91,9 +108,11 @@ async fn run_tui_inner(
     target_rate: Option<f64>,
     total_duration: Duration,
     url_label: String,
+    transport: TransportInfo,
 ) -> io::Result<()> {
     let mut terminal: DefaultTerminal = ratatui::try_init()?;
-    let mut state = DashboardState::new(target_rate, total_duration, url_label);
+    let mut state =
+        DashboardState::new(target_rate, total_duration, url_label, transport);
 
     // `next_snapshot_at` tracks the wall-clock instant at which we'll
     // swap the LiveSnapshot bucket. Using a clock-anchored deadline
@@ -122,7 +141,7 @@ async fn run_tui_inner(
         // guaranteed not to block.
         if crossterm::event::poll(Duration::ZERO)? {
             if let Event::Key(key) = crossterm::event::read()? {
-                handle_key(&mut state, key.code);
+                handle_key(&mut state, key.code, key.modifiers);
             }
         }
 
@@ -164,10 +183,57 @@ async fn run_tui_inner(
 // Keyboard handling — extracted so unit tests can exercise it.
 // ---------------------------------------------------------------------------
 
-fn handle_key(state: &mut DashboardState, code: KeyCode) {
+/// Dispatch a key event against the dashboard state.
+///
+/// Kept here (not in `ui/`) because the keymap is part of the TUI's
+/// public behaviour contract: changing a binding ripples into the help
+/// overlay and the footer text and is easier to reason about in one
+/// place.
+pub(crate) fn handle_key(
+    state: &mut DashboardState,
+    code: KeyCode,
+    mods: KeyModifiers,
+) {
+    // Help overlay eats most keys while visible — only `?`, `Esc`, or
+    // `q` should close/quit.
+    if state.help_visible {
+        match code {
+            KeyCode::Char('?') | KeyCode::Esc => {
+                state.help_visible = false;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                state.exit_requested = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match code {
+        // --- quit ---------------------------------------------------
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
             state.exit_requested = true;
+        }
+
+        // --- tab navigation ----------------------------------------
+        KeyCode::Char('1') => state.current_tab = Tab::Overview,
+        KeyCode::Char('2') => state.current_tab = Tab::Latency,
+        KeyCode::Char('3') => state.current_tab = Tab::Throughput,
+        KeyCode::Char('4') => state.current_tab = Tab::Errors,
+        KeyCode::Tab => {
+            state.current_tab = if mods.contains(KeyModifiers::SHIFT) {
+                state.current_tab.prev()
+            } else {
+                state.current_tab.next()
+            };
+        }
+        KeyCode::BackTab => {
+            state.current_tab = state.current_tab.prev();
+        }
+
+        // --- overlay / toggles -------------------------------------
+        KeyCode::Char('?') => {
+            state.help_visible = true;
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             state.paused_rendering = !state.paused_rendering;
@@ -175,6 +241,10 @@ fn handle_key(state: &mut DashboardState, code: KeyCode) {
         KeyCode::Char('l') | KeyCode::Char('L') => {
             state.log_visible = !state.log_visible;
         }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            state.reset_peaks();
+        }
+
         _ => {}
     }
 }
@@ -187,40 +257,127 @@ fn handle_key(state: &mut DashboardState, code: KeyCode) {
 mod tests {
     use super::*;
 
+    fn ti() -> TransportInfo {
+        TransportInfo::default()
+    }
+
+    fn state() -> DashboardState {
+        DashboardState::new(None, Duration::from_secs(10), "x".into(), ti())
+    }
+
     #[test]
     fn q_sets_exit_requested() {
-        let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+        let mut s = state();
         assert!(!s.exit_requested);
-        handle_key(&mut s, KeyCode::Char('q'));
+        handle_key(&mut s, KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(s.exit_requested);
     }
 
     #[test]
     fn p_toggles_pause() {
-        let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+        let mut s = state();
         assert!(!s.paused_rendering);
-        handle_key(&mut s, KeyCode::Char('p'));
+        handle_key(&mut s, KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(s.paused_rendering);
-        handle_key(&mut s, KeyCode::Char('p'));
+        handle_key(&mut s, KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(!s.paused_rendering);
     }
 
     #[test]
     fn l_toggles_log() {
-        let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+        let mut s = state();
         assert!(!s.log_visible);
-        handle_key(&mut s, KeyCode::Char('l'));
+        handle_key(&mut s, KeyCode::Char('l'), KeyModifiers::NONE);
         assert!(s.log_visible);
-        handle_key(&mut s, KeyCode::Char('l'));
+        handle_key(&mut s, KeyCode::Char('l'), KeyModifiers::NONE);
         assert!(!s.log_visible);
     }
 
     #[test]
     fn unrecognised_key_is_noop() {
-        let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
-        handle_key(&mut s, KeyCode::Enter);
+        let mut s = state();
+        handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!s.exit_requested);
         assert!(!s.paused_rendering);
         assert!(!s.log_visible);
+    }
+
+    #[test]
+    fn digits_select_tabs() {
+        let mut s = state();
+        handle_key(&mut s, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Latency);
+        handle_key(&mut s, KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Throughput);
+        handle_key(&mut s, KeyCode::Char('4'), KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Errors);
+        handle_key(&mut s, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Overview);
+    }
+
+    #[test]
+    fn tab_cycles_forward() {
+        let mut s = state();
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Latency);
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Throughput);
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Errors);
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Overview);
+    }
+
+    #[test]
+    fn shift_tab_cycles_backward() {
+        let mut s = state();
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(s.current_tab, Tab::Errors);
+        handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Throughput);
+    }
+
+    #[test]
+    fn question_toggles_help() {
+        let mut s = state();
+        assert!(!s.help_visible);
+        handle_key(&mut s, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(s.help_visible);
+        // While visible, `?` closes it.
+        handle_key(&mut s, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(!s.help_visible);
+    }
+
+    #[test]
+    fn esc_closes_help_but_quits_when_not_visible() {
+        let mut s = state();
+        s.help_visible = true;
+        handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!s.help_visible);
+        assert!(!s.exit_requested);
+        // From the main view, Esc quits.
+        handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(s.exit_requested);
+    }
+
+    #[test]
+    fn r_resets_peaks() {
+        let mut s = state();
+        s.peak_rps = 1_000.0;
+        s.min_rps = Some(100.0);
+        handle_key(&mut s, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(s.peak_rps, 0.0);
+        assert!(s.min_rps.is_none());
+    }
+
+    #[test]
+    fn help_blocks_tab_navigation() {
+        // While help is visible, tab digits should be ignored — the
+        // overlay eats the key so the user doesn't accidentally switch
+        // panes behind the modal.
+        let mut s = state();
+        s.help_visible = true;
+        handle_key(&mut s, KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(s.current_tab, Tab::Overview);
     }
 }

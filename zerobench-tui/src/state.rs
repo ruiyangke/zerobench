@@ -1,7 +1,7 @@
 //! Dashboard state — folds [`LiveTick`]s into a bounded ring of
 //! per-second snapshots and exposes the derived figures the renderer
 //! needs (sparkline data, rolling-window latency, progress ratio,
-//! delta indicators).
+//! delta indicators, tab selection, peak/min trackers, transport info).
 //!
 //! # Why a ring of ticks rather than a t-digest?
 //!
@@ -17,10 +17,9 @@
 //!
 //! # Eviction
 //!
-//! `ticks` is a plain `Vec` capped at [`MAX_TICKS`]. On overflow the
-//! oldest entry is removed (O(N) amortised by the small cap — 300
-//! entries max at a 5-min run). At our tick rate (1 Hz) this is
-//! trivial; no need for a specialised ring buffer.
+//! `ticks` is a plain `VecDeque` capped at [`MAX_TICKS`]. At our tick
+//! rate (1 Hz) a 300-element ring covers 5 minutes — more than enough
+//! for any live run the TUI is intended to render.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -57,6 +56,124 @@ fn new_hist() -> Histogram<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+/// Top-level tab — user navigates with `1`/`2`/`3`/`4`, `Tab`, or
+/// `Shift-Tab`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Overview,
+    Latency,
+    Throughput,
+    Errors,
+}
+
+impl Tab {
+    /// Short label used in the tab bar.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Latency => "Latency",
+            Tab::Throughput => "Throughput",
+            Tab::Errors => "Errors",
+        }
+    }
+
+    /// Zero-based index into the ordered tab list — used by the
+    /// keyboard handler and the renderer's underline position.
+    pub const fn index(self) -> usize {
+        match self {
+            Tab::Overview => 0,
+            Tab::Latency => 1,
+            Tab::Throughput => 2,
+            Tab::Errors => 3,
+        }
+    }
+
+    /// Tab numbered 1-4 (as typed on the keyboard). Returns `None` for
+    /// out-of-range inputs so the key handler can ignore stray digits.
+    pub const fn from_digit(d: u8) -> Option<Self> {
+        match d {
+            1 => Some(Tab::Overview),
+            2 => Some(Tab::Latency),
+            3 => Some(Tab::Throughput),
+            4 => Some(Tab::Errors),
+            _ => None,
+        }
+    }
+
+    /// All tabs in display order. Used by the tab bar renderer and by
+    /// `Tab` / `Shift-Tab` cycling.
+    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Latency, Tab::Throughput, Tab::Errors];
+
+    /// Next tab, wrapping from Errors → Overview.
+    pub const fn next(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Latency,
+            Tab::Latency => Tab::Throughput,
+            Tab::Throughput => Tab::Errors,
+            Tab::Errors => Tab::Overview,
+        }
+    }
+
+    /// Previous tab, wrapping from Overview → Errors.
+    pub const fn prev(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Errors,
+            Tab::Latency => Tab::Overview,
+            Tab::Throughput => Tab::Latency,
+            Tab::Errors => Tab::Throughput,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunMode + TransportInfo
+// ---------------------------------------------------------------------------
+
+/// Run-mode classifier for the header subtitle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunMode {
+    /// Closed-loop saturate with the given connection count.
+    Saturate(usize),
+    /// Open-loop rate-targeted — f64 req/s.
+    Rate(f64),
+}
+
+/// Snapshot of the transport configuration, shown in the header bar.
+///
+/// Built once by `main.rs` before the TUI starts; the TUI doesn't
+/// mutate it.
+#[derive(Debug, Clone)]
+pub struct TransportInfo {
+    /// Saturate or open-loop rate.
+    pub mode: RunMode,
+    /// Connection count — mirrored on `Saturate(n)` but also meaningful
+    /// for open-loop where it bounds concurrency.
+    pub connections: usize,
+    /// Protocol label — `"H1"`, `"H2"`, `"H3"`, `"WS"`, `"SSE"`.
+    pub protocol: String,
+    /// TLS enabled on this run.
+    pub tls: bool,
+    /// ALPN choice — `"h2"`, `"http/1.1"`, or `None` if the run didn't
+    /// negotiate ALPN (plain HTTP, raw WS).
+    pub alpn: Option<String>,
+}
+
+impl Default for TransportInfo {
+    fn default() -> Self {
+        Self {
+            mode: RunMode::Saturate(1),
+            connections: 1,
+            protocol: "H1".into(),
+            tls: false,
+            alpn: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TickRecord
 // ---------------------------------------------------------------------------
 
@@ -71,11 +188,20 @@ pub struct TickRecord {
     pub elapsed: Duration,
     /// Requests completed in this 1s window.
     pub requests: u64,
+    /// Bytes sent on-wire in this 1s window.
+    pub bytes_sent: u64,
+    /// Bytes received on-wire in this 1s window.
+    pub bytes_recv: u64,
     /// p50 of the window in nanoseconds (cached off the histogram for
     /// cheap renderer access).
     pub p50_ns: u64,
+    /// p90 of the window in nanoseconds.
+    pub p90_ns: u64,
     /// p99 of the window in nanoseconds.
     pub p99_ns: u64,
+    /// p99.9 of the window in nanoseconds — drives the latency
+    /// time-series chart on the Latency tab.
+    pub p99_9_ns: u64,
     /// Errors recorded in this window.
     pub errors: ErrorCounters,
     /// Full window histogram — needed for the rolling-5s merge.
@@ -89,21 +215,25 @@ pub struct TickRecord {
 
 impl TickRecord {
     fn from_live(tick: LiveTick) -> Self {
-        let p50_ns = if tick.latency.is_empty() {
-            0
+        let (p50_ns, p90_ns, p99_ns, p99_9_ns) = if tick.latency.is_empty() {
+            (0, 0, 0, 0)
         } else {
-            tick.latency.value_at_percentile(50.0)
-        };
-        let p99_ns = if tick.latency.is_empty() {
-            0
-        } else {
-            tick.latency.value_at_percentile(99.0)
+            (
+                tick.latency.value_at_percentile(50.0),
+                tick.latency.value_at_percentile(90.0),
+                tick.latency.value_at_percentile(99.0),
+                tick.latency.value_at_percentile(99.9),
+            )
         };
         Self {
             elapsed: tick.elapsed,
             requests: tick.requests,
+            bytes_sent: tick.bytes_sent,
+            bytes_recv: tick.bytes_recv,
             p50_ns,
+            p90_ns,
             p99_ns,
+            p99_9_ns,
             errors: tick.errors,
             latency: tick.latency,
             // Set by `DashboardState::ingest` once the tick has been
@@ -131,6 +261,8 @@ pub struct DashboardState {
     pub total_duration: Duration,
     /// Human-friendly target URL for the header bar.
     pub url_label: String,
+    /// Transport metadata — protocol, connection count, TLS, ALPN.
+    pub transport: TransportInfo,
 
     /// Recent per-second ticks, newest last. Capped at [`MAX_TICKS`].
     pub ticks: VecDeque<TickRecord>,
@@ -139,18 +271,35 @@ pub struct DashboardState {
     /// Cumulative errors across the entire run.
     pub total_errors: ErrorCounters,
 
+    /// Cumulative bytes sent on-wire across the full run.
+    pub cumulative_bytes_sent: u64,
+    /// Cumulative bytes received on-wire across the full run.
+    pub cumulative_bytes_recv: u64,
+
+    /// Peak rps observed since start (or since last `reset_peaks`).
+    pub peak_rps: f64,
+    /// Min rps observed since start (or since last `reset_peaks`).
+    /// `None` until at least one non-zero tick has been ingested — a
+    /// warm-up full of zeroes otherwise pins the min at 0 forever.
+    pub min_rps: Option<f64>,
+
     /// Rolling-window p99.9 from `DELTA_LOOKBACK` ticks ago, cached for
     /// rendering the delta indicator. `None` until we have enough
     /// history. This is the *rolling* p99.9 snapshotted at that tick
-    /// (not the single-tick p99.9), so it is directly comparable to
-    /// [`Self::rolling_p99_9_ns`] for the current frame.
+    /// (not the single-tick p99.9), so it is directly comparable to the
+    /// most recent rolling_p99_9_ns for the current frame.
     pub prev_p99_9_ns: Option<u64>,
+
+    /// Current tab — toggled by `1`-`4`, `Tab`, `Shift-Tab`.
+    pub current_tab: Tab,
+    /// Help overlay visible — toggled by `?`.
+    pub help_visible: bool,
 
     /// User toggled via `p` — renderer skips `terminal.draw` when set.
     pub paused_rendering: bool,
     /// User toggled via `l` — renderer shows a "log (stub)" panel when
-    /// set. Phase v0.0.1 has no real log content; this is a
-    /// scaffolded toggle for future use.
+    /// set. v0.0.1 has no real log content; this is a scaffolded
+    /// toggle for future use.
     pub log_visible: bool,
     /// `q` pressed — main loop breaks on the next iteration.
     pub exit_requested: bool,
@@ -162,16 +311,24 @@ impl DashboardState {
         target_rate: Option<f64>,
         total_duration: Duration,
         url_label: String,
+        transport: TransportInfo,
     ) -> Self {
         Self {
             started_at: Instant::now(),
             target_rate,
             total_duration,
             url_label,
+            transport,
             ticks: VecDeque::with_capacity(MAX_TICKS),
             total_requests: 0,
             total_errors: ErrorCounters::default(),
+            cumulative_bytes_sent: 0,
+            cumulative_bytes_recv: 0,
+            peak_rps: 0.0,
+            min_rps: None,
             prev_p99_9_ns: None,
+            current_tab: Tab::Overview,
+            help_visible: false,
             paused_rendering: false,
             log_visible: false,
             exit_requested: false,
@@ -180,8 +337,8 @@ impl DashboardState {
 
     /// Fold a [`LiveTick`] into state. Updates cumulative counters,
     /// appends to the ring (evicting the oldest when full), caches the
-    /// rolling p99.9 on the just-pushed tick, and refreshes the p99.9
-    /// delta baseline.
+    /// rolling p99.9 on the just-pushed tick, refreshes the p99.9
+    /// delta baseline, and updates peak/min rps.
     ///
     /// The delta baseline is taken from the *rolling* p99.9 stored on
     /// the tick at `len - DELTA_LOOKBACK` (which was itself computed
@@ -192,6 +349,22 @@ impl DashboardState {
     pub fn ingest(&mut self, tick: LiveTick) {
         self.total_requests += tick.requests;
         self.total_errors.merge(&tick.errors);
+        self.cumulative_bytes_sent += tick.bytes_sent;
+        self.cumulative_bytes_recv += tick.bytes_recv;
+
+        // Track peak / min rps using this tick's delta.
+        let rps = tick.requests as f64;
+        if rps > self.peak_rps {
+            self.peak_rps = rps;
+        }
+        // Only update min once a non-zero tick has arrived — otherwise
+        // the warm-up window pins min at 0 permanently.
+        if rps > 0.0 {
+            self.min_rps = Some(match self.min_rps {
+                Some(prev) => prev.min(rps),
+                None => rps,
+            });
+        }
 
         let rec = TickRecord::from_live(tick);
         self.ticks.push_back(rec);
@@ -201,11 +374,11 @@ impl DashboardState {
 
         // Compute the rolling-window p99.9 *ending at the just-pushed
         // tick* and store it on the record. This is the same
-        // calculation [`Self::rolling_latency`] performs; we duplicate
-        // a little code here to avoid borrow-checker issues around
-        // mutating the tick we just pushed while iterating the
-        // ring. Work is O(ROLLING_LATENCY_WINDOW) histogram merges
-        // once per second — trivial.
+        // calculation `rolling_latency` performs; we duplicate a bit
+        // of code here to avoid borrow-checker issues around mutating
+        // the tick we just pushed while iterating the ring. Work is
+        // O(ROLLING_LATENCY_WINDOW) histogram merges once per second —
+        // trivial.
         let rolling_p99_9 = self.compute_rolling_p99_9_ns();
         if let Some(last) = self.ticks.back_mut() {
             last.rolling_p99_9_ns = rolling_p99_9;
@@ -221,6 +394,13 @@ impl DashboardState {
                 self.prev_p99_9_ns = Some(ref_tick.rolling_p99_9_ns);
             }
         }
+    }
+
+    /// Reset peak / min rps trackers. Bound to the `r` keybind so the
+    /// user can re-arm them after a warm-up or a load transition.
+    pub fn reset_peaks(&mut self) {
+        self.peak_rps = 0.0;
+        self.min_rps = None;
     }
 
     /// Internal helper: merge the rolling window of histograms and
@@ -251,8 +431,18 @@ impl DashboardState {
             .unwrap_or(0.0)
     }
 
+    /// Average rps across all ticks in the ring. Returns 0 when empty.
+    /// Used by the Throughput tab's summary panel.
+    pub fn avg_rps(&self) -> f64 {
+        if self.ticks.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.ticks.iter().map(|t| t.requests).sum();
+        sum as f64 / self.ticks.len() as f64
+    }
+
     /// Instantaneous rate as a fraction of the target, if a target was
-    /// set. `None` for saturate runs. Clamped to [0.0, 2.0] so a
+    /// set. `None` for saturate runs. Clamped to [0.0, 200.0] so a
     /// transient overshoot doesn't blow up the gauge width.
     pub fn actual_vs_target_pct(&self) -> Option<f64> {
         let target = self.target_rate?;
@@ -333,11 +523,6 @@ impl DashboardState {
     /// Positive values = latency regressed (worse), negative = improved.
     /// Returns `None` until we have both a baseline and current
     /// samples.
-    ///
-    /// Both sides of the comparison are rolling-window p99.9s over the
-    /// same [`ROLLING_LATENCY_WINDOW`] — one from `DELTA_LOOKBACK`
-    /// ticks ago, one from the most recent tick. That makes the delta
-    /// reflect real drift in the tail rather than single-tick noise.
     pub fn p99_9_delta_pct(&self) -> Option<f64> {
         let baseline = self.prev_p99_9_ns?;
         if baseline == 0 {
@@ -366,6 +551,16 @@ impl DashboardState {
 mod tests {
     use super::*;
 
+    fn fixture_transport() -> TransportInfo {
+        TransportInfo {
+            mode: RunMode::Saturate(100),
+            connections: 100,
+            protocol: "H2".into(),
+            tls: true,
+            alpn: Some("h2".into()),
+        }
+    }
+
     fn make_tick(
         elapsed_s: u64,
         requests: u64,
@@ -388,21 +583,37 @@ mod tests {
 
     #[test]
     fn new_state_is_empty() {
-        let s = DashboardState::new(None, Duration::from_secs(30), "x".into());
+        let s = DashboardState::new(
+            None,
+            Duration::from_secs(30),
+            "x".into(),
+            fixture_transport(),
+        );
         assert!(s.ticks.is_empty());
         assert_eq!(s.total_requests, 0);
         assert!(s.rolling_latency().is_none());
         assert_eq!(s.requests_per_sec(), 0.0);
+        assert_eq!(s.peak_rps, 0.0);
+        assert!(s.min_rps.is_none());
+        assert_eq!(s.current_tab, Tab::Overview);
+        assert!(!s.help_visible);
     }
 
     #[test]
     fn ingest_updates_totals_and_ring() {
-        let mut s = DashboardState::new(None, Duration::from_secs(30), "x".into());
+        let mut s = DashboardState::new(
+            None,
+            Duration::from_secs(30),
+            "x".into(),
+            fixture_transport(),
+        );
         s.ingest(make_tick(1, 100, &[1_000, 2_000], ErrorCounters::default()));
         s.ingest(make_tick(2, 200, &[1_500, 2_500], ErrorCounters::default()));
         assert_eq!(s.ticks.len(), 2);
         assert_eq!(s.total_requests, 300);
         assert_eq!(s.requests_per_sec(), 200.0);
+        assert_eq!(s.peak_rps, 200.0);
+        assert_eq!(s.min_rps, Some(100.0));
     }
 
     #[test]
@@ -411,10 +622,45 @@ mod tests {
             None,
             Duration::from_millis(1),
             "x".into(),
+            fixture_transport(),
         );
         std::thread::sleep(Duration::from_millis(5));
         assert!((s.progress() - 1.0).abs() < 1e-9);
         s.started_at = Instant::now();
         assert!(s.progress() < 0.5);
+    }
+
+    #[test]
+    fn tab_cycling_wraps() {
+        assert_eq!(Tab::Overview.next(), Tab::Latency);
+        assert_eq!(Tab::Errors.next(), Tab::Overview);
+        assert_eq!(Tab::Overview.prev(), Tab::Errors);
+        assert_eq!(Tab::Errors.prev(), Tab::Throughput);
+    }
+
+    #[test]
+    fn tab_from_digit_rejects_out_of_range() {
+        assert_eq!(Tab::from_digit(0), None);
+        assert_eq!(Tab::from_digit(1), Some(Tab::Overview));
+        assert_eq!(Tab::from_digit(4), Some(Tab::Errors));
+        assert_eq!(Tab::from_digit(5), None);
+    }
+
+    #[test]
+    fn reset_peaks_clears_both() {
+        let mut s = DashboardState::new(
+            None,
+            Duration::from_secs(30),
+            "x".into(),
+            fixture_transport(),
+        );
+        s.ingest(make_tick(1, 100, &[1_000], ErrorCounters::default()));
+        s.ingest(make_tick(2, 500, &[1_000], ErrorCounters::default()));
+        assert_eq!(s.peak_rps, 500.0);
+        assert_eq!(s.min_rps, Some(100.0));
+
+        s.reset_peaks();
+        assert_eq!(s.peak_rps, 0.0);
+        assert!(s.min_rps.is_none());
     }
 }

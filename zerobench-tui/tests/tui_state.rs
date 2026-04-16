@@ -3,7 +3,8 @@
 //! The unit tests inside `state.rs` exercise basic construction and
 //! ingest bookkeeping. This file focuses on the derived-value APIs
 //! the render layer depends on: rolling histogram merges, sparkline
-//! windowing, delta indicator, and bounded-ring eviction.
+//! windowing, delta indicator, bounded-ring eviction, and the v0.0.2
+//! additions — tab switching, peak/min tracking, cumulative bytes.
 
 use std::time::Duration;
 
@@ -11,7 +12,8 @@ use hdrhistogram::Histogram;
 use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
 use zerobench_tui::state::{
-    DashboardState, DELTA_LOOKBACK, MAX_TICKS, ROLLING_LATENCY_WINDOW,
+    DashboardState, RunMode, Tab, TransportInfo, DELTA_LOOKBACK, MAX_TICKS,
+    ROLLING_LATENCY_WINDOW,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,19 @@ fn tick(elapsed_s: u64, requests: u64, latency_ns: u64) -> LiveTick {
     }
 }
 
+fn tick_with_bytes(
+    elapsed_s: u64,
+    requests: u64,
+    latency_ns: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+) -> LiveTick {
+    let mut t = tick(elapsed_s, requests, latency_ns);
+    t.bytes_sent = bytes_sent;
+    t.bytes_recv = bytes_recv;
+    t
+}
+
 fn tick_with_err(
     elapsed_s: u64,
     requests: u64,
@@ -49,17 +64,32 @@ fn tick_with_err(
     base
 }
 
+fn fixture_transport() -> TransportInfo {
+    TransportInfo {
+        mode: RunMode::Saturate(100),
+        connections: 100,
+        protocol: "H2".into(),
+        tls: true,
+        alpn: Some("h2".into()),
+    }
+}
+
+fn fresh_state(target_rate: Option<f64>, dur_s: u64) -> DashboardState {
+    DashboardState::new(
+        target_rate,
+        Duration::from_secs(dur_s),
+        "http://api".into(),
+        fixture_transport(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Totals / RPS / progress
 // ---------------------------------------------------------------------------
 
 #[test]
 fn totals_accumulate_across_ticks() {
-    let mut s = DashboardState::new(
-        Some(1000.0),
-        Duration::from_secs(10),
-        "http://api".into(),
-    );
+    let mut s = fresh_state(Some(1000.0), 10);
     s.ingest(tick(1, 500, 100_000));
     s.ingest(tick(2, 600, 120_000));
     s.ingest(tick(3, 700, 140_000));
@@ -70,7 +100,7 @@ fn totals_accumulate_across_ticks() {
 
 #[test]
 fn errors_accumulate_across_ticks() {
-    let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+    let mut s = fresh_state(None, 10);
     let mut e1 = ErrorCounters::default();
     e1.connect = 2;
     e1.timeout = 1;
@@ -89,11 +119,7 @@ fn errors_accumulate_across_ticks() {
 
 #[test]
 fn actual_vs_target_pct() {
-    let mut s = DashboardState::new(
-        Some(1000.0),
-        Duration::from_secs(10),
-        "x".into(),
-    );
+    let mut s = fresh_state(Some(1000.0), 10);
     s.ingest(tick(1, 994, 100_000));
     let pct = s.actual_vs_target_pct().unwrap();
     assert!((pct - 99.4).abs() < 0.01, "got {pct}");
@@ -101,7 +127,7 @@ fn actual_vs_target_pct() {
 
 #[test]
 fn actual_vs_target_pct_none_for_saturate() {
-    let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+    let mut s = fresh_state(None, 10);
     s.ingest(tick(1, 994, 100_000));
     assert!(s.actual_vs_target_pct().is_none());
 }
@@ -112,7 +138,7 @@ fn actual_vs_target_pct_none_for_saturate() {
 
 #[test]
 fn sparkline_returns_data_newest_last() {
-    let mut s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+    let mut s = fresh_state(None, 10);
     s.ingest(tick(1, 100, 1_000));
     s.ingest(tick(2, 200, 1_000));
     s.ingest(tick(3, 300, 1_000));
@@ -134,7 +160,7 @@ fn sparkline_returns_data_newest_last() {
 fn rolling_latency_merges_last_window_ticks() {
     // Feed ROLLING_LATENCY_WINDOW + 2 ticks; oldest two are outside
     // the window and shouldn't affect the merged histogram.
-    let mut s = DashboardState::new(None, Duration::from_secs(60), "x".into());
+    let mut s = fresh_state(None, 60);
 
     // Ticks 1..=2: high-latency outliers that must be evicted from
     // the rolling window. If they leaked in, our p99 would be huge.
@@ -158,7 +184,7 @@ fn rolling_latency_merges_last_window_ticks() {
 
 #[test]
 fn rolling_latency_none_when_empty() {
-    let s = DashboardState::new(None, Duration::from_secs(10), "x".into());
+    let s = fresh_state(None, 10);
     assert!(s.rolling_latency().is_none());
 }
 
@@ -168,7 +194,7 @@ fn rolling_latency_none_when_empty() {
 
 #[test]
 fn p99_9_delta_reports_regression_after_lookback() {
-    let mut s = DashboardState::new(None, Duration::from_secs(60), "x".into());
+    let mut s = fresh_state(None, 60);
 
     // Fewer than DELTA_LOOKBACK ticks — baseline not yet captured.
     for i in 0..(DELTA_LOOKBACK - 1) {
@@ -210,21 +236,12 @@ fn p99_9_delta_uses_symmetric_rolling_windows() {
     assert_eq!(ROLLING_LATENCY_WINDOW, 5);
     assert_eq!(DELTA_LOOKBACK, 10);
 
-    let mut s = DashboardState::new(None, Duration::from_secs(60), "x".into());
+    let mut s = fresh_state(None, 60);
 
-    // 10 ticks at 1ms. Once len == DELTA_LOOKBACK, the delta baseline
-    // becomes the cached rolling p99.9 of ticks[0], which was itself
-    // only a 1-tick window (~1ms). That's fine for this test — the
-    // rolling-vs-rolling guarantee is that *both sides* of the ratio
-    // are cached values, no longer mismatching 1-tick vs 5-tick.
     for i in 0..DELTA_LOOKBACK {
         s.ingest(tick(i as u64, 100, 1_000_000));
     }
 
-    // Now push 5 more ticks at 10ms. After these, the current rolling
-    // window sits entirely at 10ms and the baseline comes from the
-    // cached rolling p99.9 of ticks[DELTA_LOOKBACK - 1 + 5 - 10] =
-    // ticks[4], whose rolling window was entirely at 1ms.
     for i in 0..ROLLING_LATENCY_WINDOW {
         s.ingest(tick(
             DELTA_LOOKBACK as u64 + i as u64,
@@ -256,16 +273,13 @@ fn p99_9_delta_uses_symmetric_rolling_windows() {
 
 #[test]
 fn ring_evicts_oldest_past_max_ticks() {
-    let mut s = DashboardState::new(None, Duration::from_secs(10_000), "x".into());
+    let mut s = fresh_state(None, 10_000);
     // Push MAX_TICKS + 5 ticks — len should stabilise at MAX_TICKS.
     for i in 0..(MAX_TICKS + 5) {
         s.ingest(tick(i as u64, i as u64, 1_000));
     }
     assert_eq!(s.ticks.len(), MAX_TICKS);
 
-    // Oldest retained tick should be the one at offset `5`
-    // (earlier were evicted), which we can sanity-check via its
-    // `requests` field.
     let oldest = s.ticks.front().unwrap();
     assert_eq!(oldest.requests, 5);
     let newest = s.ticks.back().unwrap();
@@ -274,4 +288,147 @@ fn ring_evicts_oldest_past_max_ticks() {
     // total_requests is cumulative — not truncated.
     let expected_total: u64 = (0..(MAX_TICKS + 5) as u64).sum();
     assert_eq!(s.total_requests, expected_total);
+}
+
+// ---------------------------------------------------------------------------
+// Peak / min rps tracking
+// ---------------------------------------------------------------------------
+
+#[test]
+fn peak_tracks_highest_observed_rps() {
+    let mut s = fresh_state(None, 30);
+    s.ingest(tick(1, 100, 1_000));
+    s.ingest(tick(2, 500, 1_000));
+    s.ingest(tick(3, 300, 1_000));
+    assert_eq!(s.peak_rps, 500.0);
+}
+
+#[test]
+fn min_skips_zero_ticks_during_warmup() {
+    // An empty "ramp up" shouldn't pin min_rps to 0 forever.
+    let mut s = fresh_state(None, 30);
+    s.ingest(tick(0, 0, 1_000));
+    s.ingest(tick(1, 0, 1_000));
+    assert!(s.min_rps.is_none());
+
+    s.ingest(tick(2, 200, 1_000));
+    s.ingest(tick(3, 400, 1_000));
+    assert_eq!(s.min_rps, Some(200.0));
+}
+
+#[test]
+fn reset_peaks_clears_both_trackers() {
+    let mut s = fresh_state(None, 30);
+    s.ingest(tick(1, 200, 1_000));
+    s.ingest(tick(2, 500, 1_000));
+    assert_eq!(s.peak_rps, 500.0);
+    assert_eq!(s.min_rps, Some(200.0));
+
+    s.reset_peaks();
+    assert_eq!(s.peak_rps, 0.0);
+    assert!(s.min_rps.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Cumulative bytes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cumulative_bytes_accumulate() {
+    let mut s = fresh_state(None, 30);
+    s.ingest(tick_with_bytes(1, 100, 1_000, 1_000, 10_000));
+    s.ingest(tick_with_bytes(2, 100, 1_000, 2_000, 20_000));
+    s.ingest(tick_with_bytes(3, 100, 1_000, 3_000, 30_000));
+    assert_eq!(s.cumulative_bytes_sent, 6_000);
+    assert_eq!(s.cumulative_bytes_recv, 60_000);
+}
+
+// ---------------------------------------------------------------------------
+// TickRecord percentile cache
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tickrecord_caches_p50_p90_p99_p99_9() {
+    // Build a tick with enough spread for the percentiles to diverge.
+    // 100 samples at 1ms, 10 at 10ms, 1 at 100ms.
+    let mut h = fresh_hist();
+    for _ in 0..100 {
+        let _ = h.record(1_000_000);
+    }
+    for _ in 0..10 {
+        let _ = h.record(10_000_000);
+    }
+    let _ = h.record(100_000_000);
+    let live = LiveTick {
+        elapsed: Duration::from_secs(1),
+        requests: 111,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        errors: ErrorCounters::default(),
+        latency: h,
+    };
+
+    let mut s = fresh_state(None, 30);
+    s.ingest(live);
+    let t = s.ticks.back().unwrap();
+    // p50 should be in the 1ms cluster.
+    assert!(t.p50_ns <= 1_500_000, "p50 = {}", t.p50_ns);
+    // p99.9 should be the 100ms outlier (hdrhist rounds into its
+    // bucket; exact value is ~100ms).
+    assert!(t.p99_9_ns >= 10_000_000, "p99.9 = {}", t.p99_9_ns);
+    // p90 / p99 should sit between.
+    assert!(t.p90_ns >= t.p50_ns);
+    assert!(t.p99_ns >= t.p90_ns);
+}
+
+// ---------------------------------------------------------------------------
+// Tab enum helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_next_and_prev_wrap() {
+    assert_eq!(Tab::Overview.next(), Tab::Latency);
+    assert_eq!(Tab::Latency.next(), Tab::Throughput);
+    assert_eq!(Tab::Throughput.next(), Tab::Errors);
+    assert_eq!(Tab::Errors.next(), Tab::Overview);
+
+    assert_eq!(Tab::Overview.prev(), Tab::Errors);
+    assert_eq!(Tab::Errors.prev(), Tab::Throughput);
+}
+
+#[test]
+fn tab_from_digit_valid_range() {
+    assert_eq!(Tab::from_digit(1), Some(Tab::Overview));
+    assert_eq!(Tab::from_digit(2), Some(Tab::Latency));
+    assert_eq!(Tab::from_digit(3), Some(Tab::Throughput));
+    assert_eq!(Tab::from_digit(4), Some(Tab::Errors));
+    assert_eq!(Tab::from_digit(0), None);
+    assert_eq!(Tab::from_digit(5), None);
+    assert_eq!(Tab::from_digit(255), None);
+}
+
+#[test]
+fn initial_tab_is_overview() {
+    let s = fresh_state(None, 30);
+    assert_eq!(s.current_tab, Tab::Overview);
+    assert!(!s.help_visible);
+}
+
+// ---------------------------------------------------------------------------
+// Avg rps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn avg_rps_is_arithmetic_mean_of_tick_requests() {
+    let mut s = fresh_state(None, 30);
+    s.ingest(tick(1, 100, 1_000));
+    s.ingest(tick(2, 200, 1_000));
+    s.ingest(tick(3, 300, 1_000));
+    assert!((s.avg_rps() - 200.0).abs() < 0.001);
+}
+
+#[test]
+fn avg_rps_returns_zero_on_empty_ring() {
+    let s = fresh_state(None, 30);
+    assert_eq!(s.avg_rps(), 0.0);
 }
