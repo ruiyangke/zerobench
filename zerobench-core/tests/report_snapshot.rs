@@ -225,7 +225,7 @@ fn json_reporter_includes_schema_version_and_core_metrics() {
 }
 
 #[test]
-fn json_reporter_target_rate_is_null_in_phase_c() {
+fn json_reporter_target_rate_reflects_saturate_profile() {
     let plan = sample_plan(Duration::from_secs(1));
     let summary = build_summary(1, Duration::from_secs(1));
 
@@ -233,8 +233,105 @@ fn json_reporter_target_rate_is_null_in_phase_c() {
     print_json(&summary, &plan, &mut out).expect("json render");
     let v: Value = serde_json::from_slice(&out).expect("parse json");
 
-    // Phase C has no rate profile wiring; the field is present but null.
-    assert_eq!(v["target_rate"], Value::Null);
+    // sample_plan uses RateProfile::Saturate { max_concurrency: 50 }.
+    let tr = &v["target_rate"];
+    assert_eq!(tr["kind"], Value::from("saturate"));
+    assert_eq!(tr["max_concurrency"], Value::from(50u64));
+}
+
+#[test]
+fn json_reporter_target_rate_encodes_constant() {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("/", &mut vars).unwrap();
+    let plan = Plan {
+        scenarios: vec![Scenario {
+            name: "const".into(),
+            rate: RateProfile::Constant(2000.0),
+            steps: vec![Step::Request(RequestPlan::get(url))],
+        }],
+        vars,
+        duration: Duration::from_secs(1),
+        warmup: None,
+    };
+    let summary = build_summary(1, Duration::from_secs(1));
+    let mut out = Vec::new();
+    print_json(&summary, &plan, &mut out).expect("json render");
+    let v: Value = serde_json::from_slice(&out).expect("parse json");
+    assert_eq!(v["target_rate"]["kind"], Value::from("constant"));
+    assert_eq!(v["target_rate"]["rps"], Value::from(2000.0));
+}
+
+#[test]
+fn json_reporter_target_rate_encodes_ramp() {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("/", &mut vars).unwrap();
+    let plan = Plan {
+        scenarios: vec![Scenario {
+            name: "ramp".into(),
+            rate: RateProfile::Ramp {
+                from: 100.0,
+                to: 10_000.0,
+                over: Duration::from_millis(30_000),
+            },
+            steps: vec![Step::Request(RequestPlan::get(url))],
+        }],
+        vars,
+        duration: Duration::from_secs(1),
+        warmup: None,
+    };
+    let summary = build_summary(1, Duration::from_secs(1));
+    let mut out = Vec::new();
+    print_json(&summary, &plan, &mut out).expect("json render");
+    let v: Value = serde_json::from_slice(&out).expect("parse json");
+    let tr = &v["target_rate"];
+    assert_eq!(tr["kind"], Value::from("ramp"));
+    assert_eq!(tr["from"], Value::from(100.0));
+    assert_eq!(tr["to"], Value::from(10_000.0));
+    assert_eq!(tr["over_ms"], Value::from(30_000u64));
+}
+
+#[test]
+fn json_reporter_target_rate_collapses_identical_multi_scenario() {
+    let plan = two_scenario_plan(Duration::from_secs(1));
+    let summary = build_summary(2, Duration::from_secs(1));
+    let mut out = Vec::new();
+    print_json(&summary, &plan, &mut out).expect("json render");
+    let v: Value = serde_json::from_slice(&out).expect("parse json");
+    // Both scenarios share Saturate { max_concurrency: 50 } — reporter
+    // collapses to the scalar shape.
+    assert_eq!(v["target_rate"]["kind"], Value::from("saturate"));
+}
+
+#[test]
+fn json_reporter_target_rate_arrays_mixed_multi_scenario() {
+    let mut vars = VarRegistry::new();
+    let a = Template::compile("/a", &mut vars).unwrap();
+    let b = Template::compile("/b", &mut vars).unwrap();
+    let plan = Plan {
+        scenarios: vec![
+            Scenario {
+                name: "a".into(),
+                rate: RateProfile::Constant(500.0),
+                steps: vec![Step::Request(RequestPlan::get(a))],
+            },
+            Scenario {
+                name: "b".into(),
+                rate: RateProfile::Saturate { max_concurrency: 8 },
+                steps: vec![Step::Request(RequestPlan::get(b))],
+            },
+        ],
+        vars,
+        duration: Duration::from_secs(1),
+        warmup: None,
+    };
+    let summary = build_summary(2, Duration::from_secs(1));
+    let mut out = Vec::new();
+    print_json(&summary, &plan, &mut out).expect("json render");
+    let v: Value = serde_json::from_slice(&out).expect("parse json");
+    let arr = v["target_rate"].as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["kind"], Value::from("constant"));
+    assert_eq!(arr[1]["kind"], Value::from("saturate"));
 }
 
 #[test]

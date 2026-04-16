@@ -261,7 +261,7 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
     let blob = serde_json::json!({
         "schema_version": 1,
         "duration_ms": summary.duration.as_millis() as u64,
-        "target_rate": serde_json::Value::Null, // set by Task 10's rate wiring
+        "target_rate": target_rate_json(plan),
         "requests": summary.requests,
         "requests_per_sec": summary.requests_per_sec(),
         "bytes_sent": summary.bytes_sent,
@@ -322,6 +322,68 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
+
+/// Serialize the plan's rate profile(s) into the JSON `target_rate`
+/// field. The diff tool (Task 13) reads this to categorise runs.
+///
+/// Shape:
+///
+/// ```json
+/// { "kind": "constant", "rps": 2000.0 }
+/// { "kind": "ramp", "from": 100, "to": 10000, "over_ms": 30000 }
+/// { "kind": "saturate", "max_concurrency": 50 }
+/// { "kind": "stepped", "steps": [[0, 100.0], [10000, 500.0]] }
+/// ```
+///
+/// Multi-scenario plans where the profiles differ produce an array of
+/// per-scenario entries in scenario order; single-scenario (or all
+/// identical) plans produce the scalar shape for diff-tool simplicity.
+fn target_rate_json(plan: &Plan) -> serde_json::Value {
+    use crate::plan::RateProfile;
+    use serde_json::json;
+
+    fn one(p: &RateProfile) -> serde_json::Value {
+        match p {
+            RateProfile::Constant(rps) => json!({ "kind": "constant", "rps": rps }),
+            RateProfile::Ramp { from, to, over } => json!({
+                "kind": "ramp",
+                "from": from,
+                "to": to,
+                "over_ms": over.as_millis() as u64,
+            }),
+            RateProfile::Stepped(steps) => {
+                let list: Vec<_> = steps
+                    .iter()
+                    .map(|(d, r)| json!([d.as_millis() as u64, r]))
+                    .collect();
+                json!({ "kind": "stepped", "steps": list })
+            }
+            RateProfile::Saturate { max_concurrency } => json!({
+                "kind": "saturate",
+                "max_concurrency": max_concurrency,
+            }),
+        }
+    }
+
+    match plan.scenarios.as_slice() {
+        [] => serde_json::Value::Null,
+        [only] => one(&only.rate),
+        many => {
+            // Emit an array when profiles differ; otherwise collapse to
+            // the scalar shape (every scenario has the same rate).
+            let first = one(&many[0].rate);
+            let all_same = many
+                .iter()
+                .skip(1)
+                .all(|s| one(&s.rate) == first);
+            if all_same {
+                first
+            } else {
+                serde_json::Value::Array(many.iter().map(|s| one(&s.rate)).collect())
+            }
+        }
+    }
+}
 
 /// Describe the target rate line. Task 10 swaps this for a real
 /// `RateProfile::Constant(r)` rendering once the profile enum lands.
