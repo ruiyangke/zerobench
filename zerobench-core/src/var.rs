@@ -6,6 +6,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Errors returned by [`VarRegistry::allocate`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VarError {
+    /// Attempted to allocate a 257th variable. The registry's slot space
+    /// is fixed at 256 — sized to fit a `u8` so `Part::VarRef` stays
+    /// compact and `ScenarioContext` is cheap to initialize.
+    #[error("too many variables — zerobench supports at most 256 named vars per plan (got {0})")]
+    TooManyVars(usize),
+}
+
 /// Compile-time slot assigned to a named variable.
 ///
 /// Slot `0` is valid. We cap the slot space at 256 per plan because realistic
@@ -32,21 +42,19 @@ impl VarRegistry {
     /// Allocate a slot for `name`, or return the existing slot if already
     /// allocated.
     ///
-    /// # Panics
-    /// Panics if more than 256 distinct variables are registered (the `u8`
-    /// slot space is exhausted).
-    pub fn allocate(&mut self, name: impl Into<String>) -> VarSlot {
+    /// Returns [`VarError::TooManyVars`] if the registry is already full
+    /// (256 distinct names allocated).
+    pub fn allocate(&mut self, name: impl Into<String>) -> Result<VarSlot, VarError> {
         let name = name.into();
         if let Some(idx) = self.names.iter().position(|n| n == &name) {
-            return VarSlot(idx as u8);
+            return Ok(VarSlot(idx as u8));
         }
-        assert!(
-            self.names.len() < 256,
-            "VarRegistry exceeded 256-slot capacity",
-        );
+        if self.names.len() >= 256 {
+            return Err(VarError::TooManyVars(self.names.len()));
+        }
         let slot = VarSlot(self.names.len() as u8);
         self.names.push(name);
-        slot
+        Ok(slot)
     }
 
     /// Look up the name for a slot. Returns `None` if the slot is out of
@@ -73,18 +81,18 @@ mod tests {
     #[test]
     fn allocate_assigns_sequential_slots() {
         let mut r = VarRegistry::new();
-        assert_eq!(r.allocate("a"), VarSlot(0));
-        assert_eq!(r.allocate("b"), VarSlot(1));
-        assert_eq!(r.allocate("c"), VarSlot(2));
+        assert_eq!(r.allocate("a").unwrap(), VarSlot(0));
+        assert_eq!(r.allocate("b").unwrap(), VarSlot(1));
+        assert_eq!(r.allocate("c").unwrap(), VarSlot(2));
         assert_eq!(r.len(), 3);
     }
 
     #[test]
     fn allocate_returns_existing_slot_for_duplicate_name() {
         let mut r = VarRegistry::new();
-        let a = r.allocate("token");
-        let b = r.allocate("other");
-        let a2 = r.allocate("token");
+        let a = r.allocate("token").unwrap();
+        let b = r.allocate("other").unwrap();
+        let a2 = r.allocate("token").unwrap();
         assert_eq!(a, a2);
         assert_ne!(a, b);
         assert_eq!(r.len(), 2);
@@ -93,7 +101,7 @@ mod tests {
     #[test]
     fn name_round_trips() {
         let mut r = VarRegistry::new();
-        let slot = r.allocate("session");
+        let slot = r.allocate("session").unwrap();
         assert_eq!(r.name(slot), Some("session"));
         assert_eq!(r.name(VarSlot(42)), None);
     }

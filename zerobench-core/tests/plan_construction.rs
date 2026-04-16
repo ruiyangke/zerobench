@@ -10,15 +10,16 @@ use http::{HeaderName, Method};
 use smallvec::smallvec;
 use zerobench_core::{
     plan::{RateProfile, RequestPlan},
-    Assertion, BodySource, Extract, Plan, Scenario, Step, Template, VarRegistry, VarSlot,
+    Assertion, BodySource, Extract, Plan, Scenario, Step, Template, VarError, VarRegistry,
+    VarSlot,
 };
 
 #[test]
 fn var_registry_allocates_sequential_slots() {
     let mut vars = VarRegistry::new();
-    let a = vars.allocate("token");
-    let b = vars.allocate("order_id");
-    let c = vars.allocate("csrf");
+    let a = vars.allocate("token").unwrap();
+    let b = vars.allocate("order_id").unwrap();
+    let c = vars.allocate("csrf").unwrap();
 
     assert_eq!(a, VarSlot(0));
     assert_eq!(b, VarSlot(1));
@@ -29,8 +30,8 @@ fn var_registry_allocates_sequential_slots() {
 #[test]
 fn var_registry_returns_same_slot_for_duplicate_name() {
     let mut vars = VarRegistry::new();
-    let first = vars.allocate("session");
-    let second = vars.allocate("session");
+    let first = vars.allocate("session").unwrap();
+    let second = vars.allocate("session").unwrap();
     assert_eq!(first, second);
     assert_eq!(vars.len(), 1);
 }
@@ -38,16 +39,37 @@ fn var_registry_returns_same_slot_for_duplicate_name() {
 #[test]
 fn var_registry_name_round_trips() {
     let mut vars = VarRegistry::new();
-    let slot = vars.allocate("auth");
+    let slot = vars.allocate("auth").unwrap();
     assert_eq!(vars.name(slot), Some("auth"));
     // Out-of-range slot returns None.
     assert_eq!(vars.name(VarSlot(200)), None);
 }
 
 #[test]
+fn var_registry_returns_too_many_vars_on_257th_allocation() {
+    let mut vars = VarRegistry::new();
+    // Fill all 256 slots.
+    for i in 0..256 {
+        vars.allocate(format!("v{i}"))
+            .expect("first 256 allocations must succeed");
+    }
+    assert_eq!(vars.len(), 256);
+
+    // Allocation 257 must fail cleanly (not panic).
+    let err = vars.allocate("overflow").unwrap_err();
+    assert_eq!(err, VarError::TooManyVars(256));
+    // Registry must be unchanged on failure.
+    assert_eq!(vars.len(), 256);
+
+    // Re-allocating an existing name still succeeds even when full.
+    let existing = vars.allocate("v0").unwrap();
+    assert_eq!(existing, VarSlot(0));
+}
+
+#[test]
 fn construct_full_plan_and_read_fields_back() {
     let mut vars = VarRegistry::new();
-    let token = vars.allocate("token");
+    let token = vars.allocate("token").unwrap();
 
     let login = RequestPlan {
         method: Method::POST,
@@ -132,7 +154,7 @@ fn construct_full_plan_and_read_fields_back() {
 #[test]
 fn plan_is_clone_for_sharing_across_threads() {
     let mut vars = VarRegistry::new();
-    vars.allocate("x");
+    vars.allocate("x").unwrap();
 
     let plan = Plan {
         scenarios: vec![Scenario::new(
@@ -180,8 +202,8 @@ fn default_plan_is_empty_with_sensible_duration() {
 #[test]
 fn plan_roundtrips_through_serde_json() {
     let mut vars = VarRegistry::new();
-    let token = vars.allocate("token");
-    let status_slot = vars.allocate("last_status");
+    let token = vars.allocate("token").unwrap();
+    let status_slot = vars.allocate("last_status").unwrap();
 
     let login = RequestPlan {
         method: Method::POST,

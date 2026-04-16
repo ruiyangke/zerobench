@@ -289,7 +289,7 @@ fn var_ref_unset_expands_to_empty() {
 fn var_ref_populated_expands_to_value() {
     let mut vars = VarRegistry::new();
     let t = Template::compile("[{{var:token}}]", &mut vars).unwrap();
-    let slot = vars.allocate("token"); // same name → same slot
+    let slot = vars.allocate("token").unwrap(); // same name → same slot
     let mut h = Harness::new().with_var(slot.0 as usize, Bytes::from_static(b"abc"));
     let out = expand(&t, &mut h);
     assert_eq!(out, b"[abc]");

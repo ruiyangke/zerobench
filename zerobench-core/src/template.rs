@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::rng::BenchRng;
-use crate::var::{VarRegistry, VarSlot};
+use crate::var::{VarError, VarRegistry, VarSlot};
 
 // ---------------------------------------------------------------------------
 // Global counter — one per process, pointed at by every CounterGlobal part.
@@ -74,6 +74,10 @@ pub enum TemplateError {
     /// A v0.0.1-deferred feature (e.g. `{{line:FILE}}`) was used.
     #[error("not yet supported: {0}")]
     NotYetSupported(String),
+
+    /// More than 256 distinct named variables were declared in this plan.
+    #[error(transparent)]
+    TooManyVars(#[from] VarError),
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +413,7 @@ fn parse_expression(
                 return Ok((Part::RandStr { len }, len));
             }
             "var" => {
-                let slot = vars.allocate(tail);
+                let slot = vars.allocate(tail)?;
                 return Ok((Part::VarRef(slot), 32));
             }
             "line" => {
