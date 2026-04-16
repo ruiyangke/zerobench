@@ -35,9 +35,20 @@ zerobench-sse = { workspace = true, optional = true }
 zerobench-rhai = { workspace = true, optional = true }
 zerobench-tui = { workspace = true, optional = true }
 
+bytes = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
+http = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["http1", "server"] }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+cyper-core = { workspace = true }
+futures-util = { workspace = true }
 
 [lints]
 workspace = true
