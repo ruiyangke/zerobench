@@ -63,7 +63,7 @@ pub struct PlanBuilder {
 /// drops, so unwrapping the Arc would always fail while the engine is
 /// alive).
 #[derive(Default)]
-pub struct PlanBuilderState {
+pub(crate) struct PlanBuilderState {
     /// Scenarios collected in declaration order. `weight` on the inner
     /// builder is optional; absent means "auto-weight evenly".
     pub scenarios: Vec<ScenarioBuilder>,
@@ -323,12 +323,12 @@ fn scale_rate(global: &RateProfile, share: f64) -> RateProfile {
 /// `s.step(...)` to enqueue steps, and (optionally) `s.rate("X")` to set a
 /// per-scenario rate.
 #[derive(Clone)]
-pub struct ScenarioBuilder {
+pub(crate) struct ScenarioBuilder {
     inner: Arc<Mutex<ScenarioBuilderState>>,
 }
 
 #[derive(Default)]
-pub struct ScenarioBuilderState {
+pub(crate) struct ScenarioBuilderState {
     pub name: String,
     pub weight: Option<f64>,
     pub rate: Option<RateProfile>,
@@ -372,11 +372,11 @@ impl ScenarioBuilder {
 /// Returned by `GET(url)`, `POST(url)`, etc. and passed through the chained
 /// `.header`, `.json`, `.body`, `.expect_status`, etc. methods.
 #[derive(Clone)]
-pub struct RequestBuilder {
+pub(crate) struct RequestBuilder {
     inner: Arc<Mutex<RequestBuilderState>>,
 }
 
-pub struct RequestBuilderState {
+pub(crate) struct RequestBuilderState {
     pub method: Method,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -406,7 +406,7 @@ impl Default for RequestBuilderState {
 /// Unresolved body specification. Templates are compiled during
 /// [`PlanBuilder::finalize`] so errors carry file/line context.
 #[derive(Clone)]
-pub enum BodySourceSpec {
+pub(crate) enum BodySourceSpec {
     /// Raw bytes — `.body(...)` / `.body_file(...)`.
     Raw(Bytes),
     /// Template — `.body(s)` when `s` contains `{{...}}`.
@@ -458,7 +458,7 @@ impl RequestBuilder {
 /// share state — but by the time `s.step(req)` runs, the originating
 /// `req` temporary has already been consumed, so no sharing matters.
 #[derive(Clone)]
-pub enum StepSource {
+pub(crate) enum StepSource {
     Request(RequestBuilder),
     Pause(Duration),
     PauseRandom { min: Duration, max: Duration },
@@ -945,11 +945,12 @@ fn register_pause_helpers(engine: &mut Engine) {
 // ---------------------------------------------------------------------------
 
 /// Thin script-visible handle around a [`VarSlot`] + the variable's name.
-/// The name is kept for diagnostics ("extracted into {name}") — the slot
-/// is what the template engine uses.
+/// The name is retained on construction for future diagnostic use; only
+/// `slot` is consumed by the current Rhai registrations.
 #[derive(Debug, Clone)]
-pub struct VarSlotHandle {
+pub(crate) struct VarSlotHandle {
     pub slot: VarSlot,
+    #[allow(dead_code)]
     pub name: String,
 }
 

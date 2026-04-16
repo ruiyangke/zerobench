@@ -73,13 +73,6 @@ pub enum ScriptError {
     #[error("env variable not set: {0} (use env(\"{0}\", \"default\") for a fallback)")]
     MissingEnv(String),
 
-    /// Internal: a builder's `Arc<Mutex<...>>` still had outstanding
-    /// clones when we tried to unwrap it at finalize. Indicates a bug in
-    /// the DSL registration — shouldn't fire in practice because Rhai
-    /// always drops temporaries after chaining.
-    #[error("internal: builder still borrowed at finalize")]
-    BuilderStillBorrowed,
-
     /// The script produced zero Request steps — all scenarios were pure
     /// pause-loops. The CLI needs at least one URL to pick a connection
     /// target, so this is rejected up-front.

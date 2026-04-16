@@ -118,6 +118,13 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     use rhai::packages::{CorePackage, Package};
     CorePackage::new().register_into_engine(&mut engine);
 
+    // Cap a runaway script at ~10M operations. A well-formed plan builds
+    // in well under a million ops; this guard rail catches infinite loops
+    // and pathological recursion without affecting any real use case. The
+    // cap triggers `EvalAltResult::ErrorTooManyOperations`, which we map
+    // to `ScriptError::Eval` below.
+    engine.set_max_operations(10_000_000);
+
     let root = PlanBuilder::new();
     builders::register(&mut engine, root.clone());
 
@@ -144,11 +151,11 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
                     .to_string();
                 return Err(ScriptError::MissingEnv(name));
             }
-            // Parse errors surface as `rhai::ParseError` wrapped in
-            // `EvalAltResult::ErrorParsing`. Everything else is
-            // `ErrorRuntime` or similar. The lowercase check covers both
-            // "Parse error" and "ParseError" spellings Rhai has used.
-            if msg.to_lowercase().contains("parse") {
+            // Structural classification: parse errors are their own
+            // `EvalAltResult` variant; everything else is a runtime /
+            // eval error. Substring-on-message matching is brittle
+            // across Rhai version bumps.
+            if matches!(*e, rhai::EvalAltResult::ErrorParsing(..)) {
                 return Err(ScriptError::Parse(msg));
             }
             return Err(ScriptError::Eval(msg));
