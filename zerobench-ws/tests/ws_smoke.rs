@@ -308,7 +308,7 @@ fn ws_plan_for(addr: SocketAddr, payload: &str) -> WsPlan {
         path: "/echo".to_string(),
         headers: Vec::new(),
         message: Bytes::copy_from_slice(payload.as_bytes()),
-
+        opts: zerobench_core::transport::TransportOpts::default(),
     }
 }
 
@@ -388,7 +388,7 @@ async fn refused_connection_counts_connect_error() {
         path: "/".to_string(),
         headers: Vec::new(),
         message: Bytes::from_static(b"x"),
-
+        opts: zerobench_core::transport::TransportOpts::default(),
     };
 
     let stop = StopSignal::after(Duration::from_millis(300));

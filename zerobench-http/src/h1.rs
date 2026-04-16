@@ -417,38 +417,53 @@ impl std::fmt::Debug for StreamingResponse {
 /// Open one TCP+TLS connection and perform the HTTP/1 handshake,
 /// spawning the driver task on the compio runtime.
 async fn open_one(target: &Target, opts: &TransportOpts) -> Result<Slot, TransportError> {
-    let connected = conn::open(target, opts).await?;
+    // HTTP/1 pool always negotiates `http/1.1` when the target is TLS;
+    // a server that insists on `h2` will be handled up a layer via the
+    // ALPN probe in `HttpTransport::build_client`, not here.
+    let alpn: &[&[u8]] = if target.tls { &[b"http/1.1"] } else { &[] };
+    let connected = conn::open(target, opts, alpn).await?;
     let (read_ctr, written_ctr) = connected.counts();
 
-    match connected {
-        Connected::Plain(stream) => {
+    let (sender, conn_driver): (SendRequest<Full<Bytes>>, _) = match connected {
+        Connected::Plain { stream, .. } => {
             let io = HyperStream::new(stream);
             let (sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
                 .await
                 .map_err(|e| TransportError::Protocol(format!("handshake: {e}")))?;
-
-            // Spawn the connection driver. We don't hold a handle — the
-            // task detaches and runs until the server (or pool Drop)
-            // closes the stream. Errors here just end the task; the
-            // SendRequest side learns via poll_ready returning Err.
-            spawn(async move {
-                let _ = conn.await;
-            })
-            .detach();
-
-            Ok(Slot {
-                sender: Some(sender),
-                read_ctr,
-                written_ctr,
-            })
+            // Box the driver future so both arms produce the same type.
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> =
+                Box::pin(async move {
+                    let _ = conn.await;
+                });
+            (sender, fut)
         }
-        Connected::Tls { .. } => {
-            // Reachable once conn::open gains TLS support.
-            Err(TransportError::Tls(
-                "TLS not wired in Phase B; conn::open returns error earlier".into(),
-            ))
+        Connected::Tls { stream, .. } => {
+            // `TlsStream<CountingStream<TcpStream>>` satisfies compio's
+            // AsyncRead/AsyncWrite via compio-tls — HyperStream bridges
+            // it into hyper's trait world the same as the plain path.
+            let io = HyperStream::new(*stream);
+            let (sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
+                .await
+                .map_err(|e| TransportError::Protocol(format!("handshake: {e}")))?;
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> =
+                Box::pin(async move {
+                    let _ = conn.await;
+                });
+            (sender, fut)
         }
-    }
+    };
+
+    // Spawn the connection driver. We don't hold a handle — the task
+    // detaches and runs until the server (or pool Drop) closes the
+    // stream. Errors here just end the task; the SendRequest side learns
+    // via poll_ready returning Err.
+    spawn(conn_driver).detach();
+
+    Ok(Slot {
+        sender: Some(sender),
+        read_ctr,
+        written_ctr,
+    })
 }
 
 /// Build an `http::Request<Full<Bytes>>` from a `RequestPlan`,

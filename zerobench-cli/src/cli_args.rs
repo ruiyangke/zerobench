@@ -184,7 +184,8 @@ pub struct CliArgs {
     /// per second, byte totals, and per-category error counts.
     ///
     /// URLs accepted: `ws://host:port/path` (plain) and `wss://...`
-    /// (TLS — deferred until the rest of the stack's TLS path lands).
+    /// (TLS — uses the same `--insecure` / webpki-roots machinery as
+    /// HTTPS).
     ///
     /// Mutually exclusive with `--sse` and with an explicit
     /// `--http-version`. Only available when the binary is built with

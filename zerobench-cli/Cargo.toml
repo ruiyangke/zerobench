@@ -52,6 +52,9 @@ cyper-core = { workspace = true }
 futures-util = { workspace = true }
 httparse = { workspace = true }
 zerobench-ws = { workspace = true }
+compio-tls = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

@@ -27,6 +27,9 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
+rustls = { workspace = true }
+compio-tls = { workspace = true }
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

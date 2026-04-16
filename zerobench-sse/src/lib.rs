@@ -252,7 +252,12 @@ impl SseRunner {
         // iteration, producing spurious "slot unavailable" errors on
         // every subsequent iteration. One fresh TCP per iteration is
         // both simpler and produces the numbers the benchmark claims.
-        let connected = match zerobench_http::open(target, opts).await {
+        //
+        // SSE is always HTTP/1.1 — we advertise that via ALPN on TLS
+        // targets so servers that otherwise prefer H2 know to speak H1
+        // to us.
+        let alpn: &[&[u8]] = if target.tls { &[b"http/1.1"] } else { &[] };
+        let connected = match zerobench_http::open(target, opts, alpn).await {
             Ok(c) => c,
             Err(e) => {
                 classify_stream_open_error(&e, stats);
@@ -260,39 +265,52 @@ impl SseRunner {
             }
         };
 
-        let stream = match connected {
-            Connected::Plain(s) => s,
-            Connected::Tls { .. } => {
-                // TLS is not wired through this path yet — the rest of
-                // the stack returns TransportError::Tls on HTTPS too, so
-                // this branch shouldn't be reachable in practice for
-                // v0.0.1. Classify as connect-phase failure for parity
-                // with the HTTP transport's error surface.
-                stats.errors_connect += 1;
-                return;
-            }
-        };
-
-        let (read_ctr, _written_ctr) = stream.counts();
+        let (read_ctr, _written_ctr) = connected.counts();
         let r_before = read_ctr.load(std::sync::atomic::Ordering::Relaxed);
 
-        let io = HyperStream::new(stream);
-        let (mut sender, conn) = match http1::handshake::<_, Full<Bytes>>(io).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                stats.errors_connect += 1;
-                let _ = e;
-                return;
+        // Hand the stream to hyper. For TLS the wrapper is a boxed
+        // `TlsStream<CountingStream<TcpStream>>`; compio-tls implements
+        // AsyncRead/AsyncWrite on it, so HyperStream accepts it the
+        // same way it accepts a plain CountingStream. Hyper's
+        // `http1::handshake` returns different driver-future types for
+        // different IO wrappers, so we spawn each variant's driver
+        // inside its own arm — only the `SendRequest` flows out.
+        let mut sender = match connected {
+            Connected::Plain { stream, .. } => {
+                let io = HyperStream::new(stream);
+                match http1::handshake::<_, Full<Bytes>>(io).await {
+                    Ok((sender, conn)) => {
+                        compio::runtime::spawn(async move {
+                            let _ = conn.await;
+                        })
+                        .detach();
+                        sender
+                    }
+                    Err(e) => {
+                        stats.errors_connect += 1;
+                        let _ = e;
+                        return;
+                    }
+                }
+            }
+            Connected::Tls { stream, .. } => {
+                let io = HyperStream::new(*stream);
+                match http1::handshake::<_, Full<Bytes>>(io).await {
+                    Ok((sender, conn)) => {
+                        compio::runtime::spawn(async move {
+                            let _ = conn.await;
+                        })
+                        .detach();
+                        sender
+                    }
+                    Err(e) => {
+                        stats.errors_connect += 1;
+                        let _ = e;
+                        return;
+                    }
+                }
             }
         };
-
-        // Spawn the connection driver on the compio runtime. When the
-        // stream ends (server closes or we drop the response body), the
-        // driver future resolves and the task exits — no leak.
-        compio::runtime::spawn(async move {
-            let _ = conn.await;
-        })
-        .detach();
 
         // --- Build + send the request ------------------------------------
         let req = match build_request(target, plan, ctx) {

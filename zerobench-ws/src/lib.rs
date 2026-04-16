@@ -49,9 +49,9 @@ use hdrhistogram::Histogram;
 use zerobench_core::live_snapshot::LiveSnapshot;
 use zerobench_core::rng::from_entropy;
 use zerobench_core::stop::StopSignal;
-use zerobench_core::transport::Target;
+use zerobench_core::transport::{Target, TransportOpts};
 
-pub use conn::{DataFrame, WsConnection, WsError};
+pub use conn::{AnyWsConnection, DataFrame, WsConnection, WsError};
 pub use frame::{FrameHeader, Opcode};
 
 // ---------------------------------------------------------------------------
@@ -259,6 +259,12 @@ pub struct WsPlan {
     /// body; servers that echo return the same bytes. Defaults to
     /// `b"ping"` in the CLI.
     pub message: Bytes,
+    /// Transport options — currently the runner only cares about
+    /// `insecure_tls` and `connect_timeout` (the latter only when a TCP
+    /// connect takes a long time; we still apply the OS default socket
+    /// timeout too). Passed through so wss:// targets can borrow the
+    /// same `--insecure` toggle that HTTPS uses.
+    pub opts: TransportOpts,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +287,19 @@ impl WsRunner {
         let rng = from_entropy();
 
         // --- Connect ----------------------------------------------------
+        //
+        // `WsConnection::connect` picks plain vs TLS from `target.tls`
+        // and returns an `AnyWsConnection` that dispatches both variants
+        // through the same method signatures.
         let t_connect_start = Instant::now();
-        let conn_result =
-            WsConnection::connect_tcp(&plan.target, &plan.path, &plan.headers, rng).await;
+        let conn_result = WsConnection::connect(
+            &plan.target,
+            &plan.opts,
+            &plan.path,
+            &plan.headers,
+            rng,
+        )
+        .await;
         let mut conn = match conn_result {
             Ok(c) => {
                 stats.record_handshake(t_connect_start.elapsed());

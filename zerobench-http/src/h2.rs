@@ -111,14 +111,26 @@ impl Http2Client {
             ));
         }
 
-        let connected = conn::open(target, opts).await?;
+        // HTTP/2 requires ALPN `h2` when running over TLS. We ask for
+        // that exact protocol here; if the server doesn't speak H2, the
+        // hyper handshake below will fail with a protocol error — the
+        // `HttpTransport::build_client` ALPN probe is already the
+        // belt-and-braces check that prevents us from ever reaching this
+        // path when the server only offered `http/1.1`.
+        let alpn: &[&[u8]] = if target.tls { &[b"h2"] } else { &[] };
+        let connected = conn::open(target, opts, alpn).await?;
         let (read_ctr, written_ctr) = connected.counts();
 
         // H2 handshake wants a hyper-compatible IO handle. `HyperStream`
         // bridges compio's Async{Read,Write} into hyper's equivalents;
         // the counting has already been applied below HyperStream.
-        let (sender, conn) = match connected {
-            Connected::Plain(stream) => {
+        //
+        // Hyper's `http2::Builder::handshake` returns a `Connection<Io,
+        // B, E>` whose IO type parameter differs between the plain and
+        // TLS arms. We spawn the driver inside each arm and only return
+        // the `SendRequest` (which has a uniform type) out of the match.
+        let sender = match connected {
+            Connected::Plain { stream, .. } => {
                 let io = HyperStream::new(stream);
                 let mut builder = http2::Builder::new(CompioExecutor);
                 builder.timer(CompioTimer);
@@ -136,31 +148,64 @@ impl Http2Client {
                 // what we attempt.
                 builder.initial_max_send_streams(opts.max_conns);
 
-                builder
+                let (sender, conn) = builder
                     .handshake::<_, Full<Bytes>>(io)
                     .await
                     .map_err(|e| {
                         TransportError::Protocol(format!("h2 handshake: {e}"))
-                    })?
+                    })?;
+                spawn(async move {
+                    let _ = conn.await;
+                })
+                .detach();
+                sender
             }
-            Connected::Tls { .. } => {
-                // Plumbed for completeness — conn::open doesn't return
-                // this variant yet, but when the TLS path lights up
-                // we'll want ALPN checks to happen *there*, leaving H2
-                // free to assume the caller already confirmed `h2`.
-                return Err(TransportError::Tls(
-                    "TLS + ALPN not wired for HTTP/2 in this phase".into(),
-                ));
+            Connected::Tls {
+                stream,
+                negotiated_alpn,
+                ..
+            } => {
+                // Confirm ALPN picked `h2`. An HTTPS server that only
+                // supports HTTP/1.1 will surface as `Some(b"http/1.1")`
+                // here — reject with a Protocol error because the caller
+                // asked for H2 explicitly. This path is normally
+                // short-circuited by `HttpTransport::build_client`'s
+                // probe; keeping the check here makes `Http2Client::new`
+                // safe to call in isolation.
+                match negotiated_alpn.as_deref() {
+                    Some(b"h2") => {}
+                    Some(other) => {
+                        return Err(TransportError::Protocol(format!(
+                            "ALPN negotiated {}, expected h2",
+                            String::from_utf8_lossy(other)
+                        )));
+                    }
+                    None => {
+                        // No ALPN negotiated at all. h2 over TLS without
+                        // ALPN is non-standard; hyper's h2 handshake will
+                        // almost certainly fail. We still attempt it for
+                        // parity with loopback test servers that may not
+                        // bother advertising.
+                    }
+                }
+
+                let io = HyperStream::new(*stream);
+                let mut builder = http2::Builder::new(CompioExecutor);
+                builder.timer(CompioTimer);
+                builder.initial_max_send_streams(opts.max_conns);
+                let (sender, conn) = builder
+                    .handshake::<_, Full<Bytes>>(io)
+                    .await
+                    .map_err(|e| {
+                        TransportError::Protocol(format!("h2 handshake: {e}"))
+                    })?;
+                spawn(async move {
+                    let _ = conn.await;
+                })
+                .detach();
+                sender
             }
         };
-
-        // Spawn the connection driver. Mirrors h1: the task is detached,
-        // runs until the server closes the stream, and on error just
-        // ends — the SendRequest side learns via subsequent requests.
-        spawn(async move {
-            let _ = conn.await;
-        })
-        .detach();
 
         Ok(Self {
             sender,

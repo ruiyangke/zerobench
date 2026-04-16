@@ -81,8 +81,13 @@ thiserror = "2"
 libc = "0.2"
 socket2 = "0.6"
 
-# TLS primitives
-rustls = { version = "0.23", features = ["ring"] }
+# TLS primitives — disable default features so aws-lc-rs isn't pulled
+# alongside ring (rustls 0.23's default turns on both, which then trips
+# `get_default_or_install_from_crate_features` at runtime).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = "0.26"
+# Test-time self-signed cert generation (TLS smoke tests)
+rcgen = "0.13"
 
 # Config file parsing
 toml = "0.8"

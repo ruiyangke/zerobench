@@ -15,9 +15,14 @@
 //! - [`HttpVersionPref::Http2`] → always [`Http2Client`]. Errors with
 //!   [`TransportError::Protocol`] when the `h2` feature isn't compiled
 //!   in, so users aren't silently downgraded.
-//! - [`HttpVersionPref::Auto`] → H1 on plain HTTP. On HTTPS this would
-//!   ideally attempt ALPN-negotiated H2, but TLS + ALPN support is
-//!   deferred beyond Phase E; Auto on HTTPS currently resolves to H1.
+//! - [`HttpVersionPref::Auto`] → H1 on plain HTTP. On HTTPS, an ALPN
+//!   probe is performed: we open one TLS connection advertising
+//!   `h2, http/1.1` and look at what the server chose. `h2` → build an
+//!   `Http2Client`; anything else → build an `Http1Pool`. This probe
+//!   connection is closed and not reused — the pool/H2 client opens its
+//!   own connections with the appropriate single-protocol ALPN list
+//!   when it builds its first slot. One extra connect at startup is
+//!   negligible for a benchmark that runs for ≥1s.
 //!
 //! The `build_client` future itself is feature-gated only in terms of
 //! which arms compile — the `HttpClient` enum is always defined with
@@ -121,13 +126,7 @@ impl Transport for HttpTransport {
                 Ok(HttpClient::Http1(Arc::new(pool)))
             }
             HttpVersionPref::Http2 => build_h2(target, opts).await,
-            HttpVersionPref::Auto => {
-                // TODO(alpn): when TLS is wired, attempt ALPN `h2` on
-                // HTTPS targets and fall back to H1 on `http/1.1`. For
-                // now, Auto everywhere means H1.
-                let pool = Http1Pool::new(target, opts).await?;
-                Ok(HttpClient::Http1(Arc::new(pool)))
-            }
+            HttpVersionPref::Auto => build_auto(target, opts).await,
         }
     }
 
@@ -137,6 +136,56 @@ impl Transport for HttpTransport {
         ctx: &mut ScenarioContext,
     ) -> Result<Response, TransportError> {
         client.exchange(plan, ctx).await
+    }
+}
+
+/// `HttpVersionPref::Auto` dispatch.
+///
+/// Plain HTTP: always H1 (H2 cleartext requires explicit opt-in because
+/// no browser / curl uses it and servers don't advertise it).
+///
+/// HTTPS: probe ALPN with `h2, http/1.1`, pick the pool type based on
+/// what the server chose. The probe connection is closed; the pool opens
+/// fresh connections on its own. This adds one connect worth of latency
+/// at startup (roughly 1-3 RTTs including TLS), which is noise for any
+/// bench that runs ≥1s. We trade simplicity for the negligible cost —
+/// threading the probe connection into the first slot would require new
+/// `from_conn` constructors on both pool types and some care around
+/// ownership.
+async fn build_auto(
+    target: &Target,
+    opts: &TransportOpts,
+) -> Result<HttpClient, TransportError> {
+    // Plain HTTP → H1.
+    if !target.tls {
+        let pool = Http1Pool::new(target, opts).await?;
+        return Ok(HttpClient::Http1(Arc::new(pool)));
+    }
+
+    // TLS but H2 feature absent → H1.
+    #[cfg(not(feature = "h2"))]
+    {
+        let pool = Http1Pool::new(target, opts).await?;
+        return Ok(HttpClient::Http1(Arc::new(pool)));
+    }
+
+    #[cfg(feature = "h2")]
+    {
+        // Probe: open one TLS connection advertising both protocols.
+        let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
+        let probe = crate::conn::open(target, opts, alpn).await?;
+        let negotiated = probe.negotiated_alpn().map(|s| s.to_vec());
+        // Drop the probe — the pool/H2 client opens its own connection.
+        drop(probe);
+
+        match negotiated.as_deref() {
+            Some(b"h2") => build_h2(target, opts).await,
+            _ => {
+                // `Some(b"http/1.1")`, `None`, or anything else → H1.
+                let pool = Http1Pool::new(target, opts).await?;
+                Ok(HttpClient::Http1(Arc::new(pool)))
+            }
+        }
     }
 }
 

@@ -14,6 +14,7 @@ pub mod stats;
 mod step_exec;
 pub mod stop;
 pub mod template;
+pub mod tls;
 pub mod transport;
 pub mod var;
 
@@ -35,6 +36,7 @@ pub use scenario_context::ScenarioContext;
 pub use stats::{ErrorCounters, ErrorKind, ScenarioStats, Summary, TaskStats};
 pub use stop::StopSignal;
 pub use template::{ExpandCtx, Template, TemplateError};
+pub use tls::tls_client_config;
 pub use transport::{
     HttpVersionPref, Response, ResponseBody, Target, TargetError, Transport, TransportError,
     TransportOpts,

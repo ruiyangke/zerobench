@@ -212,13 +212,11 @@ pub struct TransportOpts {
     pub insecure_tls: bool,
     /// Preferred HTTP protocol version for the client side.
     ///
-    /// For v0.0.1 this is honoured by `HttpTransport` only. On plain
-    /// HTTP, [`HttpVersionPref::Auto`] picks H1 (H2 cleartext requires
+    /// Honoured by `HttpTransport` only. On plain HTTP,
+    /// [`HttpVersionPref::Auto`] picks H1 (H2 cleartext requires
     /// explicit opt-in because servers don't advertise). On HTTPS, Auto
-    /// will try to negotiate H2 via ALPN and fall back to H1 if the
-    /// server only offers it — but TLS + ALPN wiring is deferred beyond
-    /// Phase E and Auto-on-HTTPS today resolves to H1 until the TLS
-    /// path lands.
+    /// performs an ALPN probe (`h2, http/1.1`) and picks the protocol
+    /// the server chose — H2 if offered, H1 otherwise.
     pub http_version: HttpVersionPref,
 }
 
@@ -245,7 +243,7 @@ impl Default for TransportOpts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HttpVersionPref {
     /// Let the transport pick. HTTP → H1, HTTPS → ALPN negotiation
-    /// (currently resolves to H1 until TLS+ALPN lands).
+    /// (`h2` if the server offers it, else `http/1.1`).
     #[default]
     Auto,
     /// Force HTTP/1.1. Always available.

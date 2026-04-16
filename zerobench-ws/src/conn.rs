@@ -13,11 +13,14 @@
 //!
 //! # TLS / wss://
 //!
-//! TLS is not wired in v0.0.1 — same story as the HTTP / SSE transports,
-//! which return [`WsError::Tls`] on `wss://` URLs. The rest of the
-//! Connection layer is written generically (see [`WsStream`]) so plugging
-//! `compio_tls::TlsStream<TcpStream>` in later is a one-line change;
-//! that's deferred to the TLS task that lights up the whole stack.
+//! `wss://` runs the same handshake + frame codec on top of a
+//! `compio_tls::TlsStream<TcpStream>` instead of a plain `TcpStream`.
+//! The layered design falls out of [`WsStream`] being a blanket trait
+//! for anything that is `AsyncRead + AsyncWrite + Unpin + 'static`:
+//! `WsConnection<TcpStream>` and `WsConnection<TlsStream<TcpStream>>`
+//! coexist without any per-variant code below the connect path.
+//! We deliberately do **not** advertise ALPN here — the WebSocket
+//! Upgrade handshake lives above TLS, so ALPN has no role.
 //!
 //! # Control-frame handling
 //!
@@ -32,10 +35,15 @@ use std::io;
 use bytes::BytesMut;
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+// AsyncWrite's `flush` is an inherent method, but callers need to
+// invoke it explicitly after write_all on TLS streams (plain TCP
+// ignores it as a no-op).
 use compio::net::TcpStream;
+use compio_tls::TlsStream;
 
 use zerobench_core::rng::BenchRng;
-use zerobench_core::transport::Target;
+use zerobench_core::tls::tls_client_config;
+use zerobench_core::transport::{Target, TransportOpts};
 
 use crate::frame::{self, FrameHeader, Opcode};
 use crate::handshake::{self, find_headers_end, HandshakeError};
@@ -71,7 +79,9 @@ pub enum WsError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
 
-    /// `wss://` was requested but the TLS path is not wired in v0.0.1.
+    /// TLS handshake failed — certificate rejection, hostname mismatch,
+    /// signature failure, or an unexpected EOF before the handshake
+    /// finished. Message carries the underlying rustls error.
     #[error("tls: {0}")]
     Tls(String),
 }
@@ -82,10 +92,11 @@ pub enum WsError {
 // concrete TcpStream variant for now.
 // ---------------------------------------------------------------------------
 
-/// Marker trait for WS-capable byte streams. `TcpStream` implements it;
-/// when TLS lands, `TlsStream<TcpStream>` will too.
+/// Marker trait for WS-capable byte streams. `TcpStream` satisfies it
+/// for `ws://`; `TlsStream<TcpStream>` satisfies it for `wss://`.
 pub trait WsStream: AsyncRead + AsyncWrite + Unpin + 'static {}
 impl WsStream for TcpStream {}
+impl WsStream for TlsStream<TcpStream> {}
 
 // ---------------------------------------------------------------------------
 // Connection
@@ -150,13 +161,18 @@ impl DataFrame {
 }
 
 impl WsConnection<TcpStream> {
-    /// Open a TCP connection to `target` and perform the RFC 6455 §4
+    /// Open a plain-TCP `ws://` connection and perform the RFC 6455 §4
     /// Upgrade handshake.
     ///
     /// Returns a ready-to-use connection on success. Partial reads of
     /// the response are handled — we keep pulling from the socket until
     /// a `\r\n\r\n` terminator is found (capped at 16 KiB to prevent
     /// resource exhaustion from a malicious server).
+    ///
+    /// TLS targets are rejected here — the caller should route `wss://`
+    /// through [`WsConnection::connect`] which dispatches to the TLS
+    /// path. Kept for backward compatibility with existing tests; new
+    /// call sites should prefer the unified [`connect`] wrapper below.
     pub async fn connect_tcp(
         target: &Target,
         path: &str,
@@ -164,9 +180,8 @@ impl WsConnection<TcpStream> {
         mut mask_rng: BenchRng,
     ) -> Result<Self, WsError> {
         if target.tls {
-            // Matches the rest of the stack's Phase-B decision.
             return Err(WsError::Tls(
-                "TLS (wss://) is not wired in v0.0.1; use ws:// or pass through a TLS-terminating proxy".into(),
+                "wss:// target passed to connect_tcp; use WsConnection::connect for TLS support".into(),
             ));
         }
 
@@ -182,6 +197,138 @@ impl WsConnection<TcpStream> {
         let _ = stream.set_nodelay(true);
 
         Self::handshake_over(stream, target, path, extra_headers, &mut mask_rng).await
+    }
+}
+
+impl WsConnection<TlsStream<TcpStream>> {
+    /// Open a TLS-wrapped `wss://` connection and perform the Upgrade
+    /// handshake on top of it.
+    ///
+    /// Uses [`zerobench_core::tls::tls_client_config`] for the rustls
+    /// config. We deliberately don't advertise ALPN — the WebSocket
+    /// Upgrade lives *above* TLS, so there's no protocol for ALPN to
+    /// pick between.
+    pub async fn connect_tls(
+        target: &Target,
+        opts: &TransportOpts,
+        path: &str,
+        extra_headers: &[(String, String)],
+        mut mask_rng: BenchRng,
+    ) -> Result<Self, WsError> {
+        if !target.tls {
+            // Called from a unified wrapper that's already verified
+            // this — belt-and-braces.
+            return Err(WsError::Tls(
+                "ws:// target passed to connect_tls; use connect_tcp for plain".into(),
+            ));
+        }
+
+        let addr = target.addr();
+        let tcp = TcpStream::connect(&addr).await.map_err(|e| {
+            WsError::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("{addr}: {e}"),
+            ))
+        })?;
+        let _ = tcp.set_nodelay(true);
+
+        // Empty ALPN list — WebSocket handshake is entirely over TLS
+        // record layer, no ALPN negotiation to make.
+        let cfg = tls_client_config(opts, &[]);
+        let connector = compio_tls::TlsConnector::from(cfg);
+        let server_name = target.sni_name().to_string();
+        let tls = connector
+            .connect(&server_name, tcp)
+            .await
+            .map_err(|e| WsError::Tls(format!("handshake: {e}")))?;
+
+        Self::handshake_over(tls, target, path, extra_headers, &mut mask_rng).await
+    }
+}
+
+/// Unified `ws://` + `wss://` connection.
+///
+/// A single enum so the runner can hold "a WebSocket connection"
+/// without propagating a stream-type generic through every function.
+/// Method calls dispatch through the enum with a runtime match; the
+/// two variants don't share a vtable because the inner types differ
+/// enough (TLS stream is boxed for size parity) that an enum is clearer
+/// than a trait object.
+pub enum AnyWsConnection {
+    /// Plain `ws://` — TCP directly.
+    Plain(WsConnection<TcpStream>),
+    /// `wss://` — TLS over TCP.
+    Tls(WsConnection<TlsStream<TcpStream>>),
+}
+
+impl AnyWsConnection {
+    /// Dispatch `send_text`.
+    pub async fn send_text(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        match self {
+            AnyWsConnection::Plain(c) => c.send_text(payload).await,
+            AnyWsConnection::Tls(c) => c.send_text(payload).await,
+        }
+    }
+
+    /// Dispatch `send_binary`.
+    pub async fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        match self {
+            AnyWsConnection::Plain(c) => c.send_binary(payload).await,
+            AnyWsConnection::Tls(c) => c.send_binary(payload).await,
+        }
+    }
+
+    /// Dispatch `recv`.
+    pub async fn recv(&mut self) -> Result<DataFrame, WsError> {
+        match self {
+            AnyWsConnection::Plain(c) => c.recv().await,
+            AnyWsConnection::Tls(c) => c.recv().await,
+        }
+    }
+
+    /// Dispatch `close`.
+    pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), WsError> {
+        match self {
+            AnyWsConnection::Plain(c) => c.close(code, reason).await,
+            AnyWsConnection::Tls(c) => c.close(code, reason).await,
+        }
+    }
+}
+
+impl WsConnection<TcpStream> {
+    /// Unified connect that picks plain or TLS based on `target.tls`.
+    ///
+    /// This is the entry point the runner uses. Existing callers that
+    /// still go through [`WsConnection::connect_tcp`] (tests, v1 compat)
+    /// keep working — the inherent method lives on `WsConnection<TcpStream>`
+    /// and still returns a concrete type.
+    pub async fn connect(
+        target: &Target,
+        opts: &TransportOpts,
+        path: &str,
+        extra_headers: &[(String, String)],
+        mask_rng: BenchRng,
+    ) -> Result<AnyWsConnection, WsError> {
+        if target.tls {
+            let c = WsConnection::<TlsStream<TcpStream>>::connect_tls(
+                target,
+                opts,
+                path,
+                extra_headers,
+                mask_rng,
+            )
+            .await?;
+            Ok(AnyWsConnection::Tls(c))
+        } else {
+            let c = WsConnection::<TcpStream>::connect_tcp(
+                target,
+                path,
+                extra_headers,
+                mask_rng,
+            )
+            .await?;
+            Ok(AnyWsConnection::Plain(c))
+        }
     }
 }
 
@@ -202,6 +349,11 @@ impl<S: WsStream> WsConnection<S> {
         let (key_b64, _key_bytes) = handshake::generate_key(mask_rng);
         let req = handshake::build_request(target, path, &key_b64, extra_headers);
         stream.write_all(req).await.0?;
+        // Flush is critical on TLS streams — compio-tls buffers
+        // plaintext through rustls' record layer and only empties the
+        // buffer on an explicit flush. Plain TCP treats this as a
+        // no-op, so the call is cheap on the hot path.
+        stream.flush().await?;
 
         // Pull the response header section. Cap at 16 KiB so a misbehaving
         // server can't pin us on endless reads.
@@ -284,6 +436,9 @@ impl<S: WsStream> WsConnection<S> {
         let mut buf = Vec::with_capacity(14 + payload.len());
         frame::encode_frame(opcode, payload, mask, &mut buf);
         self.stream.write_all(buf).await.0?;
+        // Flush for TLS streams — see the handshake path's comment.
+        // Plain TCP's flush is a no-op, so the cost is negligible.
+        self.stream.flush().await?;
         Ok(())
     }
 
@@ -405,6 +560,7 @@ impl<S: WsStream> WsConnection<S> {
                     let mask = generate_mask(&mut self.mask_rng);
                     frame::encode_close(code, "", mask, &mut buf);
                     let _ = self.stream.write_all(buf).await.0;
+                    let _ = self.stream.flush().await;
                     self.close_sent = true;
                 }
                 Err(WsError::Closed { code, reason })
@@ -453,6 +609,7 @@ impl<S: WsStream> WsConnection<S> {
         frame::encode_close(code, reason, mask, &mut buf);
         self.close_sent = true;
         self.stream.write_all(buf).await.0?;
+        let _ = self.stream.flush().await;
         Ok(())
     }
 }
