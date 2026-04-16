@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 compio = { workspace = true }
 futures-util = { workspace = true }
+flume = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 hdrhistogram = { workspace = true }
@@ -22,6 +23,7 @@ rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+yansi = { workspace = true }
 
 [lints]
 workspace = true

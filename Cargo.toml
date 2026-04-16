@@ -68,6 +68,12 @@ rand = "0.8"
 rand_xoshiro = "0.6"
 uuid = { version = "1", features = ["v4", "v7"] }
 
+# Terminal colors
+yansi = "1"
+
+# Async channels (for open-loop scheduler/worker coordination)
+flume = { version = "0.12", default-features = false, features = ["async"] }
+
 # Errors
 thiserror = "2"
 

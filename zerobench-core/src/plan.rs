@@ -73,24 +73,50 @@ pub struct Scenario {
 
 impl Scenario {
     /// Construct a scenario with the given name and steps; rate profile
-    /// starts as the placeholder variant until Task 10.
+    /// defaults to [`RateProfile::Saturate`] with 50 concurrent tasks —
+    /// sensible for plan builders that don't know better (saturate is
+    /// the fallback mode; open-loop requires an explicit rate).
     pub fn new(name: impl Into<String>, steps: Vec<Step>) -> Self {
         Self {
             name: name.into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps,
         }
     }
 }
 
-/// Placeholder type; Task 10 replaces this with `Constant`/`Ramp`/`Stepped`
-/// variants and per-scenario scheduler wiring. Keeping the enum shape
-/// stable now means the [`Scenario`] field type never has to change.
+/// Per-scenario traffic shape.
+///
+/// Consumed by the Task-10 rate scheduler for open-loop modes
+/// ([`Constant`](Self::Constant) / [`Ramp`](Self::Ramp) /
+/// [`Stepped`](Self::Stepped)); the closed-loop
+/// [`Saturate`](Self::Saturate) variant is the
+/// "fill the pipe with N concurrent tasks" fallback used when the user
+/// passes `--saturate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RateProfile {
-    /// Fill-in variant so the type has a non-zero-sized discriminant and
-    /// serialization works before the real profile lands.
-    Placeholder,
+    /// Fixed rate in requests per second.
+    Constant(f64),
+    /// Linear ramp from `from` to `to` over `over`.
+    Ramp {
+        /// Starting rate in req/s.
+        from: f64,
+        /// Ending rate in req/s.
+        to: f64,
+        /// Duration over which the ramp completes; the run continues at
+        /// `to` thereafter.
+        over: Duration,
+    },
+    /// Stepped rate changes at absolute offsets from the run start.
+    /// Each tuple is `(offset_from_start, new_rate)`; the first entry
+    /// applies at `0s`.
+    Stepped(Vec<(Duration, f64)>),
+    /// Closed-loop saturation: N persistent tasks, each looping
+    /// request-then-response. `max_concurrency` is the task count.
+    Saturate {
+        /// Number of concurrent worker tasks.
+        max_concurrency: usize,
+    },
 }
 
 /// One unit of work inside a scenario iteration.

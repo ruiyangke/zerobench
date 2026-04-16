@@ -133,7 +133,7 @@ async fn saturate_single_scenario_fires_many_requests() {
     let plan = Plan {
         scenarios: vec![Scenario {
             name: "bench".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![Step::Request(RequestPlan::get(url))],
         }],
         vars,
@@ -171,12 +171,12 @@ async fn saturate_multi_scenario_exercises_every_scenario() {
         scenarios: vec![
             Scenario {
                 name: "a".into(),
-                rate: RateProfile::Placeholder,
+                rate: RateProfile::Saturate { max_concurrency: 50 },
                 steps: vec![Step::Request(RequestPlan::get(url_a))],
             },
             Scenario {
                 name: "b".into(),
-                rate: RateProfile::Placeholder,
+                rate: RateProfile::Saturate { max_concurrency: 50 },
                 steps: vec![Step::Request(RequestPlan::get(url_b))],
             },
         ],
@@ -218,7 +218,7 @@ async fn saturate_counts_assertion_failures_but_still_counts_requests() {
     let plan = Plan {
         scenarios: vec![Scenario {
             name: "expect-404".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![Step::Request(req)],
         }],
         vars,
@@ -257,7 +257,7 @@ async fn saturate_extract_status_propagates_through_chained_url() {
     let plan = Plan {
         scenarios: vec![Scenario {
             name: "chain".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![
                 Step::Request(first),
                 Step::Request(RequestPlan::get(url_second)),
@@ -298,7 +298,7 @@ async fn saturate_respects_prefired_stop_signal() {
     let plan = Plan {
         scenarios: vec![Scenario {
             name: "bench".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![Step::Request(RequestPlan::get(url))],
         }],
         vars,
@@ -358,7 +358,7 @@ async fn saturate_pause_step_slows_throughput() {
     let plan = Plan {
         scenarios: vec![Scenario {
             name: "paused".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![
                 Step::Request(RequestPlan::get(url)),
                 Step::Pause(Duration::from_millis(20)),

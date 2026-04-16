@@ -106,7 +106,7 @@ fn construct_full_plan_and_read_fields_back() {
 
     let scenario = Scenario {
         name: "login-then-fetch".into(),
-        rate: RateProfile::Placeholder,
+        rate: RateProfile::Saturate { max_concurrency: 50 },
         steps: vec![
             Step::Request(login),
             Step::Pause(Duration::from_millis(50)),
@@ -238,7 +238,7 @@ fn plan_roundtrips_through_serde_json() {
     let original = Plan {
         scenarios: vec![Scenario {
             name: "e2e".into(),
-            rate: RateProfile::Placeholder,
+            rate: RateProfile::Saturate { max_concurrency: 50 },
             steps: vec![
                 Step::Request(login),
                 Step::Pause(Duration::from_millis(50)),
