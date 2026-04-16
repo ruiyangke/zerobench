@@ -16,7 +16,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use zerobench_core::{
-    print_json, print_terminal, run_saturate, ColorChoice, StopSignal, Summary, Transport,
+    print_json, print_terminal, run_open_loop, run_saturate, ColorChoice, StopSignal,
+    Summary, Transport,
 };
 use zerobench_http::HttpTransport;
 
@@ -38,13 +39,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // Reject open-loop until Task 10 lands that path.
-    if args.rate.is_some() && !args.saturate {
-        // Task 10 updates this branch to call run_open_loop instead.
-        // For Task 9 we surface a clear message rather than silently
-        // misbehaving.
-        return Err("--rate mode lands in Task 10 of the v0.0.1 plan; pass --saturate for now".into());
-    }
+    let open_loop = args.rate.is_some();
 
     let (plan, target, opts) = plan_from_cli::build(&args)?;
 
@@ -53,7 +48,11 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     // Run.
     let stop = StopSignal::after(plan.duration);
-    let stats = run_saturate::<HttpTransport>(&plan, client, args.connections, stop).await;
+    let stats = if open_loop {
+        run_open_loop::<HttpTransport>(&plan, client, args.connections, stop).await
+    } else {
+        run_saturate::<HttpTransport>(&plan, client, args.connections, stop).await
+    };
     let summary = Summary::merge(stats, plan.duration);
 
     // Render.

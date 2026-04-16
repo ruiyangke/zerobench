@@ -4,6 +4,7 @@
 
 pub mod dispatcher;
 pub mod plan;
+pub mod rate;
 pub mod report;
 pub mod rng;
 pub mod scenario_context;
@@ -17,6 +18,7 @@ pub use dispatcher::run_saturate;
 pub use plan::{
     Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
+pub use rate::{run_open_loop, run_scheduler, KeepupCounter, Token};
 pub use report::{print_json, print_terminal, ColorChoice};
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;

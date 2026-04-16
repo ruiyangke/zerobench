@@ -201,18 +201,37 @@ fn cli_json_format_emits_structured_output() {
 }
 
 #[test]
-fn cli_rate_flag_reports_placeholder_until_task_10() {
-    // Task 9 lands --saturate only; --rate alone should surface a
-    // clean error. Task 10 flips this test to assert the CLI actually
-    // runs in open-loop mode.
+fn cli_rate_flag_runs_open_loop_and_reports_rate() {
+    let addr = spawn_server(200, b"pong");
+    let url = format!("http://{addr}/");
+
     let out = Command::new(zerobench_bin())
-        .args(["-r", "100", "-d", "100ms", "http://127.0.0.1:1/"])
+        .args([
+            "-r",
+            "200",
+            "-c",
+            "8",
+            "-d",
+            "1s",
+            "--color",
+            "never",
+            &url,
+        ])
         .output()
         .expect("run zerobench");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // Either the Task-9 rejection message or — if Task 10 already
-    // landed — an actual connect error against the dead address. Both
-    // are non-zero exits.
-    assert!(!out.status.success(), "expected non-zero exit, stderr:\n{stderr}");
+
+    assert!(
+        out.status.success(),
+        "zerobench failed under --rate: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The target rate line should render the constant profile.
+    assert!(
+        stdout.contains("200 req/s constant"),
+        "expected 'constant' rate label:\n{stdout}"
+    );
 }
 
