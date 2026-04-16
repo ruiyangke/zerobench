@@ -1,14 +1,16 @@
 //! Integration tests for [`zerobench_http::CountingStream`] over real
-//! sockets.
+//! sockets, plus targeted mock-based tests that exercise code paths
+//! real loopback can't reliably reproduce (partial writes, IO errors).
 //!
 //! The lib-level unit tests verify behaviour over in-memory `Vec<u8>`
 //! and `&[u8]` streams. Here we exercise the same counter logic against
 //! a real compio `TcpStream` pair so the compio driver code path is
 //! covered end-to-end.
 
+use std::io;
 use std::sync::atomic::Ordering;
 
-use compio::buf::BufResult;
+use compio::buf::{BufResult, IoBuf, IoBufMut};
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 
@@ -93,15 +95,16 @@ async fn reads_count_until_eof() {
 }
 
 #[compio::test]
-async fn partial_writes_still_count_correctly() {
-    // Exercise the "successful but short" branch — write a large chunk
-    // in a loop and verify the counter ends up exactly equal to the
-    // bytes we asked for.
+async fn large_writes_count_exactly() {
+    // Loopback will normally accept a 64 KiB write whole — this test
+    // doesn't *guarantee* the partial-write branch executes, it just
+    // establishes that the counter matches the bytes delivered when
+    // write_all drives a multi-call flush path (see
+    // `short_writes_accumulate_via_write_all_mock` for the deterministic
+    // partial-write case).
     let (mut server, mut client) = loopback_pair().await;
     let (_, written) = server.counts();
 
-    // 64 KiB — large enough that the OS may split the send across
-    // multiple `write` calls.
     let chunk: Vec<u8> = vec![0xAB; 65_536];
     let expected_len = chunk.len();
     server.write_all(chunk).await.unwrap();
@@ -121,6 +124,131 @@ async fn partial_writes_still_count_correctly() {
 
     assert_eq!(received, expected_len);
     assert_eq!(written.load(Ordering::Relaxed), expected_len as u64);
+}
+
+// ---------------------------------------------------------------------------
+// Mock-based tests.
+//
+// The loopback-backed tests above exercise the happy path against a real
+// socket but don't deterministically hit partial writes or IO errors.
+// The mocks here let us nail down both: CountingStream must accumulate
+// across every partial write, and must *not* advance its counters when
+// the inner stream returns an error.
+// ---------------------------------------------------------------------------
+
+/// AsyncWrite mock that returns `Ok(buf_len / 2)` on each call, or
+/// `Ok(buf_len)` once the requested slice shrinks to 1 byte.
+/// Compio's `write_all` will keep re-issuing until the buffer is fully
+/// consumed, so this reliably exercises the counter-on-partial-write path.
+struct HalfWriter {
+    total_accepted: usize,
+}
+
+impl HalfWriter {
+    fn new() -> Self {
+        Self { total_accepted: 0 }
+    }
+}
+
+impl AsyncWrite for HalfWriter {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        let len = buf.buf_len();
+        // Accept half on each call; once we're down to 1 byte take it
+        // whole so write_all terminates.
+        let n = if len <= 1 { len } else { len / 2 };
+        self.total_accepted += n;
+        BufResult(Ok(n), buf)
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// AsyncWrite mock whose every `write` call fails.
+struct FailingWriter;
+
+impl AsyncWrite for FailingWriter {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        BufResult(
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock write failure")),
+            buf,
+        )
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// AsyncRead mock whose every `read` call fails.
+struct FailingReader;
+
+impl AsyncRead for FailingReader {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        BufResult(
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "mock read failure")),
+            buf,
+        )
+    }
+}
+
+#[compio::test]
+async fn short_writes_accumulate_via_write_all_mock() {
+    // Wrap a HalfWriter: every call accepts at most half of what's asked
+    // for, so a 16-byte write_all runs through multiple partial writes.
+    // The CountingStream's counter must equal the total bytes written.
+    let mut s = CountingStream::new(HalfWriter::new());
+    let (_, written) = s.counts();
+
+    let payload: Vec<u8> = (0..16u8).collect();
+    let expected = payload.len();
+    s.write_all(payload).await.unwrap();
+
+    assert_eq!(
+        written.load(Ordering::Relaxed),
+        expected as u64,
+        "counter should equal total bytes written across partial writes"
+    );
+    // Sanity: the inner writer also saw every byte exactly once.
+    assert_eq!(s.into_inner().total_accepted, expected);
+}
+
+#[compio::test]
+async fn write_error_does_not_advance_counter() {
+    let mut s = CountingStream::new(FailingWriter);
+    let (_, written) = s.counts();
+
+    let BufResult(res, _) = s.write(b"anything".to_vec()).await;
+    assert!(res.is_err(), "mock FailingWriter should always fail");
+    assert_eq!(
+        written.load(Ordering::Relaxed),
+        0,
+        "errored writes must not bump the counter"
+    );
+}
+
+#[compio::test]
+async fn read_error_does_not_advance_counter() {
+    let mut s = CountingStream::new(FailingReader);
+    let (read_ctr, _) = s.counts();
+
+    let buf = Vec::with_capacity(32);
+    let BufResult(res, _) = s.read(buf).await;
+    assert!(res.is_err(), "mock FailingReader should always fail");
+    assert_eq!(
+        read_ctr.load(Ordering::Relaxed),
+        0,
+        "errored reads must not bump the counter"
+    );
 }
 
 #[compio::test]
