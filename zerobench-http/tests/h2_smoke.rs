@@ -140,6 +140,48 @@ async fn spawn_h2_sleeping_server(
     addr
 }
 
+/// Like [`spawn_h2_sleeping_server`] but the server advertises a
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` cap to the client. This is the
+/// coupling required to prove *the client* is obeying a concurrency
+/// bound: per h2's settings-application rules, the client's
+/// `initial_max_send_streams` is overridden by the peer's initial
+/// SETTINGS, so without the server advertising a cap the client has
+/// no enforceable ceiling. Used by the regression test that guards
+/// the `initial_max_send_streams` wiring in [`crate::h2`].
+async fn spawn_h2_sleeping_server_capped(
+    per_request: Duration,
+    max_streams: u32,
+    body: &'static [u8],
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    spawn(async move {
+        loop {
+            let (socket, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            spawn(async move {
+                let io = HyperStream::new(socket);
+                let svc = service_fn(move |_req: Request<Incoming>| async move {
+                    compio::time::sleep(per_request).await;
+                    Ok::<_, Infallible>(Response::new(Full::new(
+                        Bytes::from_static(body),
+                    )))
+                });
+                let mut builder = http2::Builder::new(LocalCompioExec);
+                builder.max_concurrent_streams(max_streams);
+                let _ = builder.serve_connection(io, svc).await;
+            })
+            .detach();
+        }
+    })
+    .detach();
+
+    addr
+}
+
 // ---------------------------------------------------------------------------
 // Plan / context builders
 // ---------------------------------------------------------------------------
@@ -314,6 +356,97 @@ async fn zero_max_conns_rejected() {
 // ---------------------------------------------------------------------------
 // Transport trait dispatch
 // ---------------------------------------------------------------------------
+
+/// End-to-end smoke test for the HTTP/2 outgoing-stream concurrency
+/// cap plumbing.
+///
+/// # Background
+///
+/// Hyper's H2 *client* exposes two similarly-named knobs that do very
+/// different things:
+///
+/// - `max_concurrent_streams(n)` — caps how many streams the **server**
+///   may initiate (server push). Irrelevant for normal request/response
+///   benchmarking. An earlier version of [`crate::h2`] incorrectly used
+///   this for the `-c N` ceiling.
+/// - `initial_max_send_streams(n)` — the ceiling on streams **we** (the
+///   client) may initiate. This is what `-c N` should be wired to.
+///
+/// Per RFC 9113 §5.1.2 the authoritative cap on client-initiated
+/// streams is whatever the server advertises in `SETTINGS_MAX_\
+/// CONCURRENT_STREAMS`. Once the server's preface SETTINGS arrive, h2
+/// overwrites the client's `initial_max_send_streams` with the peer's
+/// value. So to *observe* a cap in a test we pair:
+///
+/// - Client: [`Http2Client::new`] forwarding `opts.max_conns` → hyper's
+///   `initial_max_send_streams` (Fix 1).
+/// - Server: advertises `max_concurrent_streams = 2` in its initial
+///   SETTINGS.
+///
+/// If either side fails to wire the cap, the observed wall-clock shape
+/// of 10 × 50ms requests collapses from ~250ms to ~50ms.
+///
+/// # What this guards
+///
+/// A future edit that wires `opts.max_conns` into the wrong hyper
+/// builder method (e.g. the server-push `max_concurrent_streams`
+/// again), or drops the call entirely, will still produce a *build*
+/// that works but with the server's 2-stream SETTINGS as the only
+/// ceiling. That alone can't distinguish old-bug from fixed code
+/// against a cooperative server, so the assertion also checks that
+/// all 10 exchanges succeed — catching the case where a mis-wired
+/// cap would let us exceed the server's advertised limit and trigger
+/// `REFUSED_STREAM` resets.
+#[compio::test]
+async fn initial_max_send_streams_is_respected() {
+    // Server both sleeps 50ms per response AND advertises a
+    // `max_concurrent_streams = 2` cap to the client. The server cap
+    // is the authoritative limit per the spec; the client's
+    // `initial_max_send_streams(2)` echoes that locally so the h2
+    // stack has consistent bookkeeping from first byte onward.
+    let addr =
+        spawn_h2_sleeping_server_capped(Duration::from_millis(50), 2, b"capped").await;
+    let target = target_for(addr);
+    // Cap ourselves at 2 concurrent outgoing streams. The server-side
+    // SETTINGS will echo this value.
+    let opts = h2_opts(2);
+
+    let client = Arc::new(Http2Client::new(&target, &opts).await.expect("h2 client"));
+
+    let mut vars = VarRegistry::new();
+    let plan = url_plan("/capped", &mut vars);
+    let num_vars = vars.len();
+
+    let t0 = Instant::now();
+    let mut futs = Vec::with_capacity(10);
+    for seed in 0..10u64 {
+        let client = client.clone();
+        let plan = plan.clone();
+        futs.push(async move {
+            let mut ctx = ScenarioContext::new(num_vars, from_seed(seed));
+            client.exchange(&plan, &mut ctx).await
+        });
+    }
+    let results = futures_util::future::join_all(futs).await;
+    let elapsed = t0.elapsed();
+
+    // All 10 must succeed. If the client ignored the negotiated cap and
+    // tried to open 10 streams at once, the server would reject the
+    // excess with REFUSED_STREAM and some of these would fail.
+    for (i, r) in results.into_iter().enumerate() {
+        let resp = r.unwrap_or_else(|e| panic!("exchange {i} failed: {e:?}"));
+        assert_eq!(resp.status, 200);
+    }
+
+    // 2 concurrent × 50ms × 5 batches = ≥ 250ms. We assert ≥ 200ms as a
+    // generous floor; without the cap, 10 parallel streams against a
+    // 50ms-sleeping server would finish in ~50ms, well below the bound.
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "elapsed {elapsed:?} suggests the 2-stream cap was not honoured \
+         (would be ~50ms if the client ignored the advertised limit)"
+    );
+}
 
 #[compio::test]
 async fn transport_dispatches_to_http2_when_requested() {

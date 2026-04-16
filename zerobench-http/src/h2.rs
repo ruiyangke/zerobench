@@ -11,10 +11,13 @@
 //!
 //! - HTTP/1: `N` TCP connections, each serialising one request at a time.
 //! - HTTP/2: `1` TCP connection, up to `N` concurrent streams. The value
-//!   is forwarded to the hyper builder via `max_concurrent_streams` so
-//!   the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` is respected while
-//!   also telling the local dispatcher roughly how parallel we intend
-//!   to run.
+//!   is forwarded to the hyper builder via `initial_max_send_streams`,
+//!   which bounds the number of streams **we** (the client) may have
+//!   in flight at once. Note: hyper's `max_concurrent_streams` is the
+//!   *opposite* — it caps streams the server is allowed to initiate
+//!   (server push), not our own — so it is the wrong knob here.
+//!   The peer's `SETTINGS_MAX_CONCURRENT_STREAMS` is still respected
+//!   independently by h2 at the protocol layer.
 //!
 //! # Failure model
 //!
@@ -119,13 +122,19 @@ impl Http2Client {
                 let io = HyperStream::new(stream);
                 let mut builder = http2::Builder::new(CompioExecutor);
                 builder.timer(CompioTimer);
-                // Suggest an upper bound on concurrency. hyper will also
-                // respect whatever the server advertises in SETTINGS.
-                let streams: u32 = opts
-                    .max_conns
-                    .try_into()
-                    .unwrap_or(u32::MAX);
-                builder.max_concurrent_streams(streams);
+                // Cap the number of streams *we* initiate at once.
+                // `initial_max_send_streams` is the client-side knob;
+                // `max_concurrent_streams` (what we previously used)
+                // governs streams the *server* is allowed to open via
+                // push, not our outgoing streams. Using the wrong one
+                // silently left outgoing streams at hyper's default
+                // ceiling (100) regardless of `-c N`.
+                //
+                // The peer may advertise its own, lower cap via
+                // `SETTINGS_MAX_CONCURRENT_STREAMS`; h2 honours that
+                // independently, so our value is an *upper bound* on
+                // what we attempt.
+                builder.initial_max_send_streams(opts.max_conns);
 
                 builder
                     .handshake::<_, Full<Bytes>>(io)
