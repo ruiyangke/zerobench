@@ -45,7 +45,8 @@ pub struct CliArgs {
     pub requests: Option<PathBuf>,
 
     /// Max concurrent connections / worker tasks (closed-loop) or
-    /// pool ceiling (open-loop).
+    /// pool ceiling (open-loop). (For HTTP/2: maximum concurrent
+    /// streams on the shared connection.)
     #[arg(short = 'c', long = "connections", default_value_t = 50)]
     pub connections: usize,
 
