@@ -22,11 +22,8 @@ futures-util = { workspace = true }
 hyper = { workspace = true, features = ["http1"] }
 http = { workspace = true }
 http-body-util = { workspace = true }
-httparse = { workspace = true }
 cyper-core = { workspace = true }
 bytes = { workspace = true }
-smallvec = { workspace = true }
-rustls = { workspace = true }
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "server"] }
