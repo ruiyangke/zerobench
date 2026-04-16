@@ -131,6 +131,22 @@ pub struct CliArgs {
     #[arg(long = "http-version", value_enum,
           default_value_t = CliHttpVersion::Auto)]
     pub http_version: CliHttpVersion,
+
+    /// Show a live `ratatui` dashboard during the run.
+    ///
+    /// Refreshes at 10 Hz, consumes the same `LiveSnapshot` the JSONL
+    /// streaming path uses, and renders the standard terminal report
+    /// to stdout on exit so pipelines still capture the summary.
+    ///
+    /// Mutually exclusive with `--format jsonl` for v0.0.1 —
+    /// interleaving the TUI's redraws with JSONL lines on the same
+    /// stdout would corrupt both outputs. Requires stdout to be a TTY.
+    ///
+    /// This flag only appears when the binary was built with
+    /// `--features tui`.
+    #[cfg(feature = "tui")]
+    #[arg(long = "tui", action = ArgAction::SetTrue)]
+    pub tui: bool,
 }
 
 // ---------------------------------------------------------------------------

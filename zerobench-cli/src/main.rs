@@ -49,24 +49,55 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let open_loop = args.rate.is_some();
 
+    // --- TUI / JSONL mutual-exclusion guard -----------------------------
+    //
+    // For v0.0.1 the TUI and JSONL streamer both write to stdout; running
+    // both interleaves ANSI cursor moves with JSONL lines, corrupting
+    // anything downstream trying to parse either. Fail fast with a clean
+    // error rather than producing garbage.
+    //
+    // Checked before `build_client` so a mis-invocation surfaces as a
+    // clean usage error rather than a network failure.
+    #[cfg(feature = "tui")]
+    let tui_enabled = args.tui;
+    #[cfg(not(feature = "tui"))]
+    let tui_enabled = false;
+
+    if tui_enabled && matches!(args.format, CliFormat::Jsonl) {
+        return Err(
+            "--tui cannot be combined with --format jsonl (both write to stdout)".into(),
+        );
+    }
+    #[cfg(feature = "tui")]
+    if tui_enabled {
+        // The dashboard is unusable without a TTY (no place to render
+        // the alt-screen buffer) — surface that up-front instead of
+        // failing mid-run with a confusing crossterm error.
+        if !std::io::stdout().is_terminal() {
+            return Err("--tui requires stdout to be a TTY".into());
+        }
+    }
+
     let (plan, target, opts) = plan_from_cli::build(&args)?;
 
     // Stand up the transport client.
     let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
 
-    // Set up live streaming for `--format jsonl`.
-    // `LiveSnapshot::new` already returns an `Arc`, so we keep it as
-    // is rather than double-wrapping.
-    let live = match args.format {
-        CliFormat::Jsonl => Some(zerobench_core::LiveSnapshot::new()),
-        _ => None,
+    // Set up live streaming for JSONL streaming OR the TUI dashboard —
+    // both consume the same `LiveSnapshot`. `LiveSnapshot::new`
+    // already returns an `Arc`, so we keep it as is rather than
+    // double-wrapping.
+    let live = if matches!(args.format, CliFormat::Jsonl) || tui_enabled {
+        Some(zerobench_core::LiveSnapshot::new())
+    } else {
+        None
     };
 
     // Spawn the per-second ticker task if we're streaming JSONL. The
     // ticker writes one line per second to stdout; the final summary
     // goes to stderr so pipelines capturing stdout get clean JSONL.
     let ticker_stop = StopSignal::new();
-    let ticker_handle = if let Some(live) = &live {
+    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
         let live = live.clone();
         let stop = ticker_stop.clone();
         Some(compio::runtime::spawn(
@@ -76,8 +107,41 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         None
     };
 
-    // Run.
+    // Run. The stop signal ticks after `plan.duration` elapses; the
+    // TUI also flips it when the user hits `q` so the dispatcher
+    // exits early and records the actual (shorter) duration.
     let stop = StopSignal::after(plan.duration);
+
+    // Spawn the TUI task if `--tui` is on. The TUI owns the terminal
+    // for the duration of the run; its own loop calls
+    // `swap_and_snapshot` at 1 Hz to drain the shared LiveSnapshot.
+    //
+    // We share `stop` with the dispatcher: when the user hits `q`,
+    // the TUI stops it, which breaks the workers out of their loops.
+    // This matches the design spec — `q` terminates the whole run,
+    // not just the dashboard.
+    #[cfg(feature = "tui")]
+    let tui_handle = if tui_enabled {
+        let live = live.clone().expect("live snapshot set above when tui_enabled");
+        let target_rate_opt = args.rate;
+        let total_duration = plan.duration;
+        let url_label = format_url_label(&target);
+        let stop_for_tui = stop.clone();
+        let handle = compio::runtime::spawn(async move {
+            zerobench_tui::run_tui(
+                live,
+                stop_for_tui,
+                target_rate_opt,
+                total_duration,
+                url_label,
+            )
+            .await
+        });
+        Some(handle)
+    } else {
+        None
+    };
+
     let stats = if open_loop {
         run_open_loop::<HttpTransport>(
             &plan,
@@ -102,6 +166,15 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     ticker_stop.stop();
     if let Some(h) = ticker_handle {
         let _ = h.await;
+    }
+
+    // Wait for the TUI task to restore the terminal before we print
+    // the final report. The shared `stop` has already tripped (either
+    // the timer fired or the user hit `q`), so the TUI loop is on
+    // its way out; we just wait for it to drop the alt-screen.
+    #[cfg(feature = "tui")]
+    if let Some(handle) = tui_handle {
+        let _ = handle.await;
     }
 
     let summary = Summary::merge(stats, plan.duration);
@@ -210,5 +283,19 @@ async fn jsonl_ticker(
         let mut out = stdout.lock();
         let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);
         let _ = out.flush();
+    }
+}
+
+/// Compact human-friendly URL for the TUI header bar — `http://host`
+/// or `https://host:port`, omitting the default port so the header
+/// stays readable.
+#[cfg(feature = "tui")]
+fn format_url_label(target: &zerobench_core::transport::Target) -> String {
+    let scheme = if target.tls { "https" } else { "http" };
+    let default_port = if target.tls { 443 } else { 80 };
+    if target.port == default_port {
+        format!("{scheme}://{}", target.host)
+    } else {
+        format!("{scheme}://{}:{}", target.host, target.port)
     }
 }
