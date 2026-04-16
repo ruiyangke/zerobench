@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "duration_ms": 30000,
+  "target_rate": { "kind": "saturate", "max_concurrency": 50 },
+  "requests": 300254,
+  "requests_per_sec": 10012.5,
+  "bytes_sent": 2041000,
+  "bytes_received": 7568000,
+  "latency_ns": {
+    "p50":  118000,
+    "p90":  445000,
+    "p99":  2100000,
+    "p99_9": 8100000,
+    "max":  23500000
+  },
+  "ttfb_ns": {
+    "p50":  79000,
+    "p90":  298000,
+    "p99":  1490000,
+    "max":  19000000
+  },
+  "errors": {
+    "connect": 0,
+    "read": 0,
+    "write": 0,
+    "timeout": 0,
+    "keepup": 0,
+    "status_4xx": 0,
+    "status_5xx": 0,
+    "assertion_failed": 0
+  },
+  "scenarios": []
+}

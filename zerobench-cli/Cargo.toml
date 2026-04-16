@@ -42,6 +42,7 @@ http = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
+yansi = { workspace = true }
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "server"] }

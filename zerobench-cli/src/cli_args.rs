@@ -18,6 +18,11 @@ use clap::{ArgAction, Parser, ValueEnum};
     about = "Fast, correct HTTP benchmarking — open-loop, HDR-precise, io_uring-native"
 )]
 pub struct CliArgs {
+    /// Optional sub-command (`diff`, ...). When omitted, the positional
+    /// `url` / flags describe a bench run.
+    #[command(subcommand)]
+    pub command: Option<Subcommand>,
+
     /// Target URL. Optional when `--request-file` or `--requests` is
     /// passed — the URL is derived from the `.http` file's Host header
     /// (or from an absolute URL in the request line).
@@ -130,6 +135,54 @@ pub enum CliFormat {
     /// Prometheus textfile format emitted at end-of-run (no output
     /// during the run).
     Prom,
+}
+
+// ---------------------------------------------------------------------------
+// Sub-commands
+// ---------------------------------------------------------------------------
+
+/// Sub-commands beyond the default "run a benchmark" behaviour.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum Subcommand {
+    /// Compare two JSON bench outputs and report deltas.
+    Diff(DiffArgs),
+}
+
+/// Arguments for `zerobench diff`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DiffArgs {
+    /// Baseline JSON output (from a prior run).
+    pub baseline: PathBuf,
+
+    /// Current JSON output (from this run).
+    pub current: PathBuf,
+
+    /// p99 regression threshold in percent. A p99 increase above this
+    /// fraction counts as a regression. Default 5%.
+    #[arg(long = "threshold-p99", default_value_t = 5.0)]
+    pub threshold_p99: f64,
+
+    /// RPS regression threshold in percent. An RPS decrease above this
+    /// fraction counts as a regression. Default 2%.
+    #[arg(long = "threshold-rps", default_value_t = 2.0)]
+    pub threshold_rps: f64,
+
+    /// Output format for the diff.
+    #[arg(long = "format", value_enum, default_value_t = DiffFormat::Terminal)]
+    pub format: DiffFormat,
+
+    /// Color output preference.
+    #[arg(long = "color", value_enum, default_value_t = CliColor::Auto)]
+    pub color: CliColor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DiffFormat {
+    /// Human-readable per-metric delta table (default).
+    Terminal,
+    /// Structured JSON blob with baseline/current/delta per metric and
+    /// an overall `regression` flag.
+    Json,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +382,43 @@ mod tests {
         ])
         .unwrap_err();
         assert!(format!("{err}").contains("cannot be used"));
+    }
+
+    #[test]
+    fn args_diff_subcommand_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "diff",
+            "/tmp/base.json",
+            "/tmp/curr.json",
+            "--threshold-p99",
+            "3.5",
+        ])
+        .unwrap();
+        match args.command.as_ref().expect("subcommand") {
+            Subcommand::Diff(da) => {
+                assert_eq!(da.baseline.to_str(), Some("/tmp/base.json"));
+                assert_eq!(da.current.to_str(), Some("/tmp/curr.json"));
+                assert!((da.threshold_p99 - 3.5).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn args_diff_defaults_are_sensible() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "diff",
+            "base.json",
+            "curr.json",
+        ])
+        .unwrap();
+        match args.command.as_ref().expect("subcommand") {
+            Subcommand::Diff(da) => {
+                assert!((da.threshold_p99 - 5.0).abs() < 1e-9);
+                assert!((da.threshold_rps - 2.0).abs() < 1e-9);
+            }
+        }
     }
 
     #[test]

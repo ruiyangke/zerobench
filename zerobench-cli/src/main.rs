@@ -22,9 +22,10 @@ use zerobench_core::{
 use zerobench_http::HttpTransport;
 
 mod cli_args;
+mod diff;
 mod plan_from_cli;
 
-use cli_args::{CliArgs, CliColor, CliFormat};
+use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
 #[compio::main]
 async fn main() -> ExitCode {
@@ -39,6 +40,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Route sub-commands first — they don't touch the transport layer.
+    if let Some(cmd) = args.command.clone() {
+        return match cmd {
+            Subcommand::Diff(da) => diff::run(&da),
+        };
+    }
+
     let open_loop = args.rate.is_some();
 
     let (plan, target, opts) = plan_from_cli::build(&args)?;
