@@ -334,18 +334,22 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
 /// round-trip every field as JSON — no NaN, no Infinity.
 pub fn print_jsonl_tick(tick: &LiveTick, out: &mut impl Write) -> io::Result<()> {
     let t_secs = tick.elapsed.as_secs_f64();
-    let rps = if t_secs > 0.0 {
-        // The aggregator's window is always 1s by construction (the
-        // ticker wakes at integer second boundaries). RPS is just the
-        // per-window request count.
-        tick.requests as f64
-    } else {
-        0.0
-    };
+    // The aggregator's window is 1s by convention (the ticker wakes on
+    // integer-second boundaries, and `LiveSnapshot` swap resets the
+    // bucket every call). For the final partial tick the window may be
+    // shorter, but we preserve a 1-second denominator so consumers can
+    // treat `rps` as a per-second rate regardless of where the run
+    // ended. Downstream callers that care about the exact per-window
+    // rate can compute `requests_delta / (t - prev_t)` themselves.
+    //
+    // Schema kept stable (u64): consumers already expect an integer rps
+    // field. To switch to f64 we'd bump the JSONL version, which is a
+    // breaking change we're not taking in this pass.
+    let rps_u64 = tick.requests;
 
     let blob = serde_json::json!({
         "t": round2(t_secs),
-        "rps": rps as u64,
+        "rps": rps_u64,
         "requests_delta": tick.requests,
         "bytes_sent": tick.bytes_sent,
         "bytes_recv": tick.bytes_recv,

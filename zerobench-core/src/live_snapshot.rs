@@ -211,29 +211,6 @@ pub struct LiveTick {
 }
 
 impl LiveTick {
-    /// Approximate RPS for this window. Uses the window width (1s by
-    /// convention, but computed from the wall clock in case the ticker
-    /// ran late).
-    pub fn rps(&self) -> f64 {
-        // When we emit a tick at t=elapsed, the window size is exactly
-        // 1s (ticker sleeps to the next integer second). If the ticker
-        // runs late, a slightly longer window is fine — we divide by
-        // the actual duration between ticks. For the first tick there
-        // is only `elapsed` to use.
-        let secs = self.elapsed.as_secs_f64();
-        if secs <= 0.0 {
-            return 0.0;
-        }
-        // For a 1s tick, `elapsed` is whole seconds; requests/elapsed
-        // gives cumulative rate which is a useful proxy to avoid
-        // needing to remember the prior tick's time. But that's cumulative,
-        // and we want *window* rate. Since we always tick at 1s intervals
-        // we just return requests / 1.0 as a reasonable approximation.
-        // (The writer function calls this once per tick with a
-        // per-window value.)
-        self.requests as f64 / 1.0_f64.max(1.0)
-    }
-
     /// Latency at percentile `pct`, in nanoseconds. Returns 0 when the
     /// bucket had no samples.
     pub fn latency_p_ns(&self, pct: f64) -> u64 {

@@ -358,9 +358,10 @@ fn demote_latency_regression(d: &mut Delta) {
 // ---------------------------------------------------------------------------
 
 fn get_f64(v: &serde_json::Value, k: &str) -> f64 {
-    v.get(k)
-        .and_then(|x| x.as_f64().or_else(|| x.as_u64().map(|n| n as f64)))
-        .unwrap_or(0.0)
+    // `Value::as_f64` already handles integer variants (both u64 and
+    // i64), converting to f64 losslessly within the float's precision
+    // range — no need for a manual `or_else(as_u64)` fallback.
+    v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
 }
 
 fn get_f64_path(v: &serde_json::Value, path: &[&str]) -> f64 {
@@ -371,9 +372,7 @@ fn get_f64_path(v: &serde_json::Value, path: &[&str]) -> f64 {
             None => return 0.0,
         }
     }
-    cur.as_f64()
-        .or_else(|| cur.as_u64().map(|n| n as f64))
-        .unwrap_or(0.0)
+    cur.as_f64().unwrap_or(0.0)
 }
 
 fn get_u64_path(v: &serde_json::Value, path: &[&str]) -> u64 {
