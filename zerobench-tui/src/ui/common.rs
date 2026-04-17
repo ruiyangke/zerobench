@@ -50,6 +50,8 @@ pub enum Status {
     Green,
     Yellow,
     Red,
+    /// Benchmark completed — TUI stays open for inspection.
+    Done,
 }
 
 /// Decide the header pill colour from live state inputs.
@@ -91,6 +93,7 @@ pub fn status_pill(status: Status) -> Span<'static> {
         Status::Green => SUCCESS,
         Status::Yellow => WARNING,
         Status::Red => CRITICAL,
+        Status::Done => ACCENT,
     };
     Span::styled("⬤", Style::new().fg(colour).add_modifier(Modifier::BOLD))
 }

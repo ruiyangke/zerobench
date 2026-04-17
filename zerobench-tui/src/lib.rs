@@ -121,41 +121,44 @@ async fn run_tui_inner(
     // uses.
     let start = Instant::now();
     let mut next_snapshot_at = start + SNAPSHOT_INTERVAL;
+    let mut run_completed = false;
 
     loop {
-        if stop.is_stopped() {
-            break;
-        }
         if state.exit_requested {
             // User pressed `q` — trip the shared stop flag so the
-            // dispatcher also exits early; the summary records the
-            // actual (shorter) duration rather than the plan's.
-            stop.stop();
+            // dispatcher also exits early (if still running).
+            if !run_completed {
+                stop.stop();
+            }
             break;
+        }
+
+        // When the benchmark finishes, do a final ingest to capture
+        // the last partial tick, mark the run as done, but DON'T
+        // exit the TUI. The user can inspect charts at leisure and
+        // press `q` when ready.
+        if !run_completed && stop.is_stopped() {
+            let tick = snapshot.swap_and_snapshot();
+            state.ingest(tick);
+            run_completed = true;
+            state.run_completed = true;
         }
 
         // --- keyboard (non-blocking) ------------------------------
-        //
-        // `crossterm::event::poll(ZERO)` returns immediately whether
-        // or not an event is pending. If one is, `read()` is
-        // guaranteed not to block.
         if crossterm::event::poll(Duration::ZERO)? {
             if let Event::Key(key) = crossterm::event::read()? {
                 handle_key(&mut state, key.code, key.modifiers);
             }
         }
 
-        // --- snapshot ingest --------------------------------------
-        //
-        // One swap per SNAPSHOT_INTERVAL. Catch up more than one
-        // bucket in the pathological case (e.g. the render loop
-        // stalled for 3s). This keeps the ring aligned with real
-        // time.
-        let now = Instant::now();
-        while now >= next_snapshot_at {
-            let tick = snapshot.swap_and_snapshot();
-            state.ingest(tick);
-            next_snapshot_at += SNAPSHOT_INTERVAL;
+        // --- snapshot ingest (only while running) -----------------
+        if !run_completed {
+            let now = Instant::now();
+            while now >= next_snapshot_at {
+                let tick = snapshot.swap_and_snapshot();
+                state.ingest(tick);
+                next_snapshot_at += SNAPSHOT_INTERVAL;
+            }
         }
 
         // --- render -----------------------------------------------
@@ -163,19 +166,20 @@ async fn run_tui_inner(
             terminal.draw(|f| render(f, &state))?;
         }
 
-        // --- wait for next frame or snapshot, whichever comes first -
+        // --- wait for next frame ----------------------------------
+        let now = Instant::now();
         let next_frame = now + RENDER_INTERVAL;
-        let wake_at = next_frame.min(next_snapshot_at);
+        let wake_at = if run_completed {
+            next_frame // no snapshot tick needed, just render cadence
+        } else {
+            next_frame.min(next_snapshot_at)
+        };
         let wait = wake_at.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             compio::time::sleep(wait).await;
         }
     }
 
-    // No final drain: `LiveSnapshot` is only for live display. The
-    // authoritative counters live in `TaskStats` via the dispatcher
-    // path; the outer caller prints the standard terminal report from
-    // those.
     Ok(())
 }
 

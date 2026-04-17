@@ -117,7 +117,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     // Row 1: url · status · elapsed.
     let actual_pct = state.actual_vs_target_pct();
     let errors_present = state.total_errors.total() > 0;
-    let status = compute_status(actual_pct, errors_present);
+    let status = if state.run_completed {
+        common::Status::Done
+    } else {
+        compute_status(actual_pct, errors_present)
+    };
 
     let elapsed_s = state.elapsed().as_secs_f64();
     let total_s = state.total_duration.as_secs();
@@ -132,13 +136,17 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Span::styled("   ", Style::new()),
         status_pill(status),
         Span::raw(" "),
-        Span::styled(
-            format!("{elapsed_s:.1}s / {total_s}s"),
-            Style::new().fg(Color::Gray),
-        ),
+        if state.run_completed {
+            Span::styled("done", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(
+                format!("{elapsed_s:.1}s / {total_s}s"),
+                Style::new().fg(Color::Gray),
+            )
+        },
         Span::raw(" · "),
         Span::styled(
-            format!("{progress_pct:.0}%"),
+            if state.run_completed { "100%".into() } else { format!("{progress_pct:.0}%") },
             Style::new().fg(Color::Gray),
         ),
     ]);
@@ -200,6 +208,7 @@ fn rate_colour(status: common::Status) -> Color {
         common::Status::Green => common::SUCCESS,
         common::Status::Yellow => common::WARNING,
         common::Status::Red => common::CRITICAL,
+        common::Status::Done => common::ACCENT,
     }
 }
 

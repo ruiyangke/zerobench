@@ -86,12 +86,10 @@ fn render_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .map(|t| (t.elapsed.as_secs_f64(), t.p99_9_ns as f64))
         .collect();
 
-    let x_min = p50.first().map(|p| p.0).unwrap_or(0.0);
-    let x_max = p50
-        .last()
-        .map(|p| p.0)
-        .unwrap_or_else(|| state.total_duration.as_secs_f64())
-        .max(x_min + 1.0);
+    // Fixed time axis: always show 0..total_duration so the chart
+    // doesn't grow — data fills in from the left.
+    let x_min = 0.0_f64;
+    let x_max = state.total_duration.as_secs_f64().max(1.0);
 
     // Y-axis bounds — take the max of all series with a 10% headroom
     // so the top line doesn't clip against the frame.

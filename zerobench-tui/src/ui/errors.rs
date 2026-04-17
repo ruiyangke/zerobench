@@ -80,13 +80,8 @@ fn render_category_timeseries(frame: &mut Frame, area: Rect, state: &DashboardSt
         s_assert.push((x, t.errors.assertion_failed as f64));
     }
 
-    let x_min = state.ticks.front().map(|t| t.elapsed.as_secs_f64()).unwrap_or(0.0);
-    let x_max = state
-        .ticks
-        .back()
-        .map(|t| t.elapsed.as_secs_f64())
-        .unwrap_or_else(|| state.total_duration.as_secs_f64())
-        .max(x_min + 1.0);
+    let x_min = 0.0_f64;
+    let x_max = state.total_duration.as_secs_f64().max(1.0);
 
     let y_max = [&s_connect, &s_read, &s_write, &s_timeout, &s_keepup, &s_assert]
         .iter()
@@ -209,13 +204,8 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
         s_5xx.push((x, pct_5));
     }
 
-    let x_min = state.ticks.front().map(|t| t.elapsed.as_secs_f64()).unwrap_or(0.0);
-    let x_max = state
-        .ticks
-        .back()
-        .map(|t| t.elapsed.as_secs_f64())
-        .unwrap_or(1.0)
-        .max(x_min + 1.0);
+    let x_min = 0.0_f64;
+    let x_max = state.total_duration.as_secs_f64().max(1.0);
 
     let datasets = vec![
         Dataset::default()

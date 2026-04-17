@@ -303,6 +303,10 @@ pub struct DashboardState {
     pub log_visible: bool,
     /// `q` pressed — main loop breaks on the next iteration.
     pub exit_requested: bool,
+    /// Benchmark run has finished — TUI stays open for inspection.
+    /// Set by the main loop when `StopSignal` fires. While true,
+    /// the status pill shows "done" and no new ticks are ingested.
+    pub run_completed: bool,
 }
 
 impl DashboardState {
@@ -332,6 +336,7 @@ impl DashboardState {
             paused_rendering: false,
             log_visible: false,
             exit_requested: false,
+            run_completed: false,
         }
     }
 

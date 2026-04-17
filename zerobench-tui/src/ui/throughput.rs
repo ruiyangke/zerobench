@@ -65,12 +65,8 @@ fn render_rps_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) 
         .map(|t| (t.elapsed.as_secs_f64(), t.requests as f64))
         .collect();
 
-    let x_min = rps.first().map(|p| p.0).unwrap_or(0.0);
-    let x_max = rps
-        .last()
-        .map(|p| p.0)
-        .unwrap_or_else(|| state.total_duration.as_secs_f64())
-        .max(x_min + 1.0);
+    let x_min = 0.0_f64;
+    let x_max = state.total_duration.as_secs_f64().max(1.0);
 
     // Y max uses either target + headroom (open-loop) or observed peak
     // + headroom. Ensures the target reference line doesn't clip against
@@ -183,12 +179,8 @@ fn render_bytes_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .map(|t| (t.elapsed.as_secs_f64(), t.bytes_recv as f64))
         .collect();
 
-    let x_min = sent.first().map(|p| p.0).unwrap_or(0.0);
-    let x_max = sent
-        .last()
-        .map(|p| p.0)
-        .unwrap_or_else(|| state.total_duration.as_secs_f64())
-        .max(x_min + 1.0);
+    let x_min = 0.0_f64;
+    let x_max = state.total_duration.as_secs_f64().max(1.0);
 
     let max_y = sent
         .iter()
