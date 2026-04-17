@@ -346,7 +346,7 @@ impl DashboardState {
             exit_requested: false,
             run_completed: false,
             y_scale: 1.0,
-            marker: Marker::HalfBlock,
+            marker: Marker::Braille,
         }
     }
 
