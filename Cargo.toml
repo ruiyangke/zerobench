@@ -45,6 +45,7 @@ http = "1"
 http-body-util = "0.1"
 httparse = "1"
 cyper-core = "0.8"
+h2 = "0.4"
 
 # Core utils
 bytes = { version = "1", features = ["serde"] }

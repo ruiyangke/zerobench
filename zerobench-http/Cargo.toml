@@ -15,6 +15,7 @@ h2 = ["h1", "hyper/http2"]
 h3 = []   # placeholder — wires h3 + compio-quic in Phase 8
 raw-h1 = ["dep:httparse", "dep:itoa", "dep:futures-util"]
 mio-h1 = ["dep:mio", "dep:httparse", "dep:itoa", "dep:memchr"]
+mio-h2 = ["mio-h1", "dep:h2", "dep:tokio"]
 runtime-compio = ["dep:compio", "dep:compio-tls", "dep:cyper-core", "zerobench-core/runtime-compio"]
 runtime-tokio = ["dep:tokio", "dep:tokio-rustls", "dep:hyper-util", "zerobench-core/runtime-tokio"]
 
@@ -40,6 +41,9 @@ itoa = { workspace = true, optional = true }
 # Mio backend (opt-in, synchronous epoll)
 mio = { workspace = true, optional = true }
 memchr = { workspace = true, optional = true }
+
+# H2 protocol crate (mio-h2: manually polled, no async runtime)
+h2 = { workspace = true, optional = true }
 
 # Tokio backend (opt-in)
 tokio = { workspace = true, optional = true }

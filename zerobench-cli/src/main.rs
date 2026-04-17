@@ -868,14 +868,35 @@ fn run_mio_sync(
 
     let num_threads = args.threads.max(1);
 
-    let stats = zerobench_http::mio_h1::run_mio_threaded(
-        &target,
-        &plan,
-        num_threads,
-        args.connections,
-        plan.duration,
-        args.rate,
-    );
+    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+
+    let stats = if use_h2 {
+        #[cfg(feature = "mio-h2")]
+        {
+            zerobench_http::mio_h2::run_mio_h2_threaded(
+                &target,
+                &plan,
+                num_threads,
+                args.connections,
+                plan.duration,
+                args.rate,
+            )
+        }
+        #[cfg(not(feature = "mio-h2"))]
+        {
+            return Err("--http-version h2 with --mio requires the mio-h2 feature. \
+                         Rebuild with --features mio-h2.".into());
+        }
+    } else {
+        zerobench_http::mio_h1::run_mio_threaded(
+            &target,
+            &plan,
+            num_threads,
+            args.connections,
+            plan.duration,
+            args.rate,
+        )
+    };
 
     let summary = Summary::merge(stats, plan.duration);
 
@@ -937,14 +958,35 @@ async fn run_mio(
     plan.threads = args.threads;
     let num_threads = args.threads.max(1);
 
-    let stats = zerobench_http::mio_h1::run_mio_threaded(
-        &target,
-        &plan,
-        num_threads,
-        args.connections,
-        plan.duration,
-        args.rate,
-    );
+    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+
+    let stats = if use_h2 {
+        #[cfg(feature = "mio-h2")]
+        {
+            zerobench_http::mio_h2::run_mio_h2_threaded(
+                &target,
+                &plan,
+                num_threads,
+                args.connections,
+                plan.duration,
+                args.rate,
+            )
+        }
+        #[cfg(not(feature = "mio-h2"))]
+        {
+            return Err("--http-version h2 with --mio requires the mio-h2 feature. \
+                         Rebuild with --features mio-h2.".into());
+        }
+    } else {
+        zerobench_http::mio_h1::run_mio_threaded(
+            &target,
+            &plan,
+            num_threads,
+            args.connections,
+            plan.duration,
+            args.rate,
+        )
+    };
 
     let summary = Summary::merge(stats, plan.duration);
 

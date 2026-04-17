@@ -42,6 +42,10 @@ pub mod raw_h1_tokio;
 #[cfg(feature = "mio-h1")]
 pub mod mio_h1;
 
+// --- Mio H2 backend (opt-in, h2 crate manually polled from mio) ---
+#[cfg(feature = "mio-h2")]
+pub mod mio_h2;
+
 // --- Transport dispatch (works on either backend) ---
 #[cfg(feature = "h1")]
 mod transport_impl;
