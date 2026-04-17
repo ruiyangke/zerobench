@@ -2,6 +2,14 @@
 //!
 //! See `docs/design.md` in the repo root for the architectural overview.
 
+// When both runtime features are enabled (e.g. due to cargo feature
+// unification in a workspace), compio takes precedence. For a clean
+// tokio-only build, ensure no other workspace crate pulls in compio.
+//
+// At least one runtime must be enabled:
+#[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
+compile_error!("one of `runtime-compio` or `runtime-tokio` must be enabled");
+
 pub mod dispatcher;
 pub mod live_snapshot;
 pub mod plan;
@@ -9,6 +17,7 @@ pub mod rate;
 pub mod report;
 pub mod request_file;
 pub mod rng;
+pub mod runtime;
 pub mod scenario_context;
 pub mod stats;
 mod step_exec;

@@ -53,19 +53,15 @@ impl StopSignal {
     }
 
     /// Build a signal that automatically trips after `duration` has
-    /// elapsed on the current compio runtime.
+    /// elapsed on the current async runtime.
     ///
-    /// The timer runs as a detached task; dropping every user-held clone
-    /// of the signal does not cancel the timer, but the timer holds its
-    /// own clone of the `Arc` so the flag stays live as long as the
-    /// timer task exists. When the timer fires and drops its clone, the
-    /// `Arc` deallocates with it — no leak.
+    /// On compio: spawns a detached compio timer task.
+    /// On tokio: spawns a tokio timer task.
     ///
     /// # Panics
     ///
-    /// Must be called from inside a compio runtime (the detached sleep
-    /// task needs one). Returns a plain signal either way; the timer
-    /// future panics only if `compio::runtime::spawn` itself panics.
+    /// Must be called from inside the active async runtime.
+    #[cfg(feature = "runtime-compio")]
     pub fn after(duration: Duration) -> Self {
         let sig = Self::new();
         let timer_clone = sig.clone();
@@ -74,6 +70,19 @@ impl StopSignal {
             timer_clone.stop();
         })
         .detach();
+        sig
+    }
+
+    /// Build a signal that automatically trips after `duration` has
+    /// elapsed on the current tokio runtime.
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    pub fn after(duration: Duration) -> Self {
+        let sig = Self::new();
+        let timer_clone = sig.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            timer_clone.stop();
+        });
         sig
     }
 
@@ -143,6 +152,7 @@ mod tests {
         assert!(s.is_stopped());
     }
 
+    #[cfg(feature = "runtime-compio")]
     #[compio::test]
     async fn after_trips_when_duration_elapses() {
         let s = StopSignal::after(Duration::from_millis(50));
@@ -151,12 +161,30 @@ mod tests {
         assert!(s.is_stopped());
     }
 
+    #[cfg(feature = "runtime-compio")]
     #[compio::test]
     async fn after_does_not_trip_before_elapsed() {
         let s = StopSignal::after(Duration::from_secs(60));
         // Give the runtime a tick to schedule the detached task, then
         // verify we're still in the "running" state.
         compio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!s.is_stopped());
+    }
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    #[tokio::test]
+    async fn after_trips_when_duration_elapses_tokio() {
+        let s = StopSignal::after(Duration::from_millis(50));
+        assert!(!s.is_stopped());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(s.is_stopped());
+    }
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    #[tokio::test]
+    async fn after_does_not_trip_before_elapsed_tokio() {
+        let s = StopSignal::after(Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!s.is_stopped());
     }
 

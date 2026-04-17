@@ -29,6 +29,7 @@ use rand::Rng;
 use crate::live_snapshot::LiveSnapshot;
 use crate::plan::{Plan, RateProfile, Step};
 use crate::rng::from_entropy;
+use crate::runtime::{runtime_sleep, runtime_sleep_until, runtime_timeout};
 use crate::scenario_context::ScenarioContext;
 use crate::stats::{ErrorKind, TaskStats};
 use crate::step_exec::{
@@ -127,7 +128,7 @@ pub async fn run_scheduler(
             // short-circuits to run_saturate. If we somehow land here,
             // just idle until stop.
             while !stop.is_stopped() {
-                compio::time::sleep(Duration::from_millis(50)).await;
+                runtime_sleep(Duration::from_millis(50)).await;
             }
         }
     }
@@ -168,7 +169,7 @@ async fn run_constant(
         let intended = started_at + period * (i as u32);
         // Sleep until the intended emission time. If we're already
         // behind (catch-up), sleep_until returns immediately.
-        compio::time::sleep_until(intended).await;
+        runtime_sleep_until(intended).await;
         match sender.try_send(Token {
             scenario_id,
             intended_start: intended,
@@ -210,7 +211,7 @@ async fn run_ramp(
         let intended = started_at + Duration::from_secs_f64(intended_offset.max(0.0));
         // Sleep until the intended emission time. If we're already
         // behind (catch-up), sleep_until returns immediately.
-        compio::time::sleep_until(intended).await;
+        runtime_sleep_until(intended).await;
 
         match sender.try_send(Token {
             scenario_id,
@@ -317,14 +318,14 @@ async fn run_stepped(
                 None => Duration::from_millis(50),
             };
             let wait = wait.min(Duration::from_millis(50));
-            compio::time::sleep(wait).await;
+            runtime_sleep(wait).await;
             continue;
         }
         let period = Duration::from_nanos((1e9 / current_rps) as u64).max(Duration::from_nanos(1));
         let intended = segment_start + period * (segment_index as u32);
         let now = Instant::now();
         if intended > now {
-            compio::time::sleep(intended - now).await;
+            runtime_sleep(intended - now).await;
         }
         match sender.try_send(Token {
             scenario_id,
@@ -366,59 +367,125 @@ pub fn run_open_loop_threaded<T: Transport>(
 where
     T::Client: Send + 'static,
 {
-    if num_threads <= 1 {
-        return compio::runtime::Runtime::new()
-            .expect("compio runtime")
-            .block_on(async {
-                let client = T::build_client(&target, &opts)
-                    .await
-                    .expect("build_client");
-                run_open_loop::<T>(&plan, client, total_connections, stop, live).await
-            });
+    #[cfg(feature = "runtime-compio")]
+    {
+        if num_threads <= 1 {
+            return compio::runtime::Runtime::new()
+                .expect("compio runtime")
+                .block_on(async {
+                    let client = T::build_client(&target, &opts)
+                        .await
+                        .expect("build_client");
+                    run_open_loop::<T>(&plan, client, total_connections, stop, live).await
+                });
+        }
+
+        let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
+        let scale = 1.0 / num_threads as f64;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_thread_id| {
+                let plan = plan.clone();
+                let target = target.clone();
+                let opts = opts.clone();
+                let stop = stop.clone();
+                let live = live.clone();
+
+                std::thread::spawn(move || {
+                    let mut thread_plan = (*plan).clone();
+                    for scenario in &mut thread_plan.scenarios {
+                        scenario.rate = scenario.rate.scale(scale);
+                    }
+
+                    compio::runtime::Runtime::new()
+                        .expect("compio runtime")
+                        .block_on(async {
+                            let client = T::build_client(&target, &opts)
+                                .await
+                                .expect("build_client");
+                            run_open_loop::<T>(
+                                &thread_plan,
+                                client,
+                                conns_per_thread,
+                                stop,
+                                live,
+                            )
+                            .await
+                        })
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker thread panicked"))
+            .collect()
     }
 
-    let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
-    let scale = 1.0 / num_threads as f64;
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_thread_id| {
-            let plan = plan.clone();
-            let target = target.clone();
-            let opts = opts.clone();
-            let stop = stop.clone();
-            let live = live.clone();
-
-            std::thread::spawn(move || {
-                // Build a per-thread plan with scaled rate profiles so
-                // each thread's schedulers emit rate/num_threads.
-                let mut thread_plan = (*plan).clone();
-                for scenario in &mut thread_plan.scenarios {
-                    scenario.rate = scenario.rate.scale(scale);
-                }
-
-                compio::runtime::Runtime::new()
-                    .expect("compio runtime")
-                    .block_on(async {
-                        let client = T::build_client(&target, &opts)
-                            .await
-                            .expect("build_client");
-                        run_open_loop::<T>(
-                            &thread_plan,
-                            client,
-                            conns_per_thread,
-                            stop,
-                            live,
-                        )
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    {
+        if num_threads <= 1 {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            return rt.block_on(async {
+                let local = tokio::task::LocalSet::new();
+                local.run_until(async {
+                    let client = T::build_client(&target, &opts)
                         .await
-                    })
-            })
-        })
-        .collect();
+                        .expect("build_client");
+                    run_open_loop::<T>(&plan, client, total_connections, stop, live).await
+                }).await
+            });
+        }
 
-    handles
-        .into_iter()
-        .flat_map(|h| h.join().expect("worker thread panicked"))
-        .collect()
+        let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
+        let scale = 1.0 / num_threads as f64;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let plan = plan.clone();
+                let target = target.clone();
+                let opts = opts.clone();
+                let stop = stop.clone();
+                let live = live.clone();
+
+                std::thread::spawn(move || {
+                    let mut thread_plan = (*plan).clone();
+                    for scenario in &mut thread_plan.scenarios {
+                        scenario.rate = scenario.rate.scale(scale);
+                    }
+
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("tokio runtime");
+                    rt.block_on(async {
+                        let local = tokio::task::LocalSet::new();
+                        local.run_until(async {
+                            let client = T::build_client(&target, &opts)
+                                .await
+                                .expect("build_client");
+                            run_open_loop::<T>(
+                                &thread_plan,
+                                client,
+                                conns_per_thread,
+                                stop,
+                                live,
+                            )
+                            .await
+                        }).await
+                    })
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker thread panicked"))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,58 +533,109 @@ pub async fn run_open_loop<T: Transport>(
     // gets a clone of the shared `LiveSnapshot` so its `keepup` drops
     // land in the next per-second JSONL tick (not only in the final
     // summary).
-    let mut scheduler_handles = Vec::new();
-    for (i, scenario) in plan.scenarios.iter().enumerate() {
-        if matches!(scenario.rate, RateProfile::Saturate { .. }) {
-            continue;
+    #[cfg(feature = "runtime-compio")]
+    let (scheduler_handles, worker_handles) = {
+        let mut scheduler_handles = Vec::new();
+        for (i, scenario) in plan.scenarios.iter().enumerate() {
+            if matches!(scenario.rate, RateProfile::Saturate { .. }) {
+                continue;
+            }
+            let id = i as u16;
+            let tx = tx.clone();
+            let stop = stop.clone();
+            let keepup = scenario_keepup[i].clone();
+            let profile = scenario.rate.clone();
+            let live_for_scheduler = live.clone();
+            let h = compio::runtime::spawn(async move {
+                run_scheduler(
+                    id,
+                    profile,
+                    tx,
+                    started_at,
+                    stop,
+                    keepup,
+                    live_for_scheduler,
+                )
+                .await;
+            });
+            scheduler_handles.push(h);
         }
-        let id = i as u16;
-        let tx = tx.clone();
-        let stop = stop.clone();
-        let keepup = scenario_keepup[i].clone();
-        let profile = scenario.rate.clone();
-        let live_for_scheduler = live.clone();
-        let h = compio::runtime::spawn(async move {
-            run_scheduler(
-                id,
-                profile,
-                tx,
-                started_at,
-                stop,
-                keepup,
-                live_for_scheduler,
-            )
-            .await;
-        });
-        scheduler_handles.push(h);
-    }
 
-    // If NO scenarios had a rate profile, return empty stats — nothing
-    // to do. Drop the original sender to let workers finish draining.
-    if scheduler_handles.is_empty() {
+        if scheduler_handles.is_empty() {
+            drop(tx);
+            return Vec::new();
+        }
+
+        let mut worker_handles = Vec::with_capacity(max_conns);
+        for _ in 0..max_conns {
+            let plan = plan.clone();
+            let client = client.clone();
+            let rx = rx.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+            let h = compio::runtime::spawn(async move {
+                worker_open_loop::<T>(plan, client, rx, stop, num_scenarios, live).await
+            });
+            worker_handles.push(h);
+        }
+
         drop(tx);
-        return Vec::new();
-    }
+        drop(rx);
 
-    // Spawn worker tasks.
-    let mut worker_handles = Vec::with_capacity(max_conns);
-    for _ in 0..max_conns {
-        let plan = plan.clone();
-        let client = client.clone();
-        let rx = rx.clone();
-        let stop = stop.clone();
-        let live = live.clone();
-        let h = compio::runtime::spawn(async move {
-            worker_open_loop::<T>(plan, client, rx, stop, num_scenarios, live).await
-        });
-        worker_handles.push(h);
-    }
+        (scheduler_handles, worker_handles)
+    };
 
-    // Close our end of the channel so workers get a Disconnected when
-    // the last scheduler drops theirs. The workers cloned receivers;
-    // once all senders drop, receivers return RecvError::Disconnected.
-    drop(tx);
-    drop(rx);
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    let (scheduler_handles, worker_handles) = {
+        let mut scheduler_handles = Vec::new();
+        for (i, scenario) in plan.scenarios.iter().enumerate() {
+            if matches!(scenario.rate, RateProfile::Saturate { .. }) {
+                continue;
+            }
+            let id = i as u16;
+            let tx = tx.clone();
+            let stop = stop.clone();
+            let keepup = scenario_keepup[i].clone();
+            let profile = scenario.rate.clone();
+            let live_for_scheduler = live.clone();
+            let h = tokio::task::spawn_local(async move {
+                run_scheduler(
+                    id,
+                    profile,
+                    tx,
+                    started_at,
+                    stop,
+                    keepup,
+                    live_for_scheduler,
+                )
+                .await;
+            });
+            scheduler_handles.push(h);
+        }
+
+        if scheduler_handles.is_empty() {
+            drop(tx);
+            return Vec::new();
+        }
+
+        let mut worker_handles = Vec::with_capacity(max_conns);
+        for _ in 0..max_conns {
+            let plan = plan.clone();
+            let client = client.clone();
+            let rx = rx.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+            let h = tokio::task::spawn_local(async move {
+                worker_open_loop::<T>(plan, client, rx, stop, num_scenarios, live).await
+            });
+            worker_handles.push(h);
+        }
+
+        drop(tx);
+        drop(rx);
+
+        (scheduler_handles, worker_handles)
+    };
 
     // Wait for schedulers to finish (they exit on stop).
     for h in scheduler_handles {
@@ -572,7 +690,7 @@ async fn worker_open_loop<T: Transport>(
         // We want to wake up on either a token or stop. flume doesn't
         // have a select; poll with a short timeout so the loop exits
         // even if the channel never disconnects.
-        let token = match compio::time::timeout(
+        let token = match runtime_timeout(
             Duration::from_millis(50),
             rx.recv_async(),
         )
@@ -639,7 +757,7 @@ async fn execute_steps_open_loop<T: Transport>(
                     break;
                 }
             },
-            Step::Pause(d) => compio::time::sleep(*d).await,
+            Step::Pause(d) => runtime_sleep(*d).await,
             Step::PauseRandom { min, max } => {
                 let d = if min == max {
                     *min
@@ -648,7 +766,7 @@ async fn execute_steps_open_loop<T: Transport>(
                     let hi = max.as_nanos() as u64;
                     Duration::from_nanos(ctx.rng.gen_range(lo..=hi))
                 };
-                compio::time::sleep(d).await;
+                runtime_sleep(d).await;
             }
         }
     }

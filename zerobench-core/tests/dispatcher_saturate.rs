@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! Integration tests for [`zerobench_core::run_saturate`].
 //!
 //! These spin up an in-process hyper test server on the current compio

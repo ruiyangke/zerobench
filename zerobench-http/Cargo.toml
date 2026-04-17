@@ -9,25 +9,36 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["h1"]
+default = ["h1", "runtime-compio"]
 h1 = []
 h2 = ["hyper/http2"]
 h3 = []   # placeholder — wires h3 + compio-quic in Phase 8
+runtime-compio = ["dep:compio", "dep:compio-tls", "dep:cyper-core", "zerobench-core/runtime-compio"]
+runtime-tokio = ["dep:tokio", "dep:tokio-rustls", "dep:hyper-util", "zerobench-core/runtime-tokio"]
 
 [dependencies]
-zerobench-core = { workspace = true }
-compio = { workspace = true }
-compio-tls = { workspace = true }
+zerobench-core = { workspace = true, default-features = false }
 futures-util = { workspace = true }
 hyper = { workspace = true, features = ["http1"] }
 http = { workspace = true }
 http-body-util = { workspace = true }
-cyper-core = { workspace = true }
 bytes = { workspace = true }
+
+# Compio backend (default)
+compio = { workspace = true, optional = true }
+compio-tls = { workspace = true, optional = true }
+cyper-core = { workspace = true, optional = true }
+
+# Tokio backend (opt-in)
+tokio = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 rustls = { workspace = true }
+compio = { workspace = true }
 compio-tls = { workspace = true }
 rcgen = { workspace = true }
 

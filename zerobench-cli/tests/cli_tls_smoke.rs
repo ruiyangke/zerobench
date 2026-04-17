@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! End-to-end TLS smoke tests for the compiled `zerobench` CLI binary.
 //!
 //! Boots a self-signed HTTPS server on its own thread and invokes the

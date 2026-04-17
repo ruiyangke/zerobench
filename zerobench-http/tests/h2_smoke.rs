@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! Smoke test for [`zerobench_http::Http2Client`] against an in-process
 //! hyper HTTP/2 server over plain TCP ("h2c" / cleartext).
 //!

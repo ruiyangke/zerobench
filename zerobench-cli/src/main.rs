@@ -30,7 +30,21 @@ mod plan_from_cli;
 
 use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
+#[cfg(feature = "runtime-compio")]
 #[compio::main]
+async fn main() -> ExitCode {
+    let args = CliArgs::parse();
+    match run(args).await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let args = CliArgs::parse();
     match run(args).await {
@@ -91,6 +105,9 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // template and build an HTTP request — not what we want.
     #[cfg(feature = "ws")]
     if args.ws {
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+        return Err("--ws mode requires the compio runtime (compile with --features runtime-compio)".into());
+
         // We also catch --ws + --sse here since both features may
         // be compiled in.
         #[cfg(feature = "sse")]
@@ -99,12 +116,14 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         // Explicit --http-version with --ws is meaningless — the
         // Upgrade handshake is HTTP/1.1 by spec.
+        #[cfg(feature = "runtime-compio")]
         if !matches!(args.http_version, cli_args::CliHttpVersion::Auto) {
             return Err(
                 "--ws cannot be combined with an explicit --http-version (the RFC 6455 Upgrade is HTTP/1.1 by spec)"
                     .into(),
             );
         }
+        #[cfg(feature = "runtime-compio")]
         return run_ws(&args).await;
     }
 
@@ -119,6 +138,10 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // saturate / open-loop dispatcher below.
     #[cfg(feature = "sse")]
     if args.sse {
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+        return Err("--sse mode requires the compio runtime (compile with --features runtime-compio)".into());
+
+        #[cfg(feature = "runtime-compio")]
         return run_sse(&args, &plan, &target, &opts).await;
     }
 
@@ -146,10 +169,23 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ticker writes one line per second to stdout; the final summary
     // goes to stderr so pipelines capturing stdout get clean JSONL.
     let ticker_stop = StopSignal::new();
+
+    #[cfg(feature = "runtime-compio")]
     let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
         let live = live.clone();
         let stop = ticker_stop.clone();
         Some(compio::runtime::spawn(
+            async move { jsonl_ticker(live, stop).await },
+        ))
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
+        let live = live.clone();
+        let stop = ticker_stop.clone();
+        Some(tokio::task::spawn_local(
             async move { jsonl_ticker(live, stop).await },
         ))
     } else {
@@ -164,8 +200,18 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // which prevents compio's reactor from polling. Use `after_wall`
     // (OS thread + std::thread::sleep) so the timer fires even when
     // the main thread is blocked. Single-thread mode uses the
-    // original compio-based `after` to avoid an unnecessary OS thread.
+    // original async-runtime-based `after` to avoid an unnecessary OS thread.
     let multi_threaded = args.threads > 1;
+    #[cfg(feature = "runtime-compio")]
+    let stop = if multi_threaded {
+        StopSignal::after_wall(plan.duration)
+    } else {
+        StopSignal::after(plan.duration)
+    };
+    // On tokio, multi-threaded dispatch uses a dedicated tokio runtime
+    // that calls block_on internally, so the main tokio runtime stays
+    // responsive. Use the async `after` in both cases.
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
     let stop = if multi_threaded {
         StopSignal::after_wall(plan.duration)
     } else {
@@ -182,27 +228,33 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // not just the dashboard.
     #[cfg(feature = "tui")]
     let tui_handle = if tui_enabled {
-        let live = live.clone().expect("live snapshot set above when tui_enabled");
-        let target_rate_opt = args.rate;
-        let total_duration = plan.duration;
-        let url_label = format_url_label(&target);
-        let transport_info = build_transport_info(&args, &target, &opts);
-        let scenario_names: Vec<String> =
-            plan.scenarios.iter().map(|s| s.name.clone()).collect();
-        let stop_for_tui = stop.clone();
-        let handle = compio::runtime::spawn(async move {
-            zerobench_tui::run_tui(
-                live,
-                stop_for_tui,
-                target_rate_opt,
-                total_duration,
-                url_label,
-                transport_info,
-                scenario_names,
-            )
-            .await
-        });
-        Some(handle)
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+        return Err("--tui mode requires the compio runtime (compile with --features runtime-compio)".into());
+
+        #[cfg(feature = "runtime-compio")]
+        {
+            let live = live.clone().expect("live snapshot set above when tui_enabled");
+            let target_rate_opt = args.rate;
+            let total_duration = plan.duration;
+            let url_label = format_url_label(&target);
+            let transport_info = build_transport_info(&args, &target, &opts);
+            let scenario_names: Vec<String> =
+                plan.scenarios.iter().map(|s| s.name.clone()).collect();
+            let stop_for_tui = stop.clone();
+            let handle = compio::runtime::spawn(async move {
+                zerobench_tui::run_tui(
+                    live,
+                    stop_for_tui,
+                    target_rate_opt,
+                    total_duration,
+                    url_label,
+                    transport_info,
+                    scenario_names,
+                )
+                .await
+            });
+            Some(handle)
+        }
     } else {
         None
     };
@@ -245,7 +297,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 if let Ok(stats) = rx.try_recv() {
                     break stats;
                 }
-                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+                zerobench_core::runtime::runtime_sleep(std::time::Duration::from_millis(50)).await;
             }
         } else {
             // No TUI or JSONL ticker: block the main thread directly —
@@ -375,7 +427,7 @@ async fn jsonl_ticker(
         // Cap individual sleep at ~100ms so we wake promptly when
         // `stop` trips between ticks.
         let poll_wait = wait.min(std::time::Duration::from_millis(100));
-        compio::time::sleep(poll_wait).await;
+        zerobench_core::runtime::runtime_sleep(poll_wait).await;
         if stop.is_stopped() {
             break;
         }

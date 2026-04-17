@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! Integration tests for the open-loop rate scheduler + dispatcher.
 //!
 //! These tests go through an in-memory FakeTransport to avoid a real

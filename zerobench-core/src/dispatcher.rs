@@ -42,6 +42,7 @@ use rand::Rng;
 use crate::live_snapshot::LiveSnapshot;
 use crate::plan::{Plan, Step};
 use crate::rng::from_entropy;
+use crate::runtime::runtime_sleep;
 use crate::scenario_context::ScenarioContext;
 use crate::stats::TaskStats;
 use crate::step_exec::{
@@ -131,32 +132,64 @@ pub async fn run_saturate<T: Transport>(
     let plan = Arc::new(plan.clone());
     let num_scenarios = plan.scenarios.len();
 
-    let mut handles = Vec::with_capacity(max_tasks);
-    for _ in 0..max_tasks {
-        let plan = plan.clone();
-        let client = client.clone();
-        let stop = stop.clone();
-        let live = live.clone();
-        let handle = compio::runtime::spawn(async move {
-            worker_saturate::<T>(plan, client, stop, num_scenarios, live).await
-        });
-        handles.push(handle);
-    }
+    #[cfg(feature = "runtime-compio")]
+    {
+        let mut handles = Vec::with_capacity(max_tasks);
+        for _ in 0..max_tasks {
+            let plan = plan.clone();
+            let client = client.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+            let handle = compio::runtime::spawn(async move {
+                worker_saturate::<T>(plan, client, stop, num_scenarios, live).await
+            });
+            handles.push(handle);
+        }
 
-    let mut out = Vec::with_capacity(max_tasks);
-    for h in handles {
-        match h.await {
-            Ok(stats) => out.push(stats),
-            Err(_panic) => {
-                // The worker panicked. Contribute an empty stats slot so
-                // the count of tasks-started matches tasks-collected,
-                // rather than silently dropping the panic or letting it
-                // poison the whole run.
-                out.push(TaskStats::new(num_scenarios));
+        let mut out = Vec::with_capacity(max_tasks);
+        for h in handles {
+            match h.await {
+                Ok(stats) => out.push(stats),
+                Err(_panic) => {
+                    out.push(TaskStats::new(num_scenarios));
+                }
             }
         }
+        out
     }
-    out
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    {
+        // Tokio path: use a LocalSet to avoid the Send requirement on
+        // Transport futures (compio IO types are !Send, and the generic
+        // Transport trait doesn't bound Send on exchange's return).
+        // tokio::task::spawn_local works on a LocalSet and doesn't
+        // require Send.
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut handles = Vec::with_capacity(max_tasks);
+            for _ in 0..max_tasks {
+                let plan = plan.clone();
+                let client = client.clone();
+                let stop = stop.clone();
+                let live = live.clone();
+                handles.push(tokio::task::spawn_local(async move {
+                    worker_saturate::<T>(plan, client, stop, num_scenarios, live).await
+                }));
+            }
+
+            let mut out = Vec::with_capacity(max_tasks);
+            for h in handles {
+                match h.await {
+                    Ok(stats) => out.push(stats),
+                    Err(_panic) => {
+                        out.push(TaskStats::new(num_scenarios));
+                    }
+                }
+            }
+            out
+        }).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,21 +215,88 @@ pub fn run_saturate_threaded<T: Transport>(
 where
     T::Client: Send + 'static,
 {
+    #[cfg(feature = "runtime-compio")]
+    {
+        if num_threads <= 1 {
+            return compio::runtime::Runtime::new()
+                .expect("compio runtime")
+                .block_on(async {
+                    let client = T::build_client(&target, &opts)
+                        .await
+                        .expect("build_client");
+                    run_saturate::<T>(&plan, client, total_connections, stop, live).await
+                });
+        }
+
+        let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_thread_id| {
+                let plan = plan.clone();
+                let target = target.clone();
+                let opts = opts.clone();
+                let stop = stop.clone();
+                let live = live.clone();
+
+                std::thread::spawn(move || {
+                    compio::runtime::Runtime::new()
+                        .expect("compio runtime")
+                        .block_on(async {
+                            let client = T::build_client(&target, &opts)
+                                .await
+                                .expect("build_client");
+                            run_saturate::<T>(&plan, client, conns_per_thread, stop, live).await
+                        })
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker thread panicked"))
+            .collect()
+    }
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    {
+        run_saturate_threaded_tokio::<T>(plan, target, opts, num_threads, total_connections, stop, live)
+    }
+}
+
+/// Tokio threaded dispatcher. Spawns N OS threads, each with its own
+/// `current_thread` tokio runtime (mirroring the compio model). This
+/// avoids the `Send` requirement on Transport futures while still giving
+/// each thread its own connection pool and reactor.
+#[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+fn run_saturate_threaded_tokio<T: Transport>(
+    plan: Arc<Plan>,
+    target: Arc<crate::transport::Target>,
+    opts: Arc<crate::transport::TransportOpts>,
+    num_threads: usize,
+    total_connections: usize,
+    stop: StopSignal,
+    live: Option<Arc<LiveSnapshot>>,
+) -> Vec<TaskStats>
+where
+    T::Client: Send + 'static,
+{
     if num_threads <= 1 {
-        return compio::runtime::Runtime::new()
-            .expect("compio runtime")
-            .block_on(async {
-                let client = T::build_client(&target, &opts)
-                    .await
-                    .expect("build_client");
-                run_saturate::<T>(&plan, client, total_connections, stop, live).await
-            });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        return rt.block_on(async {
+            let client = T::build_client(&target, &opts)
+                .await
+                .expect("build_client");
+            run_saturate::<T>(&plan, client, total_connections, stop, live).await
+        });
     }
 
     let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
 
     let handles: Vec<_> = (0..num_threads)
-        .map(|_thread_id| {
+        .map(|_| {
             let plan = plan.clone();
             let target = target.clone();
             let opts = opts.clone();
@@ -204,15 +304,16 @@ where
             let live = live.clone();
 
             std::thread::spawn(move || {
-                // TODO: CPU pinning (requires unsafe, denied by workspace lint).
-                compio::runtime::Runtime::new()
-                    .expect("compio runtime")
-                    .block_on(async {
-                        let client = T::build_client(&target, &opts)
-                            .await
-                            .expect("build_client");
-                        run_saturate::<T>(&plan, client, conns_per_thread, stop, live).await
-                    })
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(async {
+                    let client = T::build_client(&target, &opts)
+                        .await
+                        .expect("build_client");
+                    run_saturate::<T>(&plan, client, conns_per_thread, stop, live).await
+                })
             })
         })
         .collect();
@@ -310,7 +411,7 @@ pub(crate) async fn execute_steps<T: Transport>(
                     }
                 }
             }
-            Step::Pause(d) => compio::time::sleep(*d).await,
+            Step::Pause(d) => runtime_sleep(*d).await,
             Step::PauseRandom { min, max } => {
                 let d = if min == max {
                     *min
@@ -320,7 +421,7 @@ pub(crate) async fn execute_steps<T: Transport>(
                     let pick = ctx.rng.gen_range(lo..=hi);
                     std::time::Duration::from_nanos(pick)
                 };
-                compio::time::sleep(d).await;
+                runtime_sleep(d).await;
             }
         }
     }

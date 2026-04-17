@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! Smoke test for [`zerobench_http::Http1Pool`] against an in-process
 //! hyper server.
 //!

@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! Integration tests for [`zerobench_http::CountingStream`] over real
 //! sockets, plus targeted mock-based tests that exercise code paths
 //! real loopback can't reliably reproduce (partial writes, IO errors).

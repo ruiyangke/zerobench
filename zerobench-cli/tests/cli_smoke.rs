@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! End-to-end smoke tests for the `zerobench` CLI binary.
 //!
 //! Each test:

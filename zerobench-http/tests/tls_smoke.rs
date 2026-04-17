@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime-compio")]
 //! End-to-end TLS smoke tests for the HTTP transport.
 //!
 //! Spins up a local HTTPS server with a rcgen-generated self-signed

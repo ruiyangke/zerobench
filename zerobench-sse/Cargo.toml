@@ -9,8 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-zerobench-core = { workspace = true }
-zerobench-http = { workspace = true }
+zerobench-core = { workspace = true, features = ["runtime-compio"] }
+zerobench-http = { workspace = true, features = ["runtime-compio", "h1"] }
 compio = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }

@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-zerobench-core = { workspace = true }
+zerobench-core = { workspace = true, features = ["runtime-compio"] }
 rhai = { workspace = true }
 thiserror = { workspace = true }
 http = { workspace = true }

@@ -13,7 +13,7 @@ name = "zerobench"
 path = "src/main.rs"
 
 [features]
-default = ["h1", "sse", "ws"]
+default = ["h1", "sse", "ws", "runtime-compio"]
 # Protocol features — flow through to zerobench-http
 h1 = []
 h2 = ["zerobench-http/h2"]
@@ -24,12 +24,15 @@ sse = ["dep:zerobench-sse"]
 # Front-ends
 tui = ["dep:zerobench-tui"]
 script = ["dep:zerobench-rhai"]
+# Runtime backends
+runtime-compio = ["dep:compio", "zerobench-core/runtime-compio", "zerobench-http/runtime-compio"]
+runtime-tokio = ["dep:tokio", "zerobench-core/runtime-tokio", "zerobench-http/runtime-tokio"]
 # Everything
 all = ["h2", "h3", "ws", "sse", "tui", "script"]
 
 [dependencies]
-zerobench-core = { workspace = true }
-zerobench-http = { workspace = true }
+zerobench-core = { workspace = true, default-features = false }
+zerobench-http = { workspace = true, default-features = false, features = ["h1"] }
 zerobench-ws = { workspace = true, optional = true }
 zerobench-sse = { workspace = true, optional = true }
 zerobench-rhai = { workspace = true, optional = true }
@@ -38,17 +41,22 @@ zerobench-tui = { workspace = true, optional = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 mimalloc = { workspace = true }
-compio = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 yansi = { workspace = true }
 
+# Runtime — compio (default)
+compio = { workspace = true, optional = true }
+# Runtime — tokio (opt-in)
+tokio = { workspace = true, optional = true }
+
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+compio = { workspace = true }
 cyper-core = { workspace = true }
 futures-util = { workspace = true }
 httparse = { workspace = true }

@@ -8,8 +8,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = ["runtime-compio"]
+runtime-compio = ["dep:compio"]
+runtime-tokio = ["dep:tokio"]
+
 [dependencies]
-compio = { workspace = true }
+# Runtime — compio (default)
+compio = { workspace = true, optional = true }
+
+# Runtime — tokio (opt-in)
+tokio = { workspace = true, optional = true }
+
 futures-util = { workspace = true }
 flume = { workspace = true }
 bytes = { workspace = true }
