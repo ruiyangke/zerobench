@@ -14,7 +14,7 @@ use zerobench_core::{
 
 #[test]
 fn live_snapshot_record_and_swap_counts_samples() {
-    let live = LiveSnapshot::new();
+    let live = LiveSnapshot::new(0);
     live.record(100_000, 5, 10);
     live.record(200_000, 7, 14);
     live.record_error(ErrorKind::Connect);
@@ -38,7 +38,7 @@ fn live_snapshot_record_and_swap_counts_samples() {
 
 #[test]
 fn jsonl_tick_is_valid_single_line_json() {
-    let live = LiveSnapshot::new();
+    let live = LiveSnapshot::new(0);
     // Seed some samples across a few orders of magnitude so percentiles
     // are meaningful.
     for _ in 0..50 {

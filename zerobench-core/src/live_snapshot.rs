@@ -121,12 +121,35 @@ pub struct LiveSnapshot {
     /// Latency samples for this bucket. Mutex is acquired on every
     /// sample; see the module-level doc for why that's OK.
     latency_bucket: Mutex<Histogram<u64>>,
+    /// Per-scenario live counters. Initialized with `num_scenarios` slots.
+    /// Index = scenario_id. Each slot tracks its own requests + errors
+    /// + latency histogram (behind a Mutex, same pattern as the aggregate).
+    scenario_counters: Vec<ScenarioLiveSlot>,
+}
+
+/// Per-scenario atomic counters — one slot per scenario in the plan.
+struct ScenarioLiveSlot {
+    requests: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_recv: AtomicU64,
+    errors: AtomicLiveErrors,
+    latency: Mutex<Histogram<u64>>,
 }
 
 impl LiveSnapshot {
-    /// Build an empty snapshot anchored at `now`. Wrap in `Arc` and
-    /// share with workers.
-    pub fn new() -> Arc<Self> {
+    /// Build an empty snapshot anchored at `now`. `num_scenarios` sets
+    /// the number of per-scenario counter slots; pass `plan.scenarios.len()`.
+    /// Wrap in `Arc` and share with workers.
+    pub fn new(num_scenarios: usize) -> Arc<Self> {
+        let scenario_counters = (0..num_scenarios)
+            .map(|_| ScenarioLiveSlot {
+                requests: AtomicU64::new(0),
+                bytes_sent: AtomicU64::new(0),
+                bytes_recv: AtomicU64::new(0),
+                errors: AtomicLiveErrors::default(),
+                latency: Mutex::new(new_hist()),
+            })
+            .collect();
         Arc::new(Self {
             start: Instant::now(),
             requests: AtomicU64::new(0),
@@ -134,6 +157,7 @@ impl LiveSnapshot {
             bytes_recv: AtomicU64::new(0),
             errors: AtomicLiveErrors::default(),
             latency_bucket: Mutex::new(new_hist()),
+            scenario_counters,
         })
     }
 
@@ -156,6 +180,33 @@ impl LiveSnapshot {
         self.errors.incr(kind);
     }
 
+    /// Record a completed sample for a specific scenario. Call alongside
+    /// [`Self::record`] — this feeds the per-scenario breakdown the TUI
+    /// scenarios table shows.
+    pub fn record_scenario(
+        &self,
+        scenario_id: u16,
+        latency_ns: u64,
+        bytes_sent: u64,
+        bytes_recv: u64,
+    ) {
+        if let Some(slot) = self.scenario_counters.get(scenario_id as usize) {
+            slot.requests.fetch_add(1, Ordering::Relaxed);
+            slot.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
+            slot.bytes_recv.fetch_add(bytes_recv, Ordering::Relaxed);
+            let ns = clamp_ns(latency_ns);
+            let mut h = slot.latency.lock();
+            let _ = h.record(ns);
+        }
+    }
+
+    /// Increment the per-scenario error counter for `kind`.
+    pub fn record_scenario_error(&self, scenario_id: u16, kind: ErrorKind) {
+        if let Some(slot) = self.scenario_counters.get(scenario_id as usize) {
+            slot.errors.incr(kind);
+        }
+    }
+
     /// Swap in an empty histogram + reset the counters, returning the
     /// prior bucket as a [`LiveTick`]. Call once per second from a
     /// dedicated ticker task.
@@ -170,6 +221,20 @@ impl LiveSnapshot {
             let fresh = new_hist();
             std::mem::replace(&mut *bucket, fresh)
         };
+        let per_scenario: Vec<ScenarioTick> = self
+            .scenario_counters
+            .iter()
+            .map(|slot| ScenarioTick {
+                requests: slot.requests.swap(0, Ordering::Relaxed),
+                bytes_sent: slot.bytes_sent.swap(0, Ordering::Relaxed),
+                bytes_recv: slot.bytes_recv.swap(0, Ordering::Relaxed),
+                errors: slot.errors.swap_all(),
+                latency: {
+                    let mut h = slot.latency.lock();
+                    std::mem::replace(&mut *h, new_hist())
+                },
+            })
+            .collect();
         LiveTick {
             elapsed,
             requests,
@@ -177,6 +242,7 @@ impl LiveSnapshot {
             bytes_recv,
             errors,
             latency,
+            per_scenario,
         }
     }
 
@@ -207,6 +273,19 @@ pub struct LiveTick {
     pub errors: ErrorCounters,
     /// Latency samples captured this window. Feeds the percentile
     /// fields on the JSONL line.
+    pub latency: Histogram<u64>,
+    /// Per-scenario breakdown for this window. Index = scenario_id.
+    /// Empty when the snapshot was created with `num_scenarios == 0`.
+    pub per_scenario: Vec<ScenarioTick>,
+}
+
+/// Per-scenario counters for one tick window.
+#[derive(Debug)]
+pub struct ScenarioTick {
+    pub requests: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub errors: ErrorCounters,
     pub latency: Histogram<u64>,
 }
 
@@ -242,7 +321,7 @@ mod tests {
 
     #[test]
     fn record_then_swap_returns_counts() {
-        let live = LiveSnapshot::new();
+        let live = LiveSnapshot::new(0);
         live.record(100_000, 10, 20);
         live.record(200_000, 11, 21);
         live.record(300_000, 12, 22);
@@ -251,11 +330,12 @@ mod tests {
         assert_eq!(tick.bytes_sent, 33);
         assert_eq!(tick.bytes_recv, 63);
         assert_eq!(tick.latency.len(), 3);
+        assert!(tick.per_scenario.is_empty());
     }
 
     #[test]
     fn swap_resets_counters() {
-        let live = LiveSnapshot::new();
+        let live = LiveSnapshot::new(0);
         live.record(100_000, 1, 2);
         let _ = live.swap_and_snapshot();
         let t2 = live.swap_and_snapshot();
@@ -266,7 +346,7 @@ mod tests {
 
     #[test]
     fn record_error_categorises_correctly() {
-        let live = LiveSnapshot::new();
+        let live = LiveSnapshot::new(0);
         live.record_error(ErrorKind::Connect);
         live.record_error(ErrorKind::Status5xx);
         live.record_error(ErrorKind::Status5xx);
@@ -281,5 +361,45 @@ mod tests {
         assert_eq!(clamp_ns(0), HIST_LO_NS);
         assert_eq!(clamp_ns(500), 500);
         assert_eq!(clamp_ns(u64::MAX), HIST_HI_NS);
+    }
+
+    #[test]
+    fn per_scenario_record_and_swap() {
+        let live = LiveSnapshot::new(2);
+
+        // Scenario 0: 2 requests.
+        live.record_scenario(0, 100_000, 10, 20);
+        live.record_scenario(0, 200_000, 11, 21);
+        // Scenario 1: 1 request.
+        live.record_scenario(1, 300_000, 5, 8);
+        // Scenario 1 error.
+        live.record_scenario_error(1, ErrorKind::Status4xx);
+
+        // Out-of-range scenario_id silently ignored.
+        live.record_scenario(99, 100_000, 1, 1);
+        live.record_scenario_error(99, ErrorKind::Connect);
+
+        let tick = live.swap_and_snapshot();
+        assert_eq!(tick.per_scenario.len(), 2);
+
+        let s0 = &tick.per_scenario[0];
+        assert_eq!(s0.requests, 2);
+        assert_eq!(s0.bytes_sent, 21);
+        assert_eq!(s0.bytes_recv, 41);
+        assert_eq!(s0.latency.len(), 2);
+        assert_eq!(s0.errors.total(), 0);
+
+        let s1 = &tick.per_scenario[1];
+        assert_eq!(s1.requests, 1);
+        assert_eq!(s1.bytes_sent, 5);
+        assert_eq!(s1.bytes_recv, 8);
+        assert_eq!(s1.latency.len(), 1);
+        assert_eq!(s1.errors.status_4xx, 1);
+
+        // After swap, scenario counters are reset.
+        let t2 = live.swap_and_snapshot();
+        assert_eq!(t2.per_scenario[0].requests, 0);
+        assert_eq!(t2.per_scenario[1].requests, 0);
+        assert!(t2.per_scenario[0].latency.is_empty());
     }
 }

@@ -126,7 +126,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // already returns an `Arc`, so we keep it as is rather than
     // double-wrapping.
     let live = if matches!(args.format, CliFormat::Jsonl) || tui_enabled {
-        Some(zerobench_core::LiveSnapshot::new())
+        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
     } else {
         None
     };
@@ -165,6 +165,8 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         let total_duration = plan.duration;
         let url_label = format_url_label(&target);
         let transport_info = build_transport_info(&args, &target, &opts);
+        let scenario_names: Vec<String> =
+            plan.scenarios.iter().map(|s| s.name.clone()).collect();
         let stop_for_tui = stop.clone();
         let handle = compio::runtime::spawn(async move {
             zerobench_tui::run_tui(
@@ -174,6 +176,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 total_duration,
                 url_label,
                 transport_info,
+                scenario_names,
             )
             .await
         });

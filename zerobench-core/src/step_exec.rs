@@ -48,11 +48,13 @@ pub(crate) fn process_response(
         stats.record_error(scenario_id, ErrorKind::Status4xx);
         if let Some(l) = live {
             l.record_error(ErrorKind::Status4xx);
+            l.record_scenario_error(scenario_id, ErrorKind::Status4xx);
         }
     } else if (500..600).contains(&status) {
         stats.record_error(scenario_id, ErrorKind::Status5xx);
         if let Some(l) = live {
             l.record_error(ErrorKind::Status5xx);
+            l.record_scenario_error(scenario_id, ErrorKind::Status5xx);
         }
     }
 
@@ -64,12 +66,10 @@ pub(crate) fn process_response(
         resp.bytes_sent,
         resp.bytes_received,
     );
+    let latency_ns = resp.total.as_nanos().min(u128::from(u64::MAX)) as u64;
     if let Some(l) = live {
-        l.record(
-            resp.total.as_nanos().min(u128::from(u64::MAX)) as u64,
-            resp.bytes_sent,
-            resp.bytes_received,
-        );
+        l.record(latency_ns, resp.bytes_sent, resp.bytes_received);
+        l.record_scenario(scenario_id, latency_ns, resp.bytes_sent, resp.bytes_received);
     }
 
     // Apply extracts.
@@ -84,6 +84,7 @@ pub(crate) fn process_response(
             stats.record_error(scenario_id, ErrorKind::AssertionFailed);
             if let Some(l) = live {
                 l.record_error(ErrorKind::AssertionFailed);
+                l.record_scenario_error(scenario_id, ErrorKind::AssertionFailed);
             }
         }
     }
@@ -93,8 +94,13 @@ pub(crate) fn process_response(
 /// addition to the usual task-stats record. Caller is responsible for
 /// having already classified the error via [`classify_transport_error`]
 /// and passed the category to `TaskStats::record_error`.
-pub(crate) fn record_transport_error_live(live: &Arc<LiveSnapshot>, kind: ErrorKind) {
+pub(crate) fn record_transport_error_live(
+    live: &Arc<LiveSnapshot>,
+    scenario_id: u16,
+    kind: ErrorKind,
+) {
     live.record_error(kind);
+    live.record_scenario_error(scenario_id, kind);
 }
 
 /// Write an [`Extract`]'s result into the scenario context.

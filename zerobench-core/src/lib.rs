@@ -19,7 +19,7 @@ pub mod transport;
 pub mod var;
 
 pub use dispatcher::run_saturate;
-pub use live_snapshot::{LiveSnapshot, LiveTick};
+pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use plan::{
     Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, Step,
 };

@@ -37,6 +37,7 @@ fn tick(elapsed_s: u64, requests: u64, latency_ns: u64) -> LiveTick {
         bytes_recv: 0,
         errors: ErrorCounters::default(),
         latency: h,
+        per_scenario: Vec::new(),
     }
 }
 
@@ -80,6 +81,7 @@ fn fresh_state(target_rate: Option<f64>, dur_s: u64) -> DashboardState {
         Duration::from_secs(dur_s),
         "http://api".into(),
         fixture_transport(),
+        vec![],
     )
 }
 
@@ -366,6 +368,7 @@ fn tickrecord_caches_p50_p90_p99_p99_9() {
         bytes_recv: 0,
         errors: ErrorCounters::default(),
         latency: h,
+        per_scenario: Vec::new(),
     };
 
     let mut s = fresh_state(None, 30);

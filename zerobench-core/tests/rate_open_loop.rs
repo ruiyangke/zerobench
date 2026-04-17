@@ -269,7 +269,7 @@ async fn open_loop_keepup_is_forwarded_to_live_snapshot() {
     let client = FakeClient::new();
     client.service_time_us.store(200, Ordering::Relaxed);
     let stop = StopSignal::after(plan.duration);
-    let live = zerobench_core::LiveSnapshot::new();
+    let live = zerobench_core::LiveSnapshot::new(plan.scenarios.len());
 
     let stats = zerobench_core::run_open_loop::<FakeTransport>(
         &plan,

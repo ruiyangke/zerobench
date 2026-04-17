@@ -82,6 +82,7 @@ pub async fn run_tui(
     total_duration: Duration,
     url_label: String,
     transport: TransportInfo,
+    scenario_names: Vec<String>,
 ) -> io::Result<()> {
     // `ratatui::try_init` installs its own panic hook that invokes
     // `restore()` before the previous hook runs, so a mid-run panic
@@ -93,6 +94,7 @@ pub async fn run_tui(
         total_duration,
         url_label,
         transport,
+        scenario_names,
     )
     .await;
 
@@ -110,10 +112,11 @@ async fn run_tui_inner(
     total_duration: Duration,
     url_label: String,
     transport: TransportInfo,
+    scenario_names: Vec<String>,
 ) -> io::Result<()> {
     let mut terminal: DefaultTerminal = ratatui::try_init()?;
     let mut state =
-        DashboardState::new(target_rate, total_duration, url_label, transport);
+        DashboardState::new(target_rate, total_duration, url_label, transport, scenario_names);
 
     // `next_snapshot_at` tracks the wall-clock instant at which we'll
     // swap the LiveSnapshot bucket. Using a clock-anchored deadline
@@ -329,7 +332,7 @@ mod tests {
     }
 
     fn state() -> DashboardState {
-        DashboardState::new(None, Duration::from_secs(10), "x".into(), ti())
+        DashboardState::new(None, Duration::from_secs(10), "x".into(), ti(), vec![])
     }
 
     #[test]

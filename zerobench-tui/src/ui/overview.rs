@@ -362,13 +362,38 @@ fn render_scenarios_table(frame: &mut Frame, area: Rect, state: &DashboardState)
         .style(Style::new().add_modifier(Modifier::BOLD))
         .bottom_margin(0);
 
-    let rows = vec![Row::new(vec![
-        Cell::from("1"),
-        Cell::from("default"),
-        Cell::from(format_rate(state.requests_per_sec())),
-        Cell::from(format_ns(state.rolling_p99_9_ns())),
-        Cell::from(format!("{}", state.total_errors.total())),
-    ])];
+    let rows: Vec<Row> = if state.scenario_names.is_empty() {
+        // Fallback: no named scenarios — show single aggregate row.
+        vec![Row::new(vec![
+            Cell::from("1"),
+            Cell::from("default"),
+            Cell::from(format_rate(state.requests_per_sec())),
+            Cell::from(format_ns(state.rolling_p99_9_ns())),
+            Cell::from(format!("{}", state.total_errors.total())),
+        ])]
+    } else {
+        state
+            .scenario_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let rps = state.scenario_rps(i);
+                let p99 = state.scenario_p99_ns(i);
+                let errs = state
+                    .scenario_total_errors
+                    .get(i)
+                    .map(|e| e.total())
+                    .unwrap_or(0);
+                Row::new(vec![
+                    Cell::from(format!("{}", i + 1)),
+                    Cell::from(name.as_str()),
+                    Cell::from(format_rate(rps)),
+                    Cell::from(format_ns(p99)),
+                    Cell::from(format!("{errs}")),
+                ])
+            })
+            .collect()
+    };
 
     let widths = [
         Constraint::Length(3),

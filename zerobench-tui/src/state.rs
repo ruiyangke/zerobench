@@ -233,6 +233,21 @@ pub struct TickRecord {
     /// compare two same-shaped rolling windows (baseline vs current)
     /// without recomputing the baseline on every frame.
     pub rolling_p99_9_ns: u64,
+    /// Per-scenario breakdown for this window. Index = scenario_id.
+    pub per_scenario: Vec<ScenarioTickRecord>,
+}
+
+/// Per-scenario counters for one tick window — the TUI-facing
+/// projection of [`ScenarioTick`]. Percentiles are pre-computed to
+/// avoid histogram queries on the render path.
+#[derive(Debug, Clone)]
+pub struct ScenarioTickRecord {
+    pub requests: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub p50_ns: u64,
+    pub p99_ns: u64,
+    pub errors: ErrorCounters,
 }
 
 impl TickRecord {
@@ -247,6 +262,28 @@ impl TickRecord {
                 tick.latency.value_at_percentile(99.9),
             )
         };
+        let per_scenario = tick
+            .per_scenario
+            .iter()
+            .map(|s| {
+                let (p50, p99) = if s.latency.is_empty() {
+                    (0, 0)
+                } else {
+                    (
+                        s.latency.value_at_percentile(50.0),
+                        s.latency.value_at_percentile(99.0),
+                    )
+                };
+                ScenarioTickRecord {
+                    requests: s.requests,
+                    bytes_sent: s.bytes_sent,
+                    bytes_recv: s.bytes_recv,
+                    p50_ns: p50,
+                    p99_ns: p99,
+                    errors: s.errors.clone(),
+                }
+            })
+            .collect();
         Self {
             elapsed: tick.elapsed,
             requests: tick.requests,
@@ -261,6 +298,7 @@ impl TickRecord {
             // Set by `DashboardState::ingest` once the tick has been
             // pushed and the rolling window can be merged.
             rolling_p99_9_ns: 0,
+            per_scenario,
         }
     }
 }
@@ -352,6 +390,13 @@ pub struct DashboardState {
     pub auto_export: bool,
     /// User-provided output directory/file for exports.
     pub export_path: Option<std::path::PathBuf>,
+
+    /// Scenario names — set once from the Plan at TUI startup.
+    pub scenario_names: Vec<String>,
+    /// Per-scenario cumulative request counts.
+    pub scenario_total_requests: Vec<u64>,
+    /// Per-scenario cumulative errors.
+    pub scenario_total_errors: Vec<ErrorCounters>,
 }
 
 impl DashboardState {
@@ -361,7 +406,9 @@ impl DashboardState {
         total_duration: Duration,
         url_label: String,
         transport: TransportInfo,
+        scenario_names: Vec<String>,
     ) -> Self {
+        let n = scenario_names.len();
         Self {
             started_at: Instant::now(),
             target_rate,
@@ -390,6 +437,9 @@ impl DashboardState {
             last_save_at: None,
             auto_export: true,
             export_path: None,
+            scenario_names,
+            scenario_total_requests: vec![0u64; n],
+            scenario_total_errors: (0..n).map(|_| ErrorCounters::default()).collect(),
         }
     }
 
@@ -425,6 +475,13 @@ impl DashboardState {
         }
 
         let rec = TickRecord::from_live(tick);
+        // Accumulate per-scenario totals.
+        for (i, st) in rec.per_scenario.iter().enumerate() {
+            if i < self.scenario_total_requests.len() {
+                self.scenario_total_requests[i] += st.requests;
+                self.scenario_total_errors[i].merge(&st.errors);
+            }
+        }
         self.ticks.push_back(rec);
         while self.ticks.len() > MAX_TICKS {
             self.ticks.pop_front();
@@ -609,6 +666,24 @@ impl DashboardState {
             .unwrap_or((0, 0))
     }
 
+    /// Per-scenario rps from the most recent tick.
+    pub fn scenario_rps(&self, idx: usize) -> f64 {
+        self.ticks
+            .back()
+            .and_then(|t| t.per_scenario.get(idx))
+            .map(|s| s.requests as f64)
+            .unwrap_or(0.0)
+    }
+
+    /// Per-scenario p99 from the most recent tick (nanoseconds).
+    pub fn scenario_p99_ns(&self, idx: usize) -> u64 {
+        self.ticks
+            .back()
+            .and_then(|t| t.per_scenario.get(idx))
+            .map(|s| s.p99_ns)
+            .unwrap_or(0)
+    }
+
     /// Append a log entry to the ring, evicting the oldest when full.
     pub fn push_log(&mut self, entry: LogEntry) {
         self.log_entries.push_back(entry);
@@ -675,6 +750,7 @@ mod tests {
             bytes_recv: 0,
             errors,
             latency: lat,
+            per_scenario: Vec::new(),
         }
     }
 
@@ -685,6 +761,7 @@ mod tests {
             Duration::from_secs(30),
             "x".into(),
             fixture_transport(),
+            vec![],
         );
         assert!(s.ticks.is_empty());
         assert_eq!(s.total_requests, 0);
@@ -703,6 +780,7 @@ mod tests {
             Duration::from_secs(30),
             "x".into(),
             fixture_transport(),
+            vec![],
         );
         s.ingest(make_tick(1, 100, &[1_000, 2_000], ErrorCounters::default()));
         s.ingest(make_tick(2, 200, &[1_500, 2_500], ErrorCounters::default()));
@@ -720,6 +798,7 @@ mod tests {
             Duration::from_millis(1),
             "x".into(),
             fixture_transport(),
+            vec![],
         );
         std::thread::sleep(Duration::from_millis(5));
         assert!((s.progress() - 1.0).abs() < 1e-9);
@@ -750,6 +829,7 @@ mod tests {
             Duration::from_secs(30),
             "x".into(),
             fixture_transport(),
+            vec![],
         );
         s.ingest(make_tick(1, 100, &[1_000], ErrorCounters::default()));
         s.ingest(make_tick(2, 500, &[1_000], ErrorCounters::default()));
@@ -759,5 +839,84 @@ mod tests {
         s.reset_peaks();
         assert_eq!(s.peak_rps, 0.0);
         assert!(s.min_rps.is_none());
+    }
+
+    #[test]
+    fn per_scenario_accumulates_across_ticks() {
+        use zerobench_core::live_snapshot::ScenarioTick;
+
+        fn make_scenario_tick(
+            elapsed_s: u64,
+            requests: u64,
+            per_scenario: Vec<ScenarioTick>,
+        ) -> LiveTick {
+            let mut lat = new_hist();
+            for _ in 0..requests {
+                let _ = lat.record(1_000);
+            }
+            LiveTick {
+                elapsed: Duration::from_secs(elapsed_s),
+                requests,
+                bytes_sent: 0,
+                bytes_recv: 0,
+                errors: ErrorCounters::default(),
+                latency: lat,
+                per_scenario,
+            }
+        }
+
+        fn scenario_tick(requests: u64, lat_ns: u64, errors: ErrorCounters) -> ScenarioTick {
+            let mut lat = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+            for _ in 0..requests {
+                let _ = lat.record(lat_ns);
+            }
+            ScenarioTick {
+                requests,
+                bytes_sent: requests * 10,
+                bytes_recv: requests * 20,
+                errors,
+                latency: lat,
+            }
+        }
+
+        let mut s = DashboardState::new(
+            None,
+            Duration::from_secs(30),
+            "x".into(),
+            fixture_transport(),
+            vec!["login".into(), "browse".into()],
+        );
+
+        // Tick 1: scenario 0 has 100 reqs, scenario 1 has 50.
+        s.ingest(make_scenario_tick(
+            1,
+            150,
+            vec![
+                scenario_tick(100, 1_000, ErrorCounters::default()),
+                scenario_tick(50, 2_000, ErrorCounters::default()),
+            ],
+        ));
+        assert_eq!(s.scenario_total_requests[0], 100);
+        assert_eq!(s.scenario_total_requests[1], 50);
+        assert_eq!(s.scenario_rps(0), 100.0);
+        assert_eq!(s.scenario_rps(1), 50.0);
+
+        // Tick 2: scenario 0 has 200, scenario 1 has 80 + 1 error.
+        let mut errs = ErrorCounters::default();
+        errs.status_4xx = 1;
+        s.ingest(make_scenario_tick(
+            2,
+            280,
+            vec![
+                scenario_tick(200, 1_500, ErrorCounters::default()),
+                scenario_tick(80, 2_500, errs),
+            ],
+        ));
+        assert_eq!(s.scenario_total_requests[0], 300);
+        assert_eq!(s.scenario_total_requests[1], 130);
+        assert_eq!(s.scenario_total_errors[1].status_4xx, 1);
+        assert_eq!(s.scenario_rps(0), 200.0);
+        assert_eq!(s.scenario_rps(1), 80.0);
+        assert!(s.scenario_p99_ns(0) > 0);
     }
 }

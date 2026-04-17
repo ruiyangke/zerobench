@@ -136,10 +136,15 @@ pub async fn run_scheduler(
 /// Bump the keepup counter and, if a `LiveSnapshot` is attached, record
 /// a per-window `ErrorKind::Keepup` so the next JSONL tick reflects the
 /// drop. Called from every scheduler on `TrySendError::Full`.
-fn record_keepup_drop(keepup: &KeepupCounter, live: Option<&Arc<LiveSnapshot>>) {
+fn record_keepup_drop(
+    scenario_id: u16,
+    keepup: &KeepupCounter,
+    live: Option<&Arc<LiveSnapshot>>,
+) {
     keepup.inc();
     if let Some(l) = live {
         l.record_error(ErrorKind::Keepup);
+        l.record_scenario_error(scenario_id, ErrorKind::Keepup);
     }
 }
 
@@ -170,7 +175,7 @@ async fn run_constant(
         }) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => {
-                record_keepup_drop(&keepup, live.as_ref());
+                record_keepup_drop(scenario_id, &keepup, live.as_ref());
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 break;
@@ -213,7 +218,7 @@ async fn run_ramp(
         }) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => {
-                record_keepup_drop(&keepup, live.as_ref());
+                record_keepup_drop(scenario_id, &keepup, live.as_ref());
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 break;
@@ -327,7 +332,7 @@ async fn run_stepped(
         }) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => {
-                record_keepup_drop(&keepup, live.as_ref());
+                record_keepup_drop(scenario_id, &keepup, live.as_ref());
             }
             Err(flume::TrySendError::Disconnected(_)) => break,
         }
@@ -548,7 +553,7 @@ async fn execute_steps_open_loop<T: Transport>(
                     let kind = classify_transport_error(&e);
                     stats.record_error(scenario_id, kind);
                     if let Some(l) = live {
-                        record_transport_error_live(l, kind);
+                        record_transport_error_live(l, scenario_id, kind);
                     }
                     break;
                 }

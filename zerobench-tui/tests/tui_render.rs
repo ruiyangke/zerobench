@@ -41,6 +41,7 @@ fn tick(elapsed_s: u64, requests: u64, latency_ns: u64) -> LiveTick {
         bytes_recv: 0,
         errors: ErrorCounters::default(),
         latency: h,
+        per_scenario: Vec::new(),
     }
 }
 
@@ -73,6 +74,7 @@ fn fresh_state(target_rate: Option<f64>) -> DashboardState {
         Duration::from_secs(30),
         "http://api.example.com".into(),
         fixture_transport(),
+        vec![],
     )
 }
 

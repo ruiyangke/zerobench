@@ -82,6 +82,24 @@ fn build_json(state: &DashboardState) -> serde_json::Value {
 
     // Per-tick time series for offline charting.
     let ticks: Vec<serde_json::Value> = state.ticks.iter().map(|t| {
+        let per_scenario: Vec<serde_json::Value> = t.per_scenario.iter().enumerate().map(|(i, s)| {
+            json!({
+                "scenario_id": i,
+                "requests": s.requests,
+                "p50_ns": s.p50_ns,
+                "p99_ns": s.p99_ns,
+                "errors": {
+                    "connect": s.errors.connect,
+                    "read": s.errors.read,
+                    "write": s.errors.write,
+                    "timeout": s.errors.timeout,
+                    "keepup": s.errors.keepup,
+                    "status_4xx": s.errors.status_4xx,
+                    "status_5xx": s.errors.status_5xx,
+                    "assertion_failed": s.errors.assertion_failed,
+                }
+            })
+        }).collect();
         json!({
             "elapsed_s": t.elapsed.as_secs_f64(),
             "requests": t.requests,
@@ -100,7 +118,27 @@ fn build_json(state: &DashboardState) -> serde_json::Value {
                 "status_4xx": t.errors.status_4xx,
                 "status_5xx": t.errors.status_5xx,
                 "assertion_failed": t.errors.assertion_failed,
-            }
+            },
+            "per_scenario": per_scenario,
+        })
+    }).collect();
+
+    // Per-scenario cumulative summary.
+    let scenarios: Vec<serde_json::Value> = state.scenario_names.iter().enumerate().map(|(i, name)| {
+        let errs = state.scenario_total_errors.get(i);
+        json!({
+            "name": name,
+            "requests": state.scenario_total_requests.get(i).copied().unwrap_or(0),
+            "errors": errs.map(|e| json!({
+                "connect": e.connect,
+                "read": e.read,
+                "write": e.write,
+                "timeout": e.timeout,
+                "keepup": e.keepup,
+                "status_4xx": e.status_4xx,
+                "status_5xx": e.status_5xx,
+                "assertion_failed": e.assertion_failed,
+            })),
         })
     }).collect();
 
@@ -139,6 +177,7 @@ fn build_json(state: &DashboardState) -> serde_json::Value {
             }
         },
 
+        "scenarios": scenarios,
         "ticks": ticks,
     })
 }

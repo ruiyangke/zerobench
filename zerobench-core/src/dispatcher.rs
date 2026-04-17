@@ -227,7 +227,7 @@ pub(crate) async fn execute_steps<T: Transport>(
                         let kind = classify_transport_error(&e);
                         stats.record_error(scenario_id, kind);
                         if let Some(l) = live {
-                            record_transport_error_live(l, kind);
+                            record_transport_error_live(l, scenario_id, kind);
                         }
                         // If every slot in the pool is dead (e.g. H1-only
                         // client against an H2-only server), `T::exchange`
