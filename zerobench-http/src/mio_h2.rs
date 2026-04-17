@@ -39,7 +39,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -112,25 +112,32 @@ impl tokio::io::AsyncWrite for MioAsyncAdapter {
 // No-op waker — mio events drive our polling, not waker notifications
 // ---------------------------------------------------------------------------
 
-/// No-op waker. When h2 internally stores this waker and calls `wake()`, it
-/// does nothing. We re-poll on every mio event anyway.
-///
-/// The h2 crate uses `atomic-waker` internally and will call `wake()` when
-/// new frames arrive or flow-control windows change. Since our mio event
-/// loop already re-polls on every socket readiness event, these waker
-/// notifications are redundant — the socket event and the waker event
-/// coincide.
-struct NoopWaker;
-
-impl Wake for NoopWaker {
-    fn wake(self: Arc<Self>) {}
+/// Waker wired to mio's eventfd. When h2's internal state transitions
+/// call `wake()`, this writes to an eventfd that wakes `poll.poll()` —
+/// so the event loop re-polls immediately instead of waiting for the
+/// next socket event or timeout.
+struct MioWaker {
+    inner: mio::Waker,
 }
 
-/// Thread-local no-op waker. Created once per thread, leaked into a
-/// `'static` reference. Extremely cheap — one `Arc<NoopWaker>` per thread.
-fn noop_waker() -> &'static Waker {
-    static WAKER: OnceLock<Waker> = OnceLock::new();
-    WAKER.get_or_init(|| Waker::from(Arc::new(NoopWaker)))
+impl Wake for MioWaker {
+    fn wake(self: Arc<Self>) {
+        let _ = self.inner.wake();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.inner.wake();
+    }
+}
+
+/// Token for the mio::Waker registration. We ignore events with this
+/// token — they just serve to break poll() out of its timeout.
+const WAKER_TOKEN: Token = Token(usize::MAX);
+
+/// Create a Waker that wakes the given mio::Poll via eventfd.
+fn mio_waker(poll: &mio::Poll) -> Waker {
+    let mio_waker = mio::Waker::new(poll.registry(), WAKER_TOKEN)
+        .expect("mio::Waker::new");
+    Waker::from(Arc::new(MioWaker { inner: mio_waker }))
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +302,8 @@ fn handshake_blocking(
     adapter: MioAsyncAdapter,
     poll: &mut mio::Poll,
     events: &mut Events,
+    waker: &Waker,
 ) -> io::Result<(SendRequest<Bytes>, client::Connection<MioAsyncAdapter, Bytes>)> {
-    let waker = noop_waker();
     let mut cx = Context::from_waker(waker);
     let mut fut = Box::pin(client::handshake(adapter));
 
@@ -351,9 +358,13 @@ pub fn run_mio_h2_worker(
         .register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
         .expect("mio register");
 
+    // Create a mio::Waker so h2's internal wake() calls break us out
+    // of poll.poll() immediately — no waiting for socket events.
+    let waker = mio_waker(&poll);
+
     // H2 handshake (blocks until complete, using mio events).
     let adapter = MioAsyncAdapter { stream };
-    let (send_request, connection) = match handshake_blocking(adapter, &mut poll, &mut events) {
+    let (send_request, connection) = match handshake_blocking(adapter, &mut poll, &mut events, &waker) {
         Ok(pair) => pair,
         Err(_) => {
             stats.record_error(0, ErrorKind::Connect);
@@ -385,8 +396,6 @@ pub fn run_mio_h2_worker(
             }
         }
     }
-
-    let waker = noop_waker();
 
     while !stop.load(Ordering::Relaxed) {
         // --- Open-loop: generate tokens into the pending queue ----------
@@ -432,7 +441,7 @@ pub fn run_mio_h2_worker(
         let batch_now = Instant::now();
 
         // --- Drive H2 connection + check completed streams -------------
-        let mut cx = Context::from_waker(waker);
+        let mut cx = Context::from_waker(&waker);
 
         let alive = h2.poll_progress(&mut cx, batch_now, &mut stats);
         if !alive {
@@ -604,8 +613,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noop_waker_does_not_panic() {
-        let waker = noop_waker();
+    fn mio_waker_does_not_panic() {
+        let poll = mio::Poll::new().unwrap();
+        let waker = mio_waker(&poll);
         waker.wake_by_ref();
         // Just verifying it doesn't crash.
     }
