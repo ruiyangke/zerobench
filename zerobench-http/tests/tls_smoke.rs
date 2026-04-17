@@ -31,7 +31,7 @@ use zerobench_core::rng::from_seed;
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::template::Template;
 use zerobench_core::transport::{
-    HttpVersionPref, ResponseBody, Target, TransportError, TransportOpts,
+    HttpVersionPref, Target, TransportError, TransportOpts,
 };
 use zerobench_core::var::VarRegistry;
 
@@ -202,10 +202,6 @@ async fn h1_with_insecure_verifier_succeeds_over_self_signed_tls() {
 
     let resp = pool.exchange(&plan, &mut ctx).await.expect("exchange");
     assert_eq!(resp.status, 200);
-    match resp.body {
-        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"tls-ok"),
-        _ => panic!("expected buffered body"),
-    }
     // TLS adds overhead vs plain HTTP, but the counter deltas still
     // must be positive.
     assert!(resp.bytes_sent > 0, "bytes_sent should be > 0");
@@ -274,10 +270,6 @@ async fn auto_negotiates_h2_via_alpn_on_https() {
         .await
         .expect("exchange");
     assert_eq!(resp.status, 200);
-    match resp.body {
-        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"via-h2"),
-        _ => panic!("expected buffered body"),
-    }
 }
 
 #[compio::test]
@@ -310,8 +302,4 @@ async fn auto_falls_back_to_h1_when_server_only_offers_h1() {
         .await
         .expect("exchange");
     assert_eq!(resp.status, 200);
-    match resp.body {
-        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"via-h1"),
-        _ => panic!("expected buffered body"),
-    }
 }

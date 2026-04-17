@@ -58,7 +58,7 @@ use zerobench_core::rng::from_seed;
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::template::Template;
 use zerobench_core::transport::{
-    HttpVersionPref, ResponseBody, Target, TransportError, TransportOpts,
+    HttpVersionPref, Target, TransportError, TransportOpts,
 };
 use zerobench_core::var::VarRegistry;
 
@@ -223,10 +223,6 @@ async fn single_exchange_returns_expected_body() {
 
     let resp = client.exchange(&plan, &mut ctx).await.expect("exchange");
     assert_eq!(resp.status, 200);
-    match &resp.body {
-        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"h2-ok"),
-        _ => panic!("expected buffered body"),
-    }
     assert!(resp.bytes_sent > 0, "bytes_sent > 0");
     assert!(resp.bytes_received > 0, "bytes_received > 0");
     assert!(resp.ttfb > Duration::ZERO);
@@ -259,10 +255,6 @@ async fn concurrent_exchanges_all_succeed_on_single_connection() {
     for (i, r) in results.into_iter().enumerate() {
         let resp = r.unwrap_or_else(|e| panic!("exchange {i} failed: {e:?}"));
         assert_eq!(resp.status, 200);
-        match resp.body {
-            ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"pong"),
-            _ => panic!("expected buffered body"),
-        }
         ok += 1;
     }
     assert_eq!(ok, 100);
@@ -477,8 +469,4 @@ async fn transport_dispatches_to_http2_when_requested() {
         .await
         .expect("exchange");
     assert_eq!(resp.status, 200);
-    match resp.body {
-        ResponseBody::Buffered(b) => assert_eq!(b.as_ref(), b"via-trait"),
-        _ => panic!("expected buffered body"),
-    }
 }

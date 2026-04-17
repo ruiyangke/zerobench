@@ -35,6 +35,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
 use zerobench_core::plan::{BodySource, RequestPlan};
 use zerobench_core::scenario_context::ScenarioContext;
+use zerobench_core::template::ExpandCtx;
 use zerobench_core::transport::{
     Response, ResponseBody, Target, TransportError, TransportOpts,
 };
@@ -184,59 +185,79 @@ impl Http1Pool {
             .ok_or_else(|| TransportError::Connect(format!("slot {slot_idx} unavailable")))?;
 
         let send_fut = sender.send_request(req);
-        // Enforce request_timeout around headers *and* body. Every exit
-        // path that leaves the slot in an undefined state (timeout *or*
-        // connection error) must null the sender: the driver task has
-        // either been cancelled mid-write or seen the connection die,
-        // so the next request on this slot would otherwise hit an
-        // out-of-sync SendRequest.
-        let res = match compio::time::timeout(self.request_timeout, send_fut).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => {
-                // Connection died — mark slot empty so future users don't
-                // hit the same dead sender (conservative: we don't try
-                // to reopen here; that's a later task).
-                guard.sender = None;
-                return Err(TransportError::Protocol(format!("send_request: {e}")));
+
+        // When the timeout is very large (>= 5 min, e.g. Duration::MAX
+        // for saturate mode against a local server), skip creating a
+        // TimerFuture per request — the overhead is ~2% of CPU at high
+        // throughput. Every error path that leaves the slot in an
+        // undefined state must still null the sender.
+        let use_timeout = self.request_timeout < Duration::from_secs(300);
+
+        let res = if use_timeout {
+            match compio::time::timeout(self.request_timeout, send_fut).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => {
+                    guard.sender = None;
+                    return Err(TransportError::Protocol(format!("send_request: {e}")));
+                }
+                Err(_) => {
+                    guard.sender = None;
+                    return Err(TransportError::Timeout);
+                }
             }
-            Err(_) => {
-                // Timeout — the send_request future is being dropped, which
-                // leaves the underlying hyper connection in an indeterminate
-                // state. Invalidate the slot so subsequent exchanges fail
-                // cleanly instead of hanging or reading stale bytes.
-                guard.sender = None;
-                return Err(TransportError::Timeout);
+        } else {
+            match send_fut.await {
+                Ok(res) => res,
+                Err(e) => {
+                    guard.sender = None;
+                    return Err(TransportError::Protocol(format!("send_request: {e}")));
+                }
             }
         };
 
         let ttfb = t0.elapsed();
 
-        // Split status + headers from the body first; collecting body
+        // Split status + headers from the body first; draining body
         // consumes `res`.
         let status = res.status().as_u16();
         let headers = res.headers().clone();
-        let body = res.into_body();
+        let mut body = res.into_body();
 
-        let collected = match compio::time::timeout(
-            self.request_timeout.saturating_sub(ttfb).max(Duration::from_millis(1)),
-            body.collect(),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                guard.sender = None;
-                return Err(TransportError::Protocol(format!("body: {e}")));
+        // Drain the body without collecting — just consume frames for
+        // timing. The hot-path benchmark code never inspects the body
+        // (only status, headers, and timing are used by extracts and
+        // assertions), so allocating a BytesMut and copying every frame
+        // into it is pure waste. This eliminates the biggest memmove +
+        // allocation cost on the read side.
+        if use_timeout {
+            let remaining = self.request_timeout.saturating_sub(ttfb).max(Duration::from_millis(1));
+            loop {
+                match compio::time::timeout(remaining, body.frame()).await {
+                    Ok(Some(Ok(_frame))) => {}
+                    Ok(Some(Err(e))) => {
+                        guard.sender = None;
+                        return Err(TransportError::Protocol(format!("body: {e}")));
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        guard.sender = None;
+                        return Err(TransportError::Timeout);
+                    }
+                }
             }
-            Err(_) => {
-                // Body-collection timeout — same reasoning as above. The
-                // body future is cancelled mid-read; invalidate the slot.
-                guard.sender = None;
-                return Err(TransportError::Timeout);
+        } else {
+            loop {
+                match body.frame().await {
+                    Some(Ok(_frame)) => {}
+                    Some(Err(e)) => {
+                        guard.sender = None;
+                        return Err(TransportError::Protocol(format!("body: {e}")));
+                    }
+                    None => break,
+                }
             }
-        };
+        }
 
-        let bytes = collected.to_bytes();
         let total = t0.elapsed();
 
         // --- Snapshot counters after ------------------------------------
@@ -251,7 +272,7 @@ impl Http1Pool {
         Ok(Response {
             status,
             headers,
-            body: ResponseBody::Buffered(bytes),
+            body: ResponseBody::Buffered(Bytes::new()),
             bytes_sent: w_after.saturating_sub(w_before),
             bytes_received: r_after.saturating_sub(r_before),
             ttfb,
@@ -473,11 +494,22 @@ fn build_request(
     plan: &RequestPlan,
     ctx: &mut ScenarioContext,
 ) -> Result<Request<Full<Bytes>>, TransportError> {
+    // Build the ExpandCtx from individual fields so we can borrow the
+    // reusable buffers (url_buf, hdr_*_buf, body_buf) simultaneously.
+    // `expand_ctx()` would take `&mut self`, conflicting with the buffer
+    // borrows.
+    let mut ectx = ExpandCtx {
+        rng: &mut ctx.rng,
+        counter: &ctx.counter,
+        scenario_vars: &ctx.vars,
+    };
+
     // URL — we only send the origin form (path+query) on the wire,
     // per hyper's convention for non-proxy HTTP/1.
-    let mut url_buf: Vec<u8> = Vec::with_capacity(plan.url.estimated_size());
-    plan.url.expand_into(&mut url_buf, &mut ctx.expand_ctx());
-    let url_str = std::str::from_utf8(&url_buf)
+    // Reuse ctx.url_buf to avoid a Vec allocation per request.
+    ctx.url_buf.clear();
+    plan.url.expand_into(&mut ctx.url_buf, &mut ectx);
+    let url_str = std::str::from_utf8(&ctx.url_buf)
         .map_err(|e| TransportError::RequestBuild(format!("url not utf-8: {e}")))?;
 
     // Strip scheme + authority if the template produced an absolute URL.
@@ -496,29 +528,28 @@ fn build_request(
     // user-supplied headers which can override it.
     builder = builder.header(http::header::HOST, target.addr());
 
-    let mut hdr_name_buf: Vec<u8> = Vec::with_capacity(32);
-    let mut hdr_val_buf: Vec<u8> = Vec::with_capacity(128);
+    // Reuse ctx.hdr_name_buf / ctx.hdr_val_buf across headers.
     for (name_tpl, val_tpl) in &plan.headers {
-        hdr_name_buf.clear();
-        hdr_val_buf.clear();
-        name_tpl.expand_into(&mut hdr_name_buf, &mut ctx.expand_ctx());
-        val_tpl.expand_into(&mut hdr_val_buf, &mut ctx.expand_ctx());
+        ctx.hdr_name_buf.clear();
+        ctx.hdr_val_buf.clear();
+        name_tpl.expand_into(&mut ctx.hdr_name_buf, &mut ectx);
+        val_tpl.expand_into(&mut ctx.hdr_val_buf, &mut ectx);
 
-        let name = http::HeaderName::from_bytes(&hdr_name_buf)
+        let name = http::HeaderName::from_bytes(&ctx.hdr_name_buf)
             .map_err(|e| TransportError::RequestBuild(format!("header name: {e}")))?;
-        let value = HeaderValue::from_bytes(&hdr_val_buf)
+        let value = HeaderValue::from_bytes(&ctx.hdr_val_buf)
             .map_err(|e| TransportError::RequestBuild(format!("header value: {e}")))?;
         builder = builder.header(name, value);
     }
 
-    // Body.
+    // Body — reuse ctx.body_buf for template bodies.
     let body_bytes = match &plan.body {
         None => Bytes::new(),
         Some(BodySource::Static(b)) => b.clone(),
         Some(BodySource::Template(t)) => {
-            let mut buf = Vec::with_capacity(t.estimated_size());
-            t.expand_into(&mut buf, &mut ctx.expand_ctx());
-            Bytes::from(buf)
+            ctx.body_buf.clear();
+            t.expand_into(&mut ctx.body_buf, &mut ectx);
+            Bytes::copy_from_slice(&ctx.body_buf)
         }
     };
 

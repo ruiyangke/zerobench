@@ -11,6 +11,9 @@
 //! 7. Exit 0 on clean runs, 1 when errors/assertion failures occurred,
 //!    2 for usage errors.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::IsTerminal;
 use std::process::ExitCode;
 

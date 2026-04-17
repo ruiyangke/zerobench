@@ -54,6 +54,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2::{self, SendRequest};
 use zerobench_core::plan::{BodySource, RequestPlan};
 use zerobench_core::scenario_context::ScenarioContext;
+use zerobench_core::template::ExpandCtx;
 use zerobench_core::transport::{
     Response, ResponseBody, Target, TransportError, TransportOpts,
 };
@@ -238,17 +239,24 @@ impl Http2Client {
         let mut sender = self.sender.clone();
 
         let send_fut = sender.send_request(req);
-        let res = match compio::time::timeout(self.request_timeout, send_fut).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => {
-                return Err(TransportError::Protocol(format!("send_request: {e}")));
+        let use_timeout = self.request_timeout < Duration::from_secs(300);
+
+        let res = if use_timeout {
+            match compio::time::timeout(self.request_timeout, send_fut).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => {
+                    return Err(TransportError::Protocol(format!("send_request: {e}")));
+                }
+                Err(_) => {
+                    return Err(TransportError::Timeout);
+                }
             }
-            Err(_) => {
-                // H2 stream-level timeout: dropping send_fut cancels the
-                // stream at the protocol level (hyper emits RST_STREAM
-                // on next driver poll), so the connection stays healthy
-                // for other concurrent exchanges.
-                return Err(TransportError::Timeout);
+        } else {
+            match send_fut.await {
+                Ok(res) => res,
+                Err(e) => {
+                    return Err(TransportError::Protocol(format!("send_request: {e}")));
+                }
             }
         };
 
@@ -256,26 +264,39 @@ impl Http2Client {
 
         let status = res.status().as_u16();
         let headers = res.headers().clone();
-        let body = res.into_body();
+        let mut body = res.into_body();
 
-        let collected = match compio::time::timeout(
-            self.request_timeout
+        // Drain the body without collecting — same rationale as H1.
+        // The benchmark hot path never inspects the body; draining
+        // avoids the BytesMut allocation + memmove per frame.
+        if use_timeout {
+            let remaining = self.request_timeout
                 .saturating_sub(ttfb)
-                .max(Duration::from_millis(1)),
-            body.collect(),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                return Err(TransportError::Protocol(format!("body: {e}")));
+                .max(Duration::from_millis(1));
+            loop {
+                match compio::time::timeout(remaining, body.frame()).await {
+                    Ok(Some(Ok(_frame))) => {}
+                    Ok(Some(Err(e))) => {
+                        return Err(TransportError::Protocol(format!("body: {e}")));
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(TransportError::Timeout);
+                    }
+                }
             }
-            Err(_) => {
-                return Err(TransportError::Timeout);
+        } else {
+            loop {
+                match body.frame().await {
+                    Some(Ok(_frame)) => {}
+                    Some(Err(e)) => {
+                        return Err(TransportError::Protocol(format!("body: {e}")));
+                    }
+                    None => break,
+                }
             }
-        };
+        }
 
-        let bytes = collected.to_bytes();
         let total = t0.elapsed();
 
         let r_after = self.read_ctr.load(Ordering::Relaxed);
@@ -284,7 +305,7 @@ impl Http2Client {
         Ok(Response {
             status,
             headers,
-            body: ResponseBody::Buffered(bytes),
+            body: ResponseBody::Buffered(Bytes::new()),
             bytes_sent: w_after.saturating_sub(w_before),
             bytes_received: r_after.saturating_sub(r_before),
             ttfb,
@@ -316,9 +337,15 @@ fn build_request(
     plan: &RequestPlan,
     ctx: &mut ScenarioContext,
 ) -> Result<Request<Full<Bytes>>, TransportError> {
-    let mut url_buf: Vec<u8> = Vec::with_capacity(plan.url.estimated_size());
-    plan.url.expand_into(&mut url_buf, &mut ctx.expand_ctx());
-    let url_str = std::str::from_utf8(&url_buf)
+    let mut ectx = ExpandCtx {
+        rng: &mut ctx.rng,
+        counter: &ctx.counter,
+        scenario_vars: &ctx.vars,
+    };
+
+    ctx.url_buf.clear();
+    plan.url.expand_into(&mut ctx.url_buf, &mut ectx);
+    let url_str = std::str::from_utf8(&ctx.url_buf)
         .map_err(|e| TransportError::RequestBuild(format!("url not utf-8: {e}")))?;
 
     let path_and_query = extract_path_and_query(url_str);
@@ -329,17 +356,15 @@ fn build_request(
 
     builder = builder.header(http::header::HOST, target.addr());
 
-    let mut hdr_name_buf: Vec<u8> = Vec::with_capacity(32);
-    let mut hdr_val_buf: Vec<u8> = Vec::with_capacity(128);
     for (name_tpl, val_tpl) in &plan.headers {
-        hdr_name_buf.clear();
-        hdr_val_buf.clear();
-        name_tpl.expand_into(&mut hdr_name_buf, &mut ctx.expand_ctx());
-        val_tpl.expand_into(&mut hdr_val_buf, &mut ctx.expand_ctx());
+        ctx.hdr_name_buf.clear();
+        ctx.hdr_val_buf.clear();
+        name_tpl.expand_into(&mut ctx.hdr_name_buf, &mut ectx);
+        val_tpl.expand_into(&mut ctx.hdr_val_buf, &mut ectx);
 
-        let name = http::HeaderName::from_bytes(&hdr_name_buf)
+        let name = http::HeaderName::from_bytes(&ctx.hdr_name_buf)
             .map_err(|e| TransportError::RequestBuild(format!("header name: {e}")))?;
-        let value = HeaderValue::from_bytes(&hdr_val_buf)
+        let value = HeaderValue::from_bytes(&ctx.hdr_val_buf)
             .map_err(|e| TransportError::RequestBuild(format!("header value: {e}")))?;
         builder = builder.header(name, value);
     }
@@ -348,9 +373,9 @@ fn build_request(
         None => Bytes::new(),
         Some(BodySource::Static(b)) => b.clone(),
         Some(BodySource::Template(t)) => {
-            let mut buf = Vec::with_capacity(t.estimated_size());
-            t.expand_into(&mut buf, &mut ctx.expand_ctx());
-            Bytes::from(buf)
+            ctx.body_buf.clear();
+            t.expand_into(&mut ctx.body_buf, &mut ectx);
+            Bytes::copy_from_slice(&ctx.body_buf)
         }
     };
 

@@ -38,14 +38,28 @@ use crate::var::VarSlot;
 pub struct ScenarioContext {
     /// Backing store for extracted variables, indexed by [`VarSlot`].
     /// Slots default to `None`; extractors overwrite on each iteration.
-    vars: Vec<Option<Bytes>>,
+    ///
+    /// Public so `build_request` can construct an [`ExpandCtx`] from
+    /// individual fields without borrowing the reusable buffers.
+    pub vars: Vec<Option<Bytes>>,
     /// Worker-owned random number generator. Public so templates and
     /// transports can reach it without going through a setter.
     pub rng: BenchRng,
     /// Per-worker monotonic counter — `{{counter}}` increments on each
     /// expansion. Not reset between iterations: the whole point of the
     /// counter is that it's monotonic across the entire run.
-    counter: Cell<u64>,
+    ///
+    /// Public for the same split-borrow reason as `vars`.
+    pub counter: Cell<u64>,
+    /// Reusable buffer for URL template expansion. Avoids a `Vec`
+    /// allocation per request on the hot path.
+    pub url_buf: Vec<u8>,
+    /// Reusable buffer for header-name template expansion.
+    pub hdr_name_buf: Vec<u8>,
+    /// Reusable buffer for header-value template expansion.
+    pub hdr_val_buf: Vec<u8>,
+    /// Reusable buffer for body template expansion.
+    pub body_buf: Vec<u8>,
 }
 
 impl ScenarioContext {
@@ -56,6 +70,10 @@ impl ScenarioContext {
             vars: vec![None; num_vars],
             rng,
             counter: Cell::new(0),
+            url_buf: Vec::with_capacity(256),
+            hdr_name_buf: Vec::with_capacity(64),
+            hdr_val_buf: Vec::with_capacity(256),
+            body_buf: Vec::with_capacity(256),
         }
     }
 
@@ -130,6 +148,7 @@ impl ScenarioContext {
             scenario_vars: &self.vars,
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
