@@ -224,6 +224,19 @@ pub struct CliArgs {
     #[arg(long = "raw", action = ArgAction::SetTrue)]
     pub raw: bool,
 
+    /// Use the mio-based synchronous epoll event loop (no async runtime).
+    ///
+    /// Each worker thread runs its own `mio::Poll` with N/T connections
+    /// in a tight event loop. No futures, no wakers, no task scheduling.
+    /// Pre-builds request bytes once at startup — per-request template
+    /// variables are expanded once and reused.
+    ///
+    /// No TLS support. Only available when the binary was built with
+    /// `--features mio-h1`.
+    #[cfg(feature = "mio-h1")]
+    #[arg(long = "mio", action = ArgAction::SetTrue)]
+    pub mio: bool,
+
     /// Text payload to send on each WebSocket iteration. Defaults to
     /// `"ping"`. Only visible when the binary was built with `ws`.
     ///

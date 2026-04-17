@@ -163,6 +163,13 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .await;
     }
 
+    // Mio H1 transport — bypasses the async runtime entirely. Each worker
+    // thread runs its own mio::Poll in a synchronous event loop.
+    #[cfg(feature = "mio-h1")]
+    if args.mio {
+        return run_mio(&args, plan, target).await;
+    }
+
     // Stand up the transport client for the single-threaded path.
     // Multi-threaded dispatch builds per-thread clients inside each
     // worker thread (each thread needs its own compio runtime to own
@@ -673,6 +680,78 @@ async fn run_with_transport<T: Transport>(
     if let Some(h) = ticker_handle {
         let _ = h.await;
     }
+
+    let summary = Summary::merge(stats, plan.duration);
+
+    let color = match args.color {
+        CliColor::Always => ColorChoice::Always,
+        CliColor::Auto => ColorChoice::Auto,
+        CliColor::Never => ColorChoice::Never,
+    };
+    match args.format {
+        CliFormat::Terminal => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            print_json(&summary, &plan, &mut out)?;
+        }
+        CliFormat::Jsonl => {
+            let stderr = std::io::stderr();
+            let is_tty = stderr.is_terminal();
+            let mut out = stderr.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Prom => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
+        }
+    }
+
+    let total_errors = summary.errors.total();
+    if total_errors > 0 {
+        Ok(ExitCode::from(1))
+    } else if summary.requests == 0 {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mio dispatch
+// ---------------------------------------------------------------------------
+
+/// Drive the mio-based benchmark — pure synchronous epoll, no async runtime
+/// in the hot path. Spawns N OS threads with their own `mio::Poll`, waits
+/// for `plan.duration`, merges stats, renders.
+#[cfg(feature = "mio-h1")]
+async fn run_mio(
+    args: &CliArgs,
+    mut plan: zerobench_core::plan::Plan,
+    target: zerobench_core::transport::Target,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+
+    if target.tls {
+        return Err("--mio does not support TLS (https://). Use http:// or remove --mio.".into());
+    }
+
+    plan.threads = args.threads;
+    let num_threads = args.threads.max(1);
+
+    let stats = zerobench_http::mio_h1::run_mio_threaded(
+        &target,
+        &plan,
+        num_threads,
+        args.connections,
+        plan.duration,
+    );
 
     let summary = Summary::merge(stats, plan.duration);
 

@@ -84,6 +84,9 @@ flume = { version = "0.12", default-features = false, features = ["async"] }
 # Fast integer formatting
 itoa = "1"
 
+# Synchronous epoll event loop (mio-h1 benchmark backend)
+mio = { version = "1", features = ["os-poll", "net"] }
+
 # Allocator
 mimalloc = { version = "0.1", default-features = false }
 

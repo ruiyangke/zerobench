@@ -30,13 +30,17 @@ pub mod conn_tokio;
 pub mod h1_tokio;
 
 // --- Raw H1 backend (opt-in, no hyper) ---
-#[cfg(feature = "raw-h1")]
+#[cfg(any(feature = "raw-h1", feature = "mio-h1"))]
 mod raw_h1_common;
 #[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
 #[allow(unsafe_code)]
 pub mod raw_h1;
 #[cfg(all(feature = "raw-h1", feature = "runtime-tokio"))]
 pub mod raw_h1_tokio;
+
+// --- Mio H1 backend (opt-in, synchronous epoll, no async runtime) ---
+#[cfg(feature = "mio-h1")]
+pub mod mio_h1;
 
 // --- Transport dispatch (works on either backend) ---
 #[cfg(feature = "h1")]

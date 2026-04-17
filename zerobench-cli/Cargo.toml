@@ -29,6 +29,8 @@ runtime-compio = ["dep:compio", "zerobench-core/runtime-compio", "zerobench-http
 runtime-tokio = ["dep:tokio", "zerobench-core/runtime-tokio", "zerobench-http/runtime-tokio"]
 # Raw HTTP/1.1 transport (httparse + compio, no hyper)
 raw-h1 = ["zerobench-http/raw-h1"]
+# Mio-based raw H1 (synchronous epoll, no async runtime)
+mio-h1 = ["zerobench-http/mio-h1"]
 # Everything
 all = ["h2", "h3", "ws", "sse", "tui", "script"]
 
