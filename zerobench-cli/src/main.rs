@@ -19,9 +19,16 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use zerobench_core::{
-    print_json, print_terminal, run_open_loop, run_open_loop_threaded, run_saturate,
-    run_saturate_threaded, ColorChoice, StopSignal, Summary, Transport,
+    print_json, print_terminal, ColorChoice, Summary,
 };
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
+use zerobench_core::StopSignal;
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
+use zerobench_core::{
+    run_open_loop, run_open_loop_threaded, run_saturate,
+    run_saturate_threaded, Transport,
+};
+#[cfg(feature = "h1")]
 use zerobench_http::HttpTransport;
 
 mod cli_args;
@@ -30,42 +37,138 @@ mod plan_from_cli;
 
 use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
-#[cfg(feature = "runtime-compio")]
-#[compio::main]
-async fn main() -> ExitCode {
-    let args = CliArgs::parse();
-    match run(args).await {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Entry point — synchronous fn main() that dispatches to the right path
+// ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = CliArgs::parse();
-    match run(args).await {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
 
-async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Route sub-commands first — they don't touch the transport layer.
     if let Some(cmd) = args.command.clone() {
         return match cmd {
-            Subcommand::Diff(da) => diff::run(&da),
+            Subcommand::Diff(da) => match diff::run(&da) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            },
             #[cfg(feature = "script")]
-            Subcommand::Run(ra) => run_script(ra).await,
+            Subcommand::Run(ra) => {
+                #[cfg(feature = "runtime-compio")]
+                {
+                    let rt = compio::runtime::Runtime::new().unwrap();
+                    return match rt.block_on(run_script(ra)) {
+                        Ok(code) => code,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ExitCode::from(2)
+                        }
+                    };
+                }
+                #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+                {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    return match rt.block_on(run_script(ra)) {
+                        Ok(code) => code,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ExitCode::from(2)
+                        }
+                    };
+                }
+                #[allow(unreachable_code)]
+                {
+                    eprintln!("error: script subcommand requires --features runtime-compio");
+                    ExitCode::from(2)
+                }
+            }
         };
     }
 
+    // Determine whether to use mio (synchronous path).
+    if should_use_mio(&args) {
+        #[cfg(feature = "mio-h1")]
+        {
+            return match run_mio_sync(&args) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        #[cfg(not(feature = "mio-h1"))]
+        {
+            eprintln!("error: mio-h1 feature not compiled in");
+            return ExitCode::from(2);
+        }
+    }
+
+    // Async path — compio takes precedence when both are enabled.
+    #[cfg(feature = "runtime-compio")]
+    {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        return match rt.block_on(run(args)) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        return match rt.block_on(run(args)) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    // No async runtime and not using mio — nothing we can do.
+    #[allow(unreachable_code)]
+    {
+        eprintln!("error: no runtime available. Rebuild with --features mio-h1 or --features runtime-compio");
+        ExitCode::from(2)
+    }
+}
+
+/// Determine whether to use the mio synchronous path.
+#[cfg(feature = "mio-h1")]
+fn should_use_mio(args: &CliArgs) -> bool {
+    // Explicit --mio flag
+    if args.mio {
+        return true;
+    }
+
+    // No async runtime compiled in — mio is the only option
+    #[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
+    {
+        let _ = args;
+        return true;
+    }
+
+    #[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
+#[cfg(not(feature = "mio-h1"))]
+fn should_use_mio(args: &CliArgs) -> bool {
+    let _ = args;
+    false
+}
+
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
+async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let open_loop = args.rate.is_some();
 
     // --- TUI / JSONL mutual-exclusion guard -----------------------------
@@ -430,6 +533,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 }
 
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 /// Per-second ticker: wakes on integer-second boundaries relative to
 /// the `LiveSnapshot` start, calls `swap_and_snapshot`, emits one JSONL
 /// line to stdout. Exits when `stop` trips; emits one last tick on
@@ -560,7 +664,7 @@ fn build_transport_info(
 /// Handles single-threaded and multi-threaded dispatch, JSONL streaming,
 /// TUI dashboard, and the full render / exit-code path. This is the
 /// generic counterpart to the `HttpTransport`-hardcoded code in `run()`.
-#[cfg(feature = "raw-h1")]
+#[cfg(all(feature = "raw-h1", any(feature = "runtime-compio", feature = "runtime-tokio")))]
 async fn run_with_transport<T: Transport>(
     args: &CliArgs,
     mut plan: zerobench_core::plan::Plan,
@@ -724,20 +828,107 @@ async fn run_with_transport<T: Transport>(
 }
 
 // ---------------------------------------------------------------------------
-// Mio dispatch
+// Mio dispatch — synchronous (called from main() without an async runtime)
 // ---------------------------------------------------------------------------
 
-/// Drive the mio-based benchmark — pure synchronous epoll, no async runtime
-/// in the hot path. Spawns N OS threads with their own `mio::Poll`, waits
+/// Drive the mio-based benchmark — pure synchronous epoll, no async runtime.
+/// Builds the plan, spawns N OS threads with their own `mio::Poll`, waits
 /// for `plan.duration`, merges stats, renders.
 #[cfg(feature = "mio-h1")]
+fn run_mio_sync(
+    args: &CliArgs,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Guard: features that need an async runtime
+    #[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
+    {
+        #[cfg(feature = "sse")]
+        if args.sse {
+            return Err("--sse requires an async runtime. Rebuild with --features sse".into());
+        }
+        #[cfg(feature = "ws")]
+        if args.ws {
+            return Err("--ws requires an async runtime. Rebuild with --features ws".into());
+        }
+        #[cfg(feature = "tui")]
+        if args.tui {
+            return Err("--tui requires an async runtime. Rebuild with --features tui".into());
+        }
+        #[cfg(feature = "raw-h1")]
+        if args.raw {
+            return Err("--raw requires an async runtime. Rebuild with --features raw-h1".into());
+        }
+    }
+
+    let (mut plan, target, _opts) = plan_from_cli::build(args)?;
+    plan.threads = args.threads;
+
+    if target.tls {
+        return Err("--mio does not support TLS (https://). Use http:// or remove --mio.".into());
+    }
+
+    let num_threads = args.threads.max(1);
+
+    let stats = zerobench_http::mio_h1::run_mio_threaded(
+        &target,
+        &plan,
+        num_threads,
+        args.connections,
+        plan.duration,
+    );
+
+    let summary = Summary::merge(stats, plan.duration);
+
+    let color = match args.color {
+        CliColor::Always => ColorChoice::Always,
+        CliColor::Auto => ColorChoice::Auto,
+        CliColor::Never => ColorChoice::Never,
+    };
+    match args.format {
+        CliFormat::Terminal => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            print_json(&summary, &plan, &mut out)?;
+        }
+        CliFormat::Jsonl => {
+            let stderr = std::io::stderr();
+            let is_tty = stderr.is_terminal();
+            let mut out = stderr.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Prom => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
+        }
+    }
+
+    let total_errors = summary.errors.total();
+    if total_errors > 0 {
+        Ok(ExitCode::from(1))
+    } else if summary.requests == 0 {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mio dispatch — async wrapper (called from the async run() path when
+// both mio-h1 and a runtime are compiled in)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "mio-h1", any(feature = "runtime-compio", feature = "runtime-tokio")))]
 async fn run_mio(
     args: &CliArgs,
     mut plan: zerobench_core::plan::Plan,
     target: zerobench_core::transport::Target,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    use std::io::IsTerminal;
-
     if target.tls {
         return Err("--mio does not support TLS (https://). Use http:// or remove --mio.".into());
     }

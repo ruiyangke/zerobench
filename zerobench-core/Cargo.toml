@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["runtime-compio"]
+default = []  # no runtime by default — mio path needs only pure-data types
 runtime-compio = ["dep:compio"]
 runtime-tokio = ["dep:tokio"]
 

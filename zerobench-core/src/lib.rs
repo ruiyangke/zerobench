@@ -5,21 +5,22 @@
 // When both runtime features are enabled (e.g. due to cargo feature
 // unification in a workspace), compio takes precedence. For a clean
 // tokio-only build, ensure no other workspace crate pulls in compio.
-//
-// At least one runtime must be enabled:
-#[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
-compile_error!("one of `runtime-compio` or `runtime-tokio` must be enabled");
 
+// --- Modules that need an async runtime (dispatcher, rate, step_exec) ---
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 pub mod dispatcher;
 pub mod live_snapshot;
 pub mod plan;
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 pub mod rate;
 pub mod report;
 pub mod request_file;
 pub mod rng;
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 pub mod runtime;
 pub mod scenario_context;
 pub mod stats;
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 mod step_exec;
 pub mod stop;
 pub mod template;
@@ -27,11 +28,13 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 pub use dispatcher::{run_saturate, run_saturate_threaded};
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use plan::{
     Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
+#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
 pub use rate::{run_open_loop, run_open_loop_threaded, run_scheduler, KeepupCounter, Token};
 pub use report::{
     print_json, print_jsonl_tick, print_prometheus, print_terminal, ColorChoice,

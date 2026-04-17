@@ -13,30 +13,33 @@ name = "zerobench"
 path = "src/main.rs"
 
 [features]
-default = ["h1", "sse", "ws", "runtime-compio"]
+default = ["mio-h1"]
+
+# Full feature set — all protocols + TUI + scripting
+full = ["h1", "h2", "sse", "ws", "tui", "script", "runtime-compio", "mio-h1", "raw-h1"]
+
 # Protocol features — flow through to zerobench-http
-h1 = []
-h2 = ["zerobench-http/h2"]
+# h1 (hyper-based) needs compio or tokio
+h1 = ["zerobench-http/h1", "runtime-compio"]
+h2 = ["zerobench-http/h2", "runtime-compio"]
 h3 = ["zerobench-http/h3"]
 # Protocol modes
-ws = ["dep:zerobench-ws"]
-sse = ["dep:zerobench-sse"]
+ws = ["dep:zerobench-ws", "runtime-compio"]
+sse = ["dep:zerobench-sse", "runtime-compio"]
 # Front-ends
-tui = ["dep:zerobench-tui"]
-script = ["dep:zerobench-rhai"]
+tui = ["dep:zerobench-tui", "runtime-compio"]
+script = ["dep:zerobench-rhai", "runtime-compio"]
 # Runtime backends
 runtime-compio = ["dep:compio", "zerobench-core/runtime-compio", "zerobench-http/runtime-compio"]
 runtime-tokio = ["dep:tokio", "zerobench-core/runtime-tokio", "zerobench-http/runtime-tokio"]
 # Raw HTTP/1.1 transport (httparse + compio, no hyper)
-raw-h1 = ["zerobench-http/raw-h1"]
+raw-h1 = ["zerobench-http/raw-h1", "runtime-compio"]
 # Mio-based raw H1 (synchronous epoll, no async runtime)
 mio-h1 = ["zerobench-http/mio-h1"]
-# Everything
-all = ["h2", "h3", "ws", "sse", "tui", "script"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
-zerobench-http = { workspace = true, default-features = false, features = ["h1"] }
+zerobench-http = { workspace = true, default-features = false }
 zerobench-ws = { workspace = true, optional = true }
 zerobench-sse = { workspace = true, optional = true }
 zerobench-rhai = { workspace = true, optional = true }
