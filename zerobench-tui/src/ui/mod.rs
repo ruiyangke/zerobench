@@ -37,7 +37,7 @@ pub mod throughput;
 
 use common::{
     compute_status, format_rate, status_pill, tile, ACCENT, CRITICAL, MIN_HEIGHT, MIN_WIDTH,
-    PALETTE,
+    PALETTE, SUCCESS,
 };
 
 // ---------------------------------------------------------------------------
@@ -381,14 +381,28 @@ fn render_log_pane(frame: &mut Frame, area: Rect, state: &DashboardState) {
 // ---------------------------------------------------------------------------
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let paused = if state.paused_rendering {
-        " [PAUSED]"
-    } else {
-        ""
-    };
+    // Show save path for 3 seconds after an export, then revert to keybinds.
+    let save_msg = state.last_save_at.and_then(|at| {
+        if at.elapsed() < std::time::Duration::from_secs(3) {
+            state.last_save_path.as_deref()
+        } else {
+            None
+        }
+    });
+
+    if let Some(path) = save_msg {
+        let line = Line::from(vec![
+            Span::styled(" ✓ saved: ", Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled(path, Style::new().fg(Color::White)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let paused = if state.paused_rendering { " [PAUSED]" } else { "" };
     let log_flag = if state.log_visible { " [log]" } else { "" };
     let text = format!(
-        " [1-4] tab   [?] help   [+/-] zoom   [m] marker   [0] reset zoom   [r] reset peaks   [p] pause{paused}   [l] log{log_flag}   [j/k] scroll log   [q] quit "
+        " [1-4] tab  [?] help  [s] save  [+/-] zoom  [m] marker  [r] reset  [p] pause{paused}  [l] log{log_flag}  [q] quit "
     );
     let paragraph = Paragraph::new(Line::from(Span::styled(
         text,

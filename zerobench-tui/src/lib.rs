@@ -36,6 +36,7 @@
 //! raw-mode/alt-screen on a panic. On a clean exit we call
 //! [`ratatui::restore`] ourselves from the outer wrapper.
 
+pub mod export;
 pub mod state;
 pub mod ui;
 
@@ -142,6 +143,11 @@ async fn run_tui_inner(
             state.ingest(tick);
             run_completed = true;
             state.run_completed = true;
+
+            // Auto-export the report on completion.
+            if state.auto_export {
+                do_export(&mut state);
+            }
         }
 
         // --- keyboard (non-blocking) ------------------------------
@@ -248,6 +254,9 @@ pub(crate) fn handle_key(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             state.reset_peaks();
         }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            do_export(state);
+        }
 
         // --- log pane scroll (only when visible) --------------------
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') if state.log_visible => {
@@ -283,6 +292,27 @@ pub(crate) fn handle_key(
         }
 
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Export helper
+// ---------------------------------------------------------------------------
+
+/// Save a JSON report snapshot to disk. Updates `state.last_save_path` so
+/// the footer can display the path for a few seconds.
+fn do_export(state: &mut DashboardState) {
+    let path = state.export_path.as_deref();
+    match export::export_report(state, path) {
+        Ok(p) => {
+            let display = p.display().to_string();
+            state.last_save_path = Some(display);
+            state.last_save_at = Some(Instant::now());
+        }
+        Err(e) => {
+            state.last_save_path = Some(format!("export failed: {e}"));
+            state.last_save_at = Some(Instant::now());
+        }
     }
 }
 

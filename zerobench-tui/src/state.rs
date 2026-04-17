@@ -343,6 +343,15 @@ pub struct DashboardState {
     pub log_entries: VecDeque<LogEntry>,
     /// Scroll offset for the log pane's `List` widget.
     pub log_scroll: usize,
+
+    /// Path of the last saved report — shown in the footer for 3 seconds.
+    pub last_save_path: Option<String>,
+    /// When the last save happened — drives the 3s fade-out.
+    pub last_save_at: Option<Instant>,
+    /// Whether to auto-export JSON when the run completes.
+    pub auto_export: bool,
+    /// User-provided output directory/file for exports.
+    pub export_path: Option<std::path::PathBuf>,
 }
 
 impl DashboardState {
@@ -377,6 +386,10 @@ impl DashboardState {
             marker: Marker::Braille,
             log_entries: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             log_scroll: 0,
+            last_save_path: None,
+            last_save_at: None,
+            auto_export: true,
+            export_path: None,
         }
     }
 

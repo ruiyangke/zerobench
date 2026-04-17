@@ -50,6 +50,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(""),
         section("Control"),
         kbd("q / Esc", "quit benchmark early (print report)"),
+        kbd("s", "save report snapshot to JSON file"),
         kbd("p", "pause rendering (benchmark continues)"),
         kbd("r", "reset peak/min trackers"),
         kbd("l", "toggle inline log pane"),

@@ -181,7 +181,8 @@ fn renders_keybind_footer() {
     let (_, content) = render_state(&state);
     assert!(content.contains("[q] quit"), "missing quit keybind:\n{content}");
     assert!(content.contains("[?] help"), "missing help keybind:\n{content}");
-    assert!(content.contains("[r] reset peaks"), "missing reset keybind:\n{content}");
+    assert!(content.contains("[r] reset"), "missing reset keybind:\n{content}");
+    assert!(content.contains("[s] save"), "missing save keybind:\n{content}");
     assert!(content.contains("[1-4]"), "missing tab keybind:\n{content}");
 }
 
