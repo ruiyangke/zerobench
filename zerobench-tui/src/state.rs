@@ -29,6 +29,9 @@ use ratatui::symbols::Marker;
 use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
 
+/// Maximum number of log entries retained in the dashboard.
+const MAX_LOG_ENTRIES: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
@@ -54,6 +57,24 @@ const HIST_SIG: u8 = 3;
 fn new_hist() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(HIST_LO_NS, HIST_HI_NS, HIST_SIG)
         .expect("HDR histogram bounds are valid compile-time constants")
+}
+
+// ---------------------------------------------------------------------------
+// Log entries
+// ---------------------------------------------------------------------------
+
+/// A single log event surfaced in the TUI's log pane. Currently no
+/// actual events are emitted from the dispatchers; the structure is
+/// here so that when we DO wire log events (assertion failures,
+/// connection errors), they appear with zero renderer changes.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Elapsed time since the benchmark started.
+    pub timestamp: Duration,
+    /// Event category — `"assert"`, `"connect"`, `"timeout"`, etc.
+    pub category: String,
+    /// Human-readable detail message.
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +336,13 @@ pub struct DashboardState {
 
     /// Chart marker style — toggled with `m` between Braille and Dot.
     pub marker: Marker,
+
+    /// Bounded ring of log events shown in the log pane. Capped at
+    /// [`MAX_LOG_ENTRIES`]. Currently no events are emitted; the
+    /// structure is scaffolded for wiring.
+    pub log_entries: VecDeque<LogEntry>,
+    /// Scroll offset for the log pane's `List` widget.
+    pub log_scroll: usize,
 }
 
 impl DashboardState {
@@ -347,6 +375,8 @@ impl DashboardState {
             run_completed: false,
             y_scale: 1.0,
             marker: Marker::Braille,
+            log_entries: VecDeque::with_capacity(MAX_LOG_ENTRIES),
+            log_scroll: 0,
         }
     }
 
@@ -555,6 +585,45 @@ impl DashboardState {
             .back()
             .map(|t| t.errors.clone())
             .unwrap_or_default()
+    }
+
+    /// Per-second byte rates from the most recent tick. Returns
+    /// `(bytes_sent, bytes_recv)` or `(0, 0)` before any tick.
+    pub fn last_tick_bytes(&self) -> (u64, u64) {
+        self.ticks
+            .back()
+            .map(|t| (t.bytes_sent, t.bytes_recv))
+            .unwrap_or((0, 0))
+    }
+
+    /// Append a log entry to the ring, evicting the oldest when full.
+    pub fn push_log(&mut self, entry: LogEntry) {
+        self.log_entries.push_back(entry);
+        while self.log_entries.len() > MAX_LOG_ENTRIES {
+            self.log_entries.pop_front();
+        }
+    }
+
+    /// Scroll the log pane up by one line (toward older entries).
+    pub fn log_scroll_up(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_add(1);
+    }
+
+    /// Scroll the log pane down by one line (toward newer entries).
+    pub fn log_scroll_down(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_sub(1);
+    }
+
+    /// Jump the log pane to the oldest entry.
+    pub fn log_scroll_top(&mut self) {
+        if !self.log_entries.is_empty() {
+            self.log_scroll = self.log_entries.len().saturating_sub(1);
+        }
+    }
+
+    /// Jump the log pane to the newest entry.
+    pub fn log_scroll_bottom(&mut self) {
+        self.log_scroll = 0;
     }
 }
 

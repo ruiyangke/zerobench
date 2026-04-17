@@ -14,7 +14,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Paragraph};
+use ratatui::widgets::{Axis, Cell, Chart, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::state::DashboardState;
@@ -26,7 +26,7 @@ use super::dataset::OwnedDataset;
 // Tab entry point
 // ---------------------------------------------------------------------------
 
-pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
+pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState, wide: bool) {
     // Chart dominates; bottom panel is fixed at 8 rows.
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -35,13 +35,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     render_rps_timeseries(frame, rows[0], state);
 
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
-
-    render_bytes_chart(frame, bot[0], state);
-    render_summary(frame, bot[1], state);
+    if wide {
+        let bot = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(rows[1]);
+        render_bytes_chart(frame, bot[0], state);
+        render_summary_table(frame, bot[1], state);
+    } else {
+        // Narrow: stack bottom panels vertically.
+        let bot = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(rows[1]);
+        render_bytes_chart(frame, bot[0], state);
+        render_summary_table(frame, bot[1], state);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,7 +74,11 @@ fn render_rps_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) 
 
     let mut owned = vec![OwnedDataset::line(
         "rps",
-        state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.requests as f64)).collect(),
+        state
+            .ticks
+            .iter()
+            .map(|t| (t.elapsed.as_secs_f64(), t.requests as f64))
+            .collect(),
         PALETTE[0],
         marker,
     )];
@@ -79,7 +92,11 @@ fn render_rps_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) 
         ));
     }
 
-    let observed_max = owned[0].data.iter().map(|p| p.1).fold(0.0_f64, f64::max);
+    let observed_max = owned[0]
+        .data
+        .iter()
+        .map(|p| p.1)
+        .fold(0.0_f64, f64::max);
     let y_max = match state.target_rate {
         Some(t) => (observed_max.max(t) * 1.15).max(1.0),
         None => (observed_max * 1.15).max(1.0),
@@ -156,13 +173,21 @@ fn render_bytes_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let owned = vec![
         OwnedDataset::line(
             "recv",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.bytes_recv as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.bytes_recv as f64))
+                .collect(),
             PALETTE[1],
             marker,
         ),
         OwnedDataset::line(
             "sent",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.bytes_sent as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.bytes_sent as f64))
+                .collect(),
             PALETTE[4],
             marker,
         ),
@@ -222,42 +247,65 @@ fn render_bytes_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
 }
 
 // ---------------------------------------------------------------------------
-// Summary — compact numeric panel.
+// Summary — Table widget with clear labeling for rate vs total.
 // ---------------------------------------------------------------------------
 
-fn render_summary(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let block = tile("summary");
-
+fn render_summary_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let current = state.requests_per_sec();
     let peak = state.peak_rps;
     let min = state.min_rps.unwrap_or(0.0);
     let avg = state.avg_rps();
+    let (last_sent, last_recv) = state.last_tick_bytes();
 
-    let lines = vec![
-        kv(" current rps", format_rate(current), SUCCESS),
-        kv(" peak rps   ", format_rate(peak), ACCENT),
-        kv(" min rps    ", format_rate(min), Color::Gray),
-        kv(" avg rps    ", format_rate(avg), Color::Gray),
-        kv(
-            " total sent ",
-            format_bytes(state.cumulative_bytes_sent),
-            Color::Gray,
-        ),
-        kv(
-            " total recv ",
-            format_bytes(state.cumulative_bytes_recv),
-            Color::Gray,
-        ),
+    let dim = Style::new().fg(Color::Gray);
+    let green_bold = Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD);
+    let accent_bold = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("current rps").style(dim),
+            Cell::from(format_rate(current)).style(green_bold),
+        ]),
+        Row::new(vec![
+            Cell::from("peak rps").style(dim),
+            Cell::from(format_rate(peak)).style(accent_bold),
+        ]),
+        Row::new(vec![
+            Cell::from("min rps").style(dim),
+            Cell::from(format_rate(min)).style(dim),
+        ]),
+        Row::new(vec![
+            Cell::from("avg rps").style(dim),
+            Cell::from(format_rate(avg)).style(dim),
+        ]),
+        Row::new(vec![
+            Cell::from("bytes/s (last)").style(dim),
+            Cell::from(format!(
+                "↑{} ↓{}",
+                format_bytes_rate(last_sent as f64),
+                format_bytes_rate(last_recv as f64)
+            ))
+            .style(dim),
+        ]),
+        Row::new(vec![
+            Cell::from("total bytes").style(dim),
+            Cell::from(format!(
+                "↑{} ↓{}",
+                format_bytes(state.cumulative_bytes_sent),
+                format_bytes(state.cumulative_bytes_recv)
+            ))
+            .style(dim),
+        ]),
     ];
 
-    let p = Paragraph::new(lines).block(block);
-    frame.render_widget(p, area);
-}
-
-fn kv(key: &'static str, value: String, colour: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(key, Style::new().fg(Color::Gray)),
-        Span::raw("  "),
-        Span::styled(value, Style::new().fg(colour).add_modifier(Modifier::BOLD)),
-    ])
+    let widths = [Constraint::Length(16), Constraint::Min(10)];
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(vec!["metric", "value"])
+                .style(Style::new().add_modifier(Modifier::BOLD))
+                .bottom_margin(0),
+        )
+        .block(tile("summary"))
+        .column_spacing(2);
+    frame.render_widget(table, area);
 }

@@ -47,7 +47,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::DefaultTerminal;
 use zerobench_core::{LiveSnapshot, StopSignal};
 
-pub use state::{DashboardState, RunMode, Tab, TransportInfo};
+pub use state::{DashboardState, LogEntry, RunMode, Tab, TransportInfo};
 pub use ui::render;
 
 // ---------------------------------------------------------------------------
@@ -247,6 +247,20 @@ pub(crate) fn handle_key(
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             state.reset_peaks();
+        }
+
+        // --- log pane scroll (only when visible) --------------------
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') if state.log_visible => {
+            state.log_scroll_up();
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') if state.log_visible => {
+            state.log_scroll_down();
+        }
+        KeyCode::Home if state.log_visible => {
+            state.log_scroll_top();
+        }
+        KeyCode::End if state.log_visible => {
+            state.log_scroll_bottom();
         }
 
         // --- chart zoom / marker toggle ----------------------------

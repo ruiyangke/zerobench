@@ -214,7 +214,7 @@ fn overview_tab_renders_totals_panel() {
         "missing requests label:\n{content}"
     );
     assert!(content.contains("2xx"), "missing 2xx label:\n{content}");
-    assert!(content.contains("bytes"), "missing bytes label:\n{content}");
+    assert!(content.contains("total"), "missing total label:\n{content}");
     // Cumulative 200 requests should appear in the totals.
     assert!(content.contains("200"), "missing request count:\n{content}");
 }
@@ -362,8 +362,8 @@ fn errors_tab_renders_all_three_panels() {
         "missing timeout row:\n{content}"
     );
     assert!(
-        content.contains("assertion"),
-        "missing assertion row:\n{content}"
+        content.contains("assert"),
+        "missing assert category:\n{content}"
     );
 }
 

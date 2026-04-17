@@ -8,15 +8,14 @@
 //! │ multiple line series (one per error category)             │
 //! ╰───────────────────────────────────────────────────────────╯
 //! ╭─ status codes over time ───╮ ╭─ cumulative totals ────────╮
-//! │ 2xx / 4xx / 5xx percentages │ │ connect / read / write /  │
-//! ╰─────────────────────────────╯ │ timeout / keepup / assert │
-//!                                  ╰────────────────────────────╯
+//! │ 2xx / 4xx / 5xx percentages │ │ Table: error counters      │
+//! ╰─────────────────────────────╯ ╰────────────────────────────╯
 //! ```
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Paragraph};
+use ratatui::widgets::{Axis, Cell, Chart, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::state::DashboardState;
@@ -28,7 +27,7 @@ use super::dataset::OwnedDataset;
 // Tab entry point
 // ---------------------------------------------------------------------------
 
-pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
+pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState, wide: bool) {
     // Chart dominates; bottom panel is fixed at 8 rows.
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -37,13 +36,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     render_category_timeseries(frame, rows[0], state);
 
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
-
-    render_status_timeseries(frame, bot[0], state);
-    render_cumulative(frame, bot[1], state);
+    if wide {
+        let bot = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(rows[1]);
+        render_status_timeseries(frame, bot[0], state);
+        render_cumulative_table(frame, bot[1], state);
+    } else {
+        // Narrow: stack bottom panels vertically.
+        let bot = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(rows[1]);
+        render_status_timeseries(frame, bot[0], state);
+        render_cumulative_table(frame, bot[1], state);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,37 +76,61 @@ fn render_category_timeseries(frame: &mut Frame, area: Rect, state: &DashboardSt
     let mut owned = vec![
         OwnedDataset::line(
             "connect",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.connect as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.connect as f64))
+                .collect(),
             PALETTE[3],
             marker,
         ),
         OwnedDataset::line(
             "read",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.read as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.read as f64))
+                .collect(),
             Color::Rgb(255, 153, 153),
             marker,
         ),
         OwnedDataset::line(
             "write",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.write as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.write as f64))
+                .collect(),
             Color::Rgb(255, 180, 120),
             marker,
         ),
         OwnedDataset::line(
             "timeout",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.timeout as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.timeout as f64))
+                .collect(),
             PALETTE[2],
             marker,
         ),
         OwnedDataset::line(
             "keepup",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.keepup as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.keepup as f64))
+                .collect(),
             PALETTE[4],
             marker,
         ),
         OwnedDataset::line(
             "assert",
-            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.assertion_failed as f64)).collect(),
+            state
+                .ticks
+                .iter()
+                .map(|t| (t.elapsed.as_secs_f64(), t.errors.assertion_failed as f64))
+                .collect(),
             Color::Rgb(255, 120, 180),
             marker,
         ),
@@ -242,51 +274,73 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
 }
 
 // ---------------------------------------------------------------------------
-// Cumulative totals panel.
+// Cumulative totals panel — Table widget.
 // ---------------------------------------------------------------------------
 
-fn render_cumulative(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let block = tile("cumulative totals");
+fn render_cumulative_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let e = &state.total_errors;
     let success = state.total_requests.saturating_sub(e.status_4xx + e.status_5xx);
 
-    let counter = |n: u64| -> Span<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let red_bold = Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD);
+    let green_bold = Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD);
+
+    let counter_style = |n: u64| -> Style {
         if n == 0 {
-            Span::styled(format!("{n}"), Style::new().fg(Color::DarkGray))
+            dim
         } else {
-            Span::styled(
-                format!("{n}"),
-                Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD),
-            )
+            red_bold
         }
     };
 
-    let lines = vec![
-        row(" connect   ", counter(e.connect)),
-        row(" read      ", counter(e.read)),
-        row(" write     ", counter(e.write)),
-        row(" timeout   ", counter(e.timeout)),
-        row(" keepup    ", counter(e.keepup)),
-        row(" assertion ", counter(e.assertion_failed)),
-        Line::from(Span::raw("")),
-        row(
-            " 2xx       ",
-            Span::styled(
-                format!("{success}"),
-                Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD),
-            ),
-        ),
-        row(" 4xx       ", counter(e.status_4xx)),
-        row(" 5xx       ", counter(e.status_5xx)),
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("connect"),
+            Cell::from(format!("{}", e.connect)).style(counter_style(e.connect)),
+        ]),
+        Row::new(vec![
+            Cell::from("read"),
+            Cell::from(format!("{}", e.read)).style(counter_style(e.read)),
+        ]),
+        Row::new(vec![
+            Cell::from("write"),
+            Cell::from(format!("{}", e.write)).style(counter_style(e.write)),
+        ]),
+        Row::new(vec![
+            Cell::from("timeout"),
+            Cell::from(format!("{}", e.timeout)).style(counter_style(e.timeout)),
+        ]),
+        Row::new(vec![
+            Cell::from("keepup"),
+            Cell::from(format!("{}", e.keepup)).style(counter_style(e.keepup)),
+        ]),
+        Row::new(vec![
+            Cell::from("assertion"),
+            Cell::from(format!("{}", e.assertion_failed)).style(counter_style(e.assertion_failed)),
+        ]),
+        Row::new(vec![Cell::from(""), Cell::from("")]),
+        Row::new(vec![
+            Cell::from("2xx"),
+            Cell::from(format!("{success}")).style(green_bold),
+        ]),
+        Row::new(vec![
+            Cell::from("4xx"),
+            Cell::from(format!("{}", e.status_4xx)).style(counter_style(e.status_4xx)),
+        ]),
+        Row::new(vec![
+            Cell::from("5xx"),
+            Cell::from(format!("{}", e.status_5xx)).style(counter_style(e.status_5xx)),
+        ]),
     ];
 
-    let p = Paragraph::new(lines).block(block);
-    frame.render_widget(p, area);
-}
-
-fn row(label: &'static str, value: Span<'static>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(label, Style::new().fg(Color::Gray)),
-        value,
-    ])
+    let widths = [Constraint::Length(12), Constraint::Min(8)];
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(vec!["category", "count"])
+                .style(Style::new().add_modifier(Modifier::BOLD))
+                .bottom_margin(0),
+        )
+        .block(tile("cumulative totals"))
+        .column_spacing(2);
+    frame.render_widget(table, area);
 }
