@@ -51,68 +51,62 @@ use zerobench_core::plan::{Plan, Step};
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::Target;
 
-use super::raw_h1_common::find_header_end;
-
 // ---------------------------------------------------------------------------
-// Minimal header extraction — replaces httparse for the mio hot path.
-// Scans raw bytes for Content-Length and Connection without full HTTP
-// validation. ~12% faster than httparse (no SIMD char-class checks,
-// no reason phrase parse, no Header struct construction).
+// SIMD-accelerated minimal header extraction via memchr.
+//
+// Replaces both httparse AND our earlier byte-by-byte scanner. memchr
+// uses AVX2/SSE4.2 internally to find \n boundaries and \r\n\r\n
+// in ~0.1 cycles/byte instead of ~1 cycle/byte.
 // ---------------------------------------------------------------------------
 
-/// Extract Content-Length from raw header bytes via case-insensitive scan.
-/// Returns 0 if not found (server closed-delimited or chunked — treated
-/// as "read until EOF" by the caller).
+/// Find the end of HTTP headers (`\r\n\r\n`). Returns the byte offset
+/// just past the terminator. Uses `memchr::memmem` (SIMD-accelerated).
+#[inline]
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    memchr::memmem::find(buf, b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Extract Content-Length from raw header bytes. Uses `memchr::memchr`
+/// to jump between `\n` boundaries (SIMD) then a short case-insensitive
+/// match on the header name (15 bytes, scalar).
 fn fast_content_length(headers: &[u8]) -> usize {
-    // Scan for "\ncontent-length:" or "\nContent-Length:" (most common casings).
-    // We check byte-by-byte after each \n for a case-insensitive match.
-    let needle_lower = b"content-length:";
-    let mut i = 0;
-    while i < headers.len() {
-        // Find next \n (start of a header line, or after \r\n).
-        if headers[i] == b'\n' {
-            i += 1;
-            if i + needle_lower.len() <= headers.len()
-                && eq_ignore_case(&headers[i..i + needle_lower.len()], needle_lower)
-            {
-                // Found — parse the value after the colon.
-                let val_start = i + needle_lower.len();
-                return parse_int_after_colon(&headers[val_start..]);
-            }
-        } else {
-            i += 1;
+    let needle = b"content-length:";
+    let mut pos = 0;
+    while let Some(nl) = memchr::memchr(b'\n', &headers[pos..]) {
+        let line_start = pos + nl + 1;
+        if line_start + needle.len() <= headers.len()
+            && eq_ignore_case(&headers[line_start..line_start + needle.len()], needle)
+        {
+            return parse_int_after_colon(&headers[line_start + needle.len()..]);
         }
+        pos = line_start;
     }
     0
 }
 
-/// Check if "Connection: close" (case-insensitive) is present.
+/// Check if `Connection: close` (case-insensitive) is present. Uses
+/// `memchr::memchr` to jump between `\n` boundaries.
 fn fast_connection_close(headers: &[u8]) -> bool {
     let needle = b"connection:";
-    let mut i = 0;
-    while i < headers.len() {
-        if headers[i] == b'\n' {
-            i += 1;
-            if i + needle.len() <= headers.len()
-                && eq_ignore_case(&headers[i..i + needle.len()], needle)
-            {
-                let val_start = i + needle.len();
-                // Check if the value contains "close" (case-insensitive).
-                let line_end = headers[val_start..]
-                    .iter()
-                    .position(|&b| b == b'\r' || b == b'\n')
-                    .unwrap_or(headers.len() - val_start);
-                let val = &headers[val_start..val_start + line_end];
-                return contains_ignore_case(val, b"close");
-            }
-        } else {
-            i += 1;
+    let mut pos = 0;
+    while let Some(nl) = memchr::memchr(b'\n', &headers[pos..]) {
+        let line_start = pos + nl + 1;
+        if line_start + needle.len() <= headers.len()
+            && eq_ignore_case(&headers[line_start..line_start + needle.len()], needle)
+        {
+            let val_start = line_start + needle.len();
+            // Find the end of this header line.
+            let line_end = memchr::memchr2(b'\r', b'\n', &headers[val_start..])
+                .unwrap_or(headers.len() - val_start);
+            let val = &headers[val_start..val_start + line_end];
+            return contains_ignore_case(val, b"close");
         }
+        pos = line_start;
     }
     false
 }
 
-/// Case-insensitive byte comparison for short ASCII strings.
+/// Case-insensitive byte comparison for short ASCII strings (≤16 bytes).
 #[inline(always)]
 fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_lowercase() == *y)
@@ -129,22 +123,20 @@ fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|w| eq_ignore_case(w, needle))
 }
 
-/// Parse a decimal integer from the bytes after "Content-Length:".
+/// Parse a decimal integer from bytes after "Content-Length:".
 /// Skips leading whitespace, stops at first non-digit.
 #[inline]
 fn parse_int_after_colon(bytes: &[u8]) -> usize {
     let mut val: usize = 0;
     let mut started = false;
     for &b in bytes {
-        if b == b' ' || b == b'\t' {
-            if started { break; }
-            continue;
-        }
-        if b >= b'0' && b <= b'9' {
-            val = val * 10 + (b - b'0') as usize;
-            started = true;
-        } else {
-            break;
+        match b {
+            b' ' | b'\t' if !started => continue,
+            b'0'..=b'9' => {
+                val = val * 10 + (b - b'0') as usize;
+                started = true;
+            }
+            _ => break,
         }
     }
     val
