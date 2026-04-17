@@ -13,24 +13,24 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Chart, Paragraph};
 use ratatui::Frame;
 
 use crate::state::DashboardState;
 
-use super::common::{format_bytes, format_bytes_rate, format_rate, tile, ACCENT, SUCCESS};
+use super::common::{format_bytes, format_bytes_rate, format_rate, tile, ACCENT, PALETTE, SUCCESS};
+use super::dataset::OwnedDataset;
 
 // ---------------------------------------------------------------------------
 // Tab entry point
 // ---------------------------------------------------------------------------
 
 pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    // Top 60%: rps chart. Bottom 40%: bytes chart + summary.
+    // Chart dominates; bottom panel is fixed at 8 rows.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Min(12), Constraint::Length(8)])
         .split(area);
 
     render_rps_timeseries(frame, rows[0], state);
@@ -59,50 +59,33 @@ fn render_rps_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) 
         return;
     }
 
-    let rps: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.requests as f64))
-        .collect();
-
+    let marker = state.marker;
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    // Y max uses either target + headroom (open-loop) or observed peak
-    // + headroom. Ensures the target reference line doesn't clip against
-    // the top frame.
-    let observed_max = rps.iter().map(|p| p.1).fold(0.0_f64, f64::max);
+    let mut owned = vec![OwnedDataset::line(
+        "rps",
+        state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.requests as f64)).collect(),
+        PALETTE[0],
+        marker,
+    )];
+
+    // Target reference line — dim gray, spans full x-range.
+    if let Some(t) = state.target_rate {
+        owned.push(OwnedDataset::reference_line(
+            vec![(x_min, t), (x_max, t)],
+            PALETTE[5],
+            marker,
+        ));
+    }
+
+    let observed_max = owned[0].data.iter().map(|p| p.1).fold(0.0_f64, f64::max);
     let y_max = match state.target_rate {
         Some(t) => (observed_max.max(t) * 1.15).max(1.0),
         None => (observed_max * 1.15).max(1.0),
-    };
+    } * state.y_scale;
 
-    // Target reference series — two points at the target rate, drawn as
-    // a short "line" that spans the full x-range. Graph type Line keeps
-    // it continuous; we colour it dim so it reads as a reference.
-    let target_series: Vec<(f64, f64)> = match state.target_rate {
-        Some(t) => vec![(x_min, t), (x_max, t)],
-        None => Vec::new(),
-    };
-
-    let mut datasets = vec![
-        Dataset::default()
-            .name("rps")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(SUCCESS))
-            .data(&rps),
-    ];
-    if !target_series.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .name("target")
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(Color::DarkGray))
-                .data(&target_series),
-        );
-    }
+    let datasets = owned.iter().map(|d| d.to_dataset()).collect();
 
     let y_labels = vec![
         Line::from(Span::styled("0", Style::new().fg(Color::Gray))),
@@ -168,42 +151,35 @@ fn render_bytes_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
         return;
     }
 
-    let sent: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.bytes_sent as f64))
-        .collect();
-    let recv: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.bytes_recv as f64))
-        .collect();
+    let marker = state.marker;
+
+    let owned = vec![
+        OwnedDataset::line(
+            "recv",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.bytes_recv as f64)).collect(),
+            PALETTE[1],
+            marker,
+        ),
+        OwnedDataset::line(
+            "sent",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.bytes_sent as f64)).collect(),
+            PALETTE[4],
+            marker,
+        ),
+    ];
 
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    let max_y = sent
+    let max_y = owned
         .iter()
-        .chain(recv.iter())
+        .flat_map(|d| d.data.iter())
         .map(|p| p.1)
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let y_max = max_y * 1.15;
+    let y_max = max_y * 1.15 * state.y_scale;
 
-    let datasets = vec![
-        Dataset::default()
-            .name("recv")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(ACCENT))
-            .data(&recv),
-        Dataset::default()
-            .name("sent")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(200, 180, 255)))
-            .data(&sent),
-    ];
+    let datasets = owned.iter().map(|d| d.to_dataset()).collect();
 
     let y_labels = vec![
         Line::from(Span::styled("0", Style::new().fg(Color::Gray))),

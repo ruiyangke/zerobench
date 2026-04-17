@@ -22,7 +22,7 @@ use ratatui::Frame;
 use crate::state::{DashboardState, ROLLING_LATENCY_WINDOW};
 
 use super::common::{
-    format_bytes, format_ns, format_rate, hbar_smooth, tile, CRITICAL, SUCCESS,
+    format_bytes, format_ns, format_rate, hbar_smooth, tile, CRITICAL, PALETTE, SUCCESS,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ fn render_throughput_sparkline(frame: &mut Frame, area: Rect, state: &DashboardS
     let sparkline = Sparkline::default()
         .data(&data)
         .max(max_hint)
-        .style(Style::new().fg(SUCCESS));
+        .style(Style::new().fg(PALETTE[0]));
     frame.render_widget(sparkline, spark_area);
 }
 
@@ -184,15 +184,15 @@ fn render_latency_bars(frame: &mut Frame, area: Rect, state: &DashboardState) {
             let delta_span = delta_span(state);
 
             vec![
-                percentile_line("p50  ", p50, max_f, bar_width, SUCCESS),
-                percentile_line("p90  ", p90, max_f, bar_width, Color::Rgb(180, 220, 180)),
-                percentile_line("p99  ", p99, max_f, bar_width, Color::Rgb(255, 204, 102)),
+                percentile_line("p50  ", p50, max_f, bar_width, PALETTE[0]),
+                percentile_line("p90  ", p90, max_f, bar_width, PALETTE[1]),
+                percentile_line("p99  ", p99, max_f, bar_width, PALETTE[2]),
                 percentile_line_with_suffix(
                     "p99.9",
                     p99_9,
                     max_f,
                     bar_width,
-                    Color::Rgb(255, 153, 102),
+                    PALETTE[3],
                     delta_span,
                 ),
                 percentile_line("max  ", max, max_f, bar_width, CRITICAL),

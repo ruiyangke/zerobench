@@ -15,24 +15,24 @@
 use hdrhistogram::Histogram;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Chart, Paragraph};
 use ratatui::Frame;
 
 use crate::state::DashboardState;
 
-use super::common::{format_ns, hbar_smooth, tile, CRITICAL, SUCCESS};
+use super::common::{format_ns, hbar_smooth, tile, CRITICAL, PALETTE, SUCCESS};
+use super::dataset::OwnedDataset;
 
 // ---------------------------------------------------------------------------
 // Tab entry point
 // ---------------------------------------------------------------------------
 
 pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    // Top 60%: time-series chart. Bottom 40%: bars + distribution.
+    // Chart dominates; bottom panel is fixed at 8 rows.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Min(12), Constraint::Length(8)])
         .split(area);
 
     render_timeseries(frame, rows[0], state);
@@ -62,72 +62,46 @@ fn render_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) {
         return;
     }
 
-    // Build point series. X is seconds elapsed; Y is nanoseconds.
-    // Ratatui's Chart consumes `&[(f64, f64)]`, so we need to allocate
-    // backing vectors for the datasets.
-    let p50: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.p50_ns as f64))
-        .collect();
-    let p90: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.p90_ns as f64))
-        .collect();
-    let p99: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.p99_ns as f64))
-        .collect();
-    let p99_9: Vec<(f64, f64)> = state
-        .ticks
-        .iter()
-        .map(|t| (t.elapsed.as_secs_f64(), t.p99_9_ns as f64))
-        .collect();
+    let marker = state.marker;
 
-    // Fixed time axis: always show 0..total_duration so the chart
-    // doesn't grow — data fills in from the left.
+    let owned = vec![
+        OwnedDataset::line(
+            "p50",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.p50_ns as f64)).collect(),
+            PALETTE[0],
+            marker,
+        ),
+        OwnedDataset::line(
+            "p90",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.p90_ns as f64)).collect(),
+            PALETTE[1],
+            marker,
+        ),
+        OwnedDataset::line(
+            "p99",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.p99_ns as f64)).collect(),
+            PALETTE[2],
+            marker,
+        ),
+        OwnedDataset::line(
+            "p99.9",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.p99_9_ns as f64)).collect(),
+            PALETTE[3],
+            marker,
+        ),
+    ];
+
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    // Y-axis bounds — take the max of all series with a 10% headroom
-    // so the top line doesn't clip against the frame.
-    let y_raw_max = p99_9
+    let y_raw_max = owned
         .iter()
-        .chain(p99.iter())
-        .chain(p90.iter())
-        .chain(p50.iter())
+        .flat_map(|d| d.data.iter())
         .map(|p| p.1)
         .fold(0.0_f64, f64::max);
-    let y_max = (y_raw_max * 1.10).max(1.0);
+    let y_max = (y_raw_max * 1.10).max(1.0) * state.y_scale;
 
-    let datasets = vec![
-        Dataset::default()
-            .name("p50")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(SUCCESS))
-            .data(&p50),
-        Dataset::default()
-            .name("p90")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(180, 220, 180)))
-            .data(&p90),
-        Dataset::default()
-            .name("p99")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(255, 204, 102)))
-            .data(&p99),
-        Dataset::default()
-            .name("p99.9")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(CRITICAL))
-            .data(&p99_9),
-    ];
+    let datasets = owned.iter().map(|d| d.to_dataset()).collect();
 
     let y_labels: Vec<Line> = [0.0, y_max / 2.0, y_max]
         .iter()
@@ -148,9 +122,6 @@ fn render_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) {
         })
         .collect();
 
-    // Series names already live in the panel title; suppress the
-    // per-chart legend so it doesn't cover the plot data in narrow
-    // layouts.
     let chart = Chart::new(datasets)
         .block(tile("latency over time  (p50 · p90 · p99 · p99.9)"))
         .legend_position(None)
@@ -205,31 +176,10 @@ fn render_window_bars(frame: &mut Frame, area: Rect, state: &DashboardState) {
             };
 
             vec![
-                pct_line("p50  ", p50, max_f, bar_width, SUCCESS, None),
-                pct_line(
-                    "p90  ",
-                    p90,
-                    max_f,
-                    bar_width,
-                    Color::Rgb(180, 220, 180),
-                    None,
-                ),
-                pct_line(
-                    "p99  ",
-                    p99,
-                    max_f,
-                    bar_width,
-                    Color::Rgb(255, 204, 102),
-                    None,
-                ),
-                pct_line(
-                    "p99.9",
-                    p99_9,
-                    max_f,
-                    bar_width,
-                    Color::Rgb(255, 153, 102),
-                    delta_span,
-                ),
+                pct_line("p50  ", p50, max_f, bar_width, PALETTE[0], None),
+                pct_line("p90  ", p90, max_f, bar_width, PALETTE[1], None),
+                pct_line("p99  ", p99, max_f, bar_width, PALETTE[2], None),
+                pct_line("p99.9", p99_9, max_f, bar_width, PALETTE[3], delta_span),
                 pct_line("max  ", max, max_f, bar_width, CRITICAL, None),
             ]
         }

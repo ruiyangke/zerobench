@@ -25,6 +25,7 @@ use ratatui::Frame;
 use crate::state::{DashboardState, RunMode, Tab};
 
 pub mod common;
+pub mod dataset;
 pub mod errors;
 pub mod help;
 pub mod latency;
@@ -292,7 +293,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let paused = if state.paused_rendering { " [PAUSED]" } else { "" };
     let log_flag = if state.log_visible { " [log]" } else { "" };
     let text = format!(
-        " [1-4] tab   [Tab] next   [?] help   [r] reset peaks   [p] pause{paused}   [l] log{log_flag}   [q] quit "
+        " [1-4] tab   [?] help   [+/-] zoom   [m] marker   [0] reset zoom   [r] reset peaks   [p] pause{paused}   [l] log{log_flag}   [q] quit "
     );
     let paragraph = Paragraph::new(Line::from(Span::styled(
         text,

@@ -249,6 +249,23 @@ pub(crate) fn handle_key(
             state.reset_peaks();
         }
 
+        // --- chart zoom / marker toggle ----------------------------
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            state.y_scale = (state.y_scale * 0.8).max(0.1);
+        }
+        KeyCode::Char('-') => {
+            state.y_scale = (state.y_scale * 1.25).min(10.0);
+        }
+        KeyCode::Char('0') => {
+            state.y_scale = 1.0;
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            state.marker = match state.marker {
+                ratatui::symbols::Marker::Braille => ratatui::symbols::Marker::Dot,
+                _ => ratatui::symbols::Marker::Braille,
+            };
+        }
+
         _ => {}
     }
 }

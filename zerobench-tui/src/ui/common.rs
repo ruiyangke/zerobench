@@ -25,6 +25,18 @@ pub const WARNING: Color = Color::Rgb(255, 204, 102);
 /// Critical — errors, off-target.
 pub const CRITICAL: Color = Color::Rgb(255, 102, 102);
 
+/// Chart series palette — 6 visually distinct colors for multi-line
+/// charts. Index with `PALETTE[i % PALETTE.len()]` for consistent
+/// coloring across all tabs.
+pub const PALETTE: [Color; 6] = [
+    Color::Rgb(88, 200, 130),  // green  — p50, rps, 2xx
+    Color::Rgb(130, 200, 240), // cyan   — p90, bytes recv
+    Color::Rgb(255, 204, 102), // amber  — p99, 4xx
+    Color::Rgb(255, 120, 120), // red    — p99.9, errors, 5xx
+    Color::Rgb(180, 140, 255), // purple — bytes sent
+    Color::Rgb(200, 200, 200), // gray   — reference lines
+];
+
 // ---------------------------------------------------------------------------
 // Shared block / title helper
 // ---------------------------------------------------------------------------

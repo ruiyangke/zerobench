@@ -15,23 +15,24 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Chart, Paragraph};
 use ratatui::Frame;
 
 use crate::state::DashboardState;
 
-use super::common::{tile, CRITICAL, SUCCESS, WARNING};
+use super::common::{tile, CRITICAL, PALETTE, SUCCESS};
+use super::dataset::OwnedDataset;
 
 // ---------------------------------------------------------------------------
 // Tab entry point
 // ---------------------------------------------------------------------------
 
 pub fn render(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    // Chart dominates; bottom panel is fixed at 8 rows.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Min(12), Constraint::Length(8)])
         .split(area);
 
     render_category_timeseries(frame, rows[0], state);
@@ -60,74 +61,66 @@ fn render_category_timeseries(frame: &mut Frame, area: Rect, state: &DashboardSt
         return;
     }
 
-    // Build one series per category. Each is `(elapsed_s, count_in_tick)`.
-    // For tabs where every category is zero, Chart still renders fine —
-    // the flat-zero lines just hug the x-axis.
-    let mut s_connect = Vec::with_capacity(state.ticks.len());
-    let mut s_read = Vec::with_capacity(state.ticks.len());
-    let mut s_write = Vec::with_capacity(state.ticks.len());
-    let mut s_timeout = Vec::with_capacity(state.ticks.len());
-    let mut s_keepup = Vec::with_capacity(state.ticks.len());
-    let mut s_assert = Vec::with_capacity(state.ticks.len());
-
-    for t in &state.ticks {
-        let x = t.elapsed.as_secs_f64();
-        s_connect.push((x, t.errors.connect as f64));
-        s_read.push((x, t.errors.read as f64));
-        s_write.push((x, t.errors.write as f64));
-        s_timeout.push((x, t.errors.timeout as f64));
-        s_keepup.push((x, t.errors.keepup as f64));
-        s_assert.push((x, t.errors.assertion_failed as f64));
-    }
-
+    let marker = state.marker;
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    let y_max = [&s_connect, &s_read, &s_write, &s_timeout, &s_keepup, &s_assert]
+    let mut owned = vec![
+        OwnedDataset::line(
+            "connect",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.connect as f64)).collect(),
+            PALETTE[3],
+            marker,
+        ),
+        OwnedDataset::line(
+            "read",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.read as f64)).collect(),
+            Color::Rgb(255, 153, 153),
+            marker,
+        ),
+        OwnedDataset::line(
+            "write",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.write as f64)).collect(),
+            Color::Rgb(255, 180, 120),
+            marker,
+        ),
+        OwnedDataset::line(
+            "timeout",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.timeout as f64)).collect(),
+            PALETTE[2],
+            marker,
+        ),
+        OwnedDataset::line(
+            "keepup",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.keepup as f64)).collect(),
+            PALETTE[4],
+            marker,
+        ),
+        OwnedDataset::line(
+            "assert",
+            state.ticks.iter().map(|t| (t.elapsed.as_secs_f64(), t.errors.assertion_failed as f64)).collect(),
+            Color::Rgb(255, 120, 180),
+            marker,
+        ),
+    ];
+
+    let y_raw_max = owned
         .iter()
-        .flat_map(|s| s.iter())
-        .map(|(_, y)| *y)
+        .flat_map(|d| d.data.iter())
+        .map(|p| p.1)
         .fold(0.0_f64, f64::max)
         .max(1.0);
 
-    let datasets = vec![
-        Dataset::default()
-            .name("connect")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(CRITICAL))
-            .data(&s_connect),
-        Dataset::default()
-            .name("read")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(255, 153, 153)))
-            .data(&s_read),
-        Dataset::default()
-            .name("write")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(255, 180, 120)))
-            .data(&s_write),
-        Dataset::default()
-            .name("timeout")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(WARNING))
-            .data(&s_timeout),
-        Dataset::default()
-            .name("keepup")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(200, 180, 255)))
-            .data(&s_keepup),
-        Dataset::default()
-            .name("assert")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Rgb(255, 120, 180)))
-            .data(&s_assert),
-    ];
+    // Zero baseline reference line.
+    owned.push(OwnedDataset::reference_line(
+        vec![(x_min, 0.0), (x_max, 0.0)],
+        PALETTE[5],
+        marker,
+    ));
+
+    let y_max = y_raw_max * 1.1 * state.y_scale;
+
+    let datasets = owned.iter().map(|d| d.to_dataset()).collect();
 
     let y_labels = vec![
         Line::from(Span::styled("0", Style::new().fg(Color::Gray))),
@@ -165,7 +158,7 @@ fn render_category_timeseries(frame: &mut Frame, area: Rect, state: &DashboardSt
         .y_axis(
             Axis::default()
                 .style(Style::new().fg(Color::DarkGray))
-                .bounds([0.0, y_max * 1.1])
+                .bounds([0.0, y_max])
                 .labels(y_labels),
         );
     frame.render_widget(chart, area);
@@ -186,18 +179,17 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
         return;
     }
 
+    let marker = state.marker;
+
     let mut s_2xx = Vec::with_capacity(state.ticks.len());
     let mut s_4xx = Vec::with_capacity(state.ticks.len());
     let mut s_5xx = Vec::with_capacity(state.ticks.len());
 
     for t in &state.ticks {
         let x = t.elapsed.as_secs_f64();
-        let total = t.requests.max(1) as f64; // avoid /0 on empty ticks
+        let total = t.requests.max(1) as f64;
         let pct_4 = t.errors.status_4xx as f64 / total * 100.0;
         let pct_5 = t.errors.status_5xx as f64 / total * 100.0;
-        // 2xx "proxy": remaining fraction of successful requests for
-        // the tick. We don't record a dedicated 2xx counter, so we
-        // derive it as 100% - 4xx% - 5xx%.
         let pct_2 = (100.0 - pct_4 - pct_5).max(0.0);
         s_2xx.push((x, pct_2));
         s_4xx.push((x, pct_4));
@@ -207,26 +199,13 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    let datasets = vec![
-        Dataset::default()
-            .name("2xx %")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(SUCCESS))
-            .data(&s_2xx),
-        Dataset::default()
-            .name("4xx %")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(WARNING))
-            .data(&s_4xx),
-        Dataset::default()
-            .name("5xx %")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(CRITICAL))
-            .data(&s_5xx),
+    let owned = vec![
+        OwnedDataset::line("2xx %", s_2xx, PALETTE[0], marker),
+        OwnedDataset::line("4xx %", s_4xx, PALETTE[2], marker),
+        OwnedDataset::line("5xx %", s_5xx, PALETTE[3], marker),
     ];
+
+    let datasets = owned.iter().map(|d| d.to_dataset()).collect();
 
     let y_labels = vec![
         Line::from(Span::styled("0%", Style::new().fg(Color::Gray))),

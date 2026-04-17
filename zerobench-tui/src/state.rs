@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use ratatui::symbols::Marker;
 use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
 
@@ -307,6 +308,13 @@ pub struct DashboardState {
     /// Set by the main loop when `StopSignal` fires. While true,
     /// the status pill shows "done" and no new ticks are ingested.
     pub run_completed: bool,
+
+    /// User-controlled Y-axis scale multiplier. 1.0 = auto (fit data).
+    /// < 1.0 = zoomed in, > 1.0 = zoomed out.
+    pub y_scale: f64,
+
+    /// Chart marker style — toggled with `m` between Braille and Dot.
+    pub marker: Marker,
 }
 
 impl DashboardState {
@@ -337,6 +345,8 @@ impl DashboardState {
             log_visible: false,
             exit_requested: false,
             run_completed: false,
+            y_scale: 1.0,
+            marker: Marker::Braille,
         }
     }
 

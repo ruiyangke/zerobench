@@ -54,6 +54,12 @@ pub fn render(frame: &mut Frame, area: Rect) {
         kbd("r", "reset peak/min trackers"),
         kbd("l", "toggle inline log pane"),
         Line::from(""),
+        section("Charts"),
+        kbd("+ / =", "zoom in Y axis (reduce scale 20%)"),
+        kbd("-", "zoom out Y axis (increase scale 20%)"),
+        kbd("0", "reset Y axis to auto-scale"),
+        kbd("m", "toggle marker (braille / dot)"),
+        Line::from(""),
         section("Panel legend"),
         legend(
             "▲ pct",
