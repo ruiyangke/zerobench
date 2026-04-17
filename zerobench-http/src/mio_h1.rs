@@ -311,38 +311,59 @@ pub fn run_mio_worker(
         }
     }
 
-    while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
+    // Pending token queue — tokens wait here briefly for a connection
+    // to become idle instead of being immediately dropped as keepup.
+    // Bounded at 2× connection count to prevent unbounded growth.
+    let mut pending_tokens: std::collections::VecDeque<Instant> =
+        std::collections::VecDeque::with_capacity(num_conns * 2);
+    let max_pending = num_conns * 2;
 
-        // --- Open-loop: generate tokens and assign to idle connections ---
+    while !stop.load(Ordering::Relaxed) {
+        // --- Open-loop: generate tokens into the pending queue ----------
         if let Some(interval) = token_interval {
-            // Dispatch tokens to idle connections.
+            let now = Instant::now();
             while now >= next_token_at {
+                pending_tokens.push_back(next_token_at);
+                next_token_at += interval;
+            }
+            // Cap the queue — excess tokens are keepup drops.
+            while pending_tokens.len() > max_pending {
+                pending_tokens.pop_front();
+                stats.record_error(0, ErrorKind::Keepup);
+            }
+        }
+
+        // --- Assign pending tokens to idle connections ------------------
+        if open_loop {
+            while let Some(&intended) = pending_tokens.front() {
                 if let Some(conn_idx) = idle_conns.pop() {
+                    pending_tokens.pop_front();
                     let conn = &mut connections[conn_idx];
-                    conn.prepare_request(request_bytes, next_token_at);
-                    // Try immediate write.
+                    conn.prepare_request(request_bytes, intended);
                     match conn.try_write() {
                         Ok(true) => conn.state = ConnState::ReadingHeaders,
-                        Ok(false) => {} // queued, will complete on writable event
+                        Ok(false) => {}
                         Err(_) => {
                             conn.state = ConnState::Dead;
                             stats.record_error(0, ErrorKind::Write);
                         }
                     }
                 } else {
-                    // No idle connection available — count as keepup drop.
-                    stats.record_error(0, ErrorKind::Keepup);
+                    break; // no idle conns — tokens wait in queue
                 }
-                next_token_at += interval;
             }
         }
 
         // --- Calculate poll timeout ------------------------------------
-        let poll_timeout = if open_loop && !idle_conns.is_empty() {
-            // Wake up when the next token is due.
-            let until_next = next_token_at.saturating_duration_since(Instant::now());
-            Some(until_next.min(Duration::from_millis(100)))
+        let poll_timeout = if open_loop {
+            if !pending_tokens.is_empty() {
+                // Tokens waiting — wake up ASAP to check for completions.
+                Some(Duration::ZERO)
+            } else {
+                // No pending tokens — wake at next token time.
+                let until_next = next_token_at.saturating_duration_since(Instant::now());
+                Some(until_next.min(Duration::from_millis(1)))
+            }
         } else {
             Some(Duration::from_millis(100))
         };
@@ -434,6 +455,30 @@ pub fn run_mio_worker(
                         conn.state = ConnState::Dead;
                         stats.record_error(0, ErrorKind::Read);
                     }
+                }
+            }
+        }
+
+        // --- Post-event token assignment --------------------------------
+        // Connections that just went idle can immediately pick up queued
+        // tokens. Without this second pass, idle conns would wait until
+        // the next outer-loop iteration — wasting an entire poll cycle.
+        if open_loop {
+            while let Some(&intended) = pending_tokens.front() {
+                if let Some(conn_idx) = idle_conns.pop() {
+                    pending_tokens.pop_front();
+                    let conn = &mut connections[conn_idx];
+                    conn.prepare_request(request_bytes, intended);
+                    match conn.try_write() {
+                        Ok(true) => conn.state = ConnState::ReadingHeaders,
+                        Ok(false) => {}
+                        Err(_) => {
+                            conn.state = ConnState::Dead;
+                            stats.record_error(0, ErrorKind::Write);
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         }
