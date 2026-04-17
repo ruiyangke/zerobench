@@ -260,9 +260,11 @@ pub(crate) fn handle_key(
             state.y_scale = 1.0;
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
+            // Cycle: HalfBlock (thick) → Braille (thin) → Dot (minimal) → HalfBlock
             state.marker = match state.marker {
+                ratatui::symbols::Marker::HalfBlock => ratatui::symbols::Marker::Braille,
                 ratatui::symbols::Marker::Braille => ratatui::symbols::Marker::Dot,
-                _ => ratatui::symbols::Marker::Braille,
+                _ => ratatui::symbols::Marker::HalfBlock,
             };
         }
 
