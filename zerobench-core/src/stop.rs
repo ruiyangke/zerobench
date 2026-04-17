@@ -76,6 +76,25 @@ impl StopSignal {
         .detach();
         sig
     }
+
+    /// Build a signal that trips after `duration` using a plain OS
+    /// thread and `std::thread::sleep`. Unlike [`Self::after`], this
+    /// does **not** require a compio runtime to be running — the timer
+    /// fires even when the calling thread is blocked on
+    /// `std::thread::JoinHandle::join`.
+    ///
+    /// Preferred over [`Self::after`] in multi-threaded dispatch where
+    /// the main thread blocks on worker thread joins and cannot poll
+    /// the compio reactor.
+    pub fn after_wall(duration: Duration) -> Self {
+        let sig = Self::new();
+        let timer_clone = sig.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            timer_clone.stop();
+        });
+        sig
+    }
 }
 
 impl Default for StopSignal {
@@ -138,6 +157,22 @@ mod tests {
         // Give the runtime a tick to schedule the detached task, then
         // verify we're still in the "running" state.
         compio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!s.is_stopped());
+    }
+
+    #[test]
+    fn after_wall_trips_when_duration_elapses() {
+        let s = StopSignal::after_wall(Duration::from_millis(50));
+        assert!(!s.is_stopped());
+        // Block the calling thread — no compio runtime needed.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(s.is_stopped());
+    }
+
+    #[test]
+    fn after_wall_does_not_trip_before_elapsed() {
+        let s = StopSignal::after_wall(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(5));
         assert!(!s.is_stopped());
     }
 }

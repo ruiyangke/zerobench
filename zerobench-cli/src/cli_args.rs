@@ -10,6 +10,14 @@ use std::time::Duration;
 
 use clap::{ArgAction, Parser, ValueEnum};
 
+/// Return the number of available CPU cores, falling back to 1 if the
+/// query fails (e.g. inside a restricted container).
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 /// `zerobench` — fast, correct HTTP benchmarking tool.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -43,6 +51,12 @@ pub struct CliArgs {
     /// scenario weights; when absent, weights are equal.
     #[arg(long = "requests", conflicts_with = "request_file")]
     pub requests: Option<PathBuf>,
+
+    /// Number of OS worker threads. Each thread gets its own compio
+    /// runtime and io_uring instance. Connections are distributed
+    /// evenly across threads. Default: number of available CPU cores.
+    #[arg(short = 't', long = "threads", default_value_t = num_cpus())]
+    pub threads: usize,
 
     /// Max concurrent connections / worker tasks (closed-loop) or
     /// pool ceiling (open-loop). (For HTTP/2: maximum concurrent
@@ -296,6 +310,10 @@ pub struct RunArgs {
     /// Implicitly overrides any per-scenario `.rate(...)` too.
     #[arg(long = "rate", short = 'r', value_parser = parse_rate_flag)]
     pub rate: Option<f64>,
+
+    /// Number of OS worker threads.
+    #[arg(short = 't', long = "threads", default_value_t = num_cpus())]
+    pub threads: usize,
 
     /// Max concurrent connections. Used in saturate mode (when the
     /// script set `saturate(...)` or neither `rate()` nor `saturate()`
@@ -724,5 +742,49 @@ mod tests {
             msg.contains("threshold") || msg.contains("invalid"),
             "expected threshold error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn args_threads_flag_short_form() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--saturate",
+            "-t",
+            "4",
+            "-c",
+            "20",
+            "-d",
+            "1s",
+            "http://127.0.0.1:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.threads, 4);
+        assert_eq!(args.connections, 20);
+    }
+
+    #[test]
+    fn args_threads_flag_long_form() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--saturate",
+            "--threads",
+            "8",
+            "http://127.0.0.1:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.threads, 8);
+    }
+
+    #[test]
+    fn args_threads_defaults_to_cpu_count() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--saturate",
+            "http://127.0.0.1:1/",
+        ])
+        .unwrap();
+        // Default should be num_cpus(), which is >= 1.
+        assert!(args.threads >= 1);
+        assert_eq!(args.threads, num_cpus());
     }
 }

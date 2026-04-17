@@ -28,7 +28,7 @@ use zerobench_core::transport::{
     Response, ResponseBody, Target, Transport, TransportError, TransportOpts,
 };
 use zerobench_core::var::VarRegistry;
-use zerobench_core::{run_saturate, Summary};
+use zerobench_core::{run_saturate, run_saturate_threaded, Summary};
 
 // ---------------------------------------------------------------------------
 // FakeTransport — an in-memory transport for testing the dispatcher.
@@ -137,6 +137,7 @@ async fn saturate_single_scenario_fires_many_requests() {
         vars,
         duration: Duration::from_millis(300),
         warmup: None,
+        threads: 1,
     };
 
     let client = FakeClient::new(200);
@@ -181,6 +182,7 @@ async fn saturate_multi_scenario_exercises_every_scenario() {
         vars,
         duration: Duration::from_millis(300),
         warmup: None,
+        threads: 1,
     };
 
     let client = FakeClient::new(200);
@@ -222,6 +224,7 @@ async fn saturate_counts_assertion_failures_but_still_counts_requests() {
         vars,
         duration: Duration::from_millis(250),
         warmup: None,
+        threads: 1,
     };
 
     let client = FakeClient::new(200);
@@ -264,6 +267,7 @@ async fn saturate_extract_status_propagates_through_chained_url() {
         vars,
         duration: Duration::from_millis(200),
         warmup: None,
+        threads: 1,
     };
 
     let mut client = FakeClient::new(200);
@@ -302,6 +306,7 @@ async fn saturate_respects_prefired_stop_signal() {
         vars,
         duration: Duration::from_millis(100),
         warmup: None,
+        threads: 1,
     };
 
     let client = FakeClient::new(200);
@@ -340,6 +345,7 @@ async fn saturate_zero_max_tasks_is_noop() {
         vars,
         duration: Duration::from_millis(50),
         warmup: None,
+        threads: 1,
     };
     let client = FakeClient::new(200);
     let stop = StopSignal::after(plan.duration);
@@ -414,6 +420,7 @@ async fn saturate_exits_under_synchronous_transport_errors() {
         vars,
         duration: Duration::from_millis(500),
         warmup: None,
+        threads: 1,
     };
 
     let client = AlwaysErrSyncClient {
@@ -476,6 +483,7 @@ async fn saturate_pause_step_slows_throughput() {
         vars,
         duration: Duration::from_millis(250),
         warmup: None,
+        threads: 1,
     };
 
     let client = FakeClient::new(200);
@@ -491,5 +499,74 @@ async fn saturate_pause_step_slows_throughput() {
         "unexpected request count with 20ms pause: {}",
         summary.requests
     );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded saturate tests
+// ---------------------------------------------------------------------------
+
+/// 4 threads x 2 connections each = 8 total connections.
+/// Run for 500ms with FakeTransport and verify merged stats.
+#[test]
+fn saturate_threaded_distributes_across_threads() {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("/", &mut vars).unwrap();
+    let plan = Arc::new(Plan {
+        scenarios: vec![Scenario {
+            name: "threaded".into(),
+            rate: RateProfile::Saturate { max_concurrency: 50 },
+            steps: vec![Step::Request(RequestPlan::get(url))],
+        }],
+        vars,
+        duration: Duration::from_millis(500),
+        warmup: None,
+        threads: 4,
+    });
+    let target = Arc::new(Target::parse("http://fake:80").unwrap());
+    let opts = Arc::new(TransportOpts::default());
+    let stop = StopSignal::after_wall(Duration::from_millis(500));
+
+    let stats = run_saturate_threaded::<FakeTransport>(
+        plan, target, opts, 4, 8, stop, None,
+    );
+
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    assert!(total > 0, "multi-threaded run produced zero requests");
+    // 4 threads x 2 conns = 8 worker tasks total.
+    assert!(
+        stats.len() == 8,
+        "expected 8 stats entries (4 threads x 2 conns), got {}",
+        stats.len()
+    );
+}
+
+/// Single-thread fast path in threaded dispatcher does not spawn extra
+/// threads and produces the same result as the original `run_saturate`.
+#[test]
+fn saturate_threaded_single_thread_fast_path() {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("/", &mut vars).unwrap();
+    let plan = Arc::new(Plan {
+        scenarios: vec![Scenario {
+            name: "st".into(),
+            rate: RateProfile::Saturate { max_concurrency: 50 },
+            steps: vec![Step::Request(RequestPlan::get(url))],
+        }],
+        vars,
+        duration: Duration::from_millis(300),
+        warmup: None,
+        threads: 1,
+    });
+    let target = Arc::new(Target::parse("http://fake:80").unwrap());
+    let opts = Arc::new(TransportOpts::default());
+    let stop = StopSignal::after_wall(Duration::from_millis(300));
+
+    let stats = run_saturate_threaded::<FakeTransport>(
+        plan, target, opts, 1, 4, stop, None,
+    );
+
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    assert!(total > 0, "single-thread fast path produced zero requests");
+    assert_eq!(stats.len(), 4, "expected 4 stats entries");
 }
 

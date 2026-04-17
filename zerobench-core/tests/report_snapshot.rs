@@ -39,6 +39,7 @@ fn sample_plan(duration: Duration) -> Plan {
         vars,
         duration,
         warmup: None,
+        threads: 1,
     }
 }
 
@@ -63,6 +64,7 @@ fn two_scenario_plan(duration: Duration) -> Plan {
         vars,
         duration,
         warmup: None,
+        threads: 1,
     }
 }
 
@@ -252,6 +254,7 @@ fn json_reporter_target_rate_encodes_constant() {
         vars,
         duration: Duration::from_secs(1),
         warmup: None,
+        threads: 1,
     };
     let summary = build_summary(1, Duration::from_secs(1));
     let mut out = Vec::new();
@@ -278,6 +281,7 @@ fn json_reporter_target_rate_encodes_ramp() {
         vars,
         duration: Duration::from_secs(1),
         warmup: None,
+        threads: 1,
     };
     let summary = build_summary(1, Duration::from_secs(1));
     let mut out = Vec::new();
@@ -323,6 +327,7 @@ fn json_reporter_target_rate_arrays_mixed_multi_scenario() {
         vars,
         duration: Duration::from_secs(1),
         warmup: None,
+        threads: 1,
     };
     let summary = build_summary(2, Duration::from_secs(1));
     let mut out = Vec::new();

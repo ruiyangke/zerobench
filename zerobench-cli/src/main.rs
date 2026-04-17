@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use zerobench_core::{
-    print_json, print_terminal, run_open_loop, run_saturate, ColorChoice, StopSignal,
-    Summary, Transport,
+    print_json, print_terminal, run_open_loop, run_open_loop_threaded, run_saturate,
+    run_saturate_threaded, ColorChoice, StopSignal, Summary, Transport,
 };
 use zerobench_http::HttpTransport;
 
@@ -105,7 +105,8 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return run_ws(&args).await;
     }
 
-    let (plan, target, opts) = plan_from_cli::build(&args)?;
+    let (mut plan, target, opts) = plan_from_cli::build(&args)?;
+    plan.threads = args.threads;
 
     // SSE takes a different path — it opens its own fresh connections
     // per iteration rather than going through the shared `Http1Pool`.
@@ -118,8 +119,15 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return run_sse(&args, &plan, &target, &opts).await;
     }
 
-    // Stand up the transport client for the non-SSE path.
-    let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
+    // Stand up the transport client for the single-threaded path.
+    // Multi-threaded dispatch builds per-thread clients inside each
+    // worker thread (each thread needs its own compio runtime to own
+    // the pool's IO handles), so we skip the main-thread client.
+    let client = if args.threads <= 1 {
+        Some(<HttpTransport as Transport>::build_client(&target, &opts).await?)
+    } else {
+        None
+    };
 
     // Set up live streaming for JSONL streaming OR the TUI dashboard —
     // both consume the same `LiveSnapshot`. `LiveSnapshot::new`
@@ -148,7 +156,18 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Run. The stop signal ticks after `plan.duration` elapses; the
     // TUI also flips it when the user hits `q` so the dispatcher
     // exits early and records the actual (shorter) duration.
-    let stop = StopSignal::after(plan.duration);
+    //
+    // Multi-threaded dispatch blocks the calling thread on join(),
+    // which prevents compio's reactor from polling. Use `after_wall`
+    // (OS thread + std::thread::sleep) so the timer fires even when
+    // the main thread is blocked. Single-thread mode uses the
+    // original compio-based `after` to avoid an unnecessary OS thread.
+    let multi_threaded = args.threads > 1;
+    let stop = if multi_threaded {
+        StopSignal::after_wall(plan.duration)
+    } else {
+        StopSignal::after(plan.duration)
+    };
 
     // Spawn the TUI task if `--tui` is on. The TUI owns the terminal
     // for the duration of the run; its own loop calls
@@ -185,24 +204,84 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         None
     };
 
-    let stats = if open_loop {
-        run_open_loop::<HttpTransport>(
-            &plan,
-            client,
-            args.connections,
-            stop,
-            live.clone(),
-        )
-        .await
+    let stats = if multi_threaded {
+        // Multi-threaded path: the threaded dispatchers are synchronous
+        // (they spawn OS threads internally and join). When TUI is
+        // enabled, run the dispatcher on a background OS thread so the
+        // main compio runtime can keep polling the TUI task.
+        let plan = std::sync::Arc::new(plan.clone());
+        let target = std::sync::Arc::new(target);
+        let opts = std::sync::Arc::new(opts);
+        let num_threads = args.threads;
+        let connections = args.connections;
+        let stop_for_dispatch = stop.clone();
+        let live_for_dispatch = live.clone();
+
+        // When the TUI or JSONL ticker is active, compio tasks on the
+        // main runtime need to keep being polled. Run the blocking
+        // threaded dispatcher on a background OS thread and poll a
+        // channel, yielding to the main reactor between checks.
+        let needs_reactor = tui_enabled || live.is_some();
+        if needs_reactor {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let stats = if open_loop {
+                    run_open_loop_threaded::<HttpTransport>(
+                        plan, target, opts, num_threads, connections,
+                        stop_for_dispatch, live_for_dispatch,
+                    )
+                } else {
+                    run_saturate_threaded::<HttpTransport>(
+                        plan, target, opts, num_threads, connections,
+                        stop_for_dispatch, live_for_dispatch,
+                    )
+                };
+                let _ = tx.send(stats);
+            });
+            loop {
+                if let Ok(stats) = rx.try_recv() {
+                    break stats;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } else {
+            // No TUI or JSONL ticker: block the main thread directly —
+            // nothing else needs to run on the compio reactor.
+            if open_loop {
+                run_open_loop_threaded::<HttpTransport>(
+                    plan, target, opts, num_threads, connections,
+                    stop, live.clone(),
+                )
+            } else {
+                run_saturate_threaded::<HttpTransport>(
+                    plan, target, opts, num_threads, connections,
+                    stop, live.clone(),
+                )
+            }
+        }
     } else {
-        run_saturate::<HttpTransport>(
-            &plan,
-            client,
-            args.connections,
-            stop,
-            live.clone(),
-        )
-        .await
+        // Single-threaded fast path — original async dispatch with
+        // no thread-spawn overhead.
+        let client = client.expect("client built for single-threaded path");
+        if open_loop {
+            run_open_loop::<HttpTransport>(
+                &plan,
+                client,
+                args.connections,
+                stop,
+                live.clone(),
+            )
+            .await
+        } else {
+            run_saturate::<HttpTransport>(
+                &plan,
+                client,
+                args.connections,
+                stop,
+                live.clone(),
+            )
+            .await
+        }
     };
 
     // Stop the ticker and let it flush its final tick.
@@ -708,13 +787,30 @@ async fn run_script(
     // we open-loop.
     let open_loop = !matches!(plan.scenarios[0].rate, RateProfile::Saturate { .. });
 
-    let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
+    plan.threads = args.threads;
 
-    let stop = StopSignal::after(plan.duration);
-    let stats = if open_loop {
-        run_open_loop::<HttpTransport>(&plan, client, args.connections, stop, None).await
+    let stats = if args.threads > 1 {
+        let plan = std::sync::Arc::new(plan.clone());
+        let target = std::sync::Arc::new(target);
+        let opts = std::sync::Arc::new(opts);
+        let stop = StopSignal::after_wall(plan.duration);
+        if open_loop {
+            run_open_loop_threaded::<HttpTransport>(
+                plan, target, opts, args.threads, args.connections, stop, None,
+            )
+        } else {
+            run_saturate_threaded::<HttpTransport>(
+                plan, target, opts, args.threads, args.connections, stop, None,
+            )
+        }
     } else {
-        run_saturate::<HttpTransport>(&plan, client, args.connections, stop, None).await
+        let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
+        let stop = StopSignal::after(plan.duration);
+        if open_loop {
+            run_open_loop::<HttpTransport>(&plan, client, args.connections, stop, None).await
+        } else {
+            run_saturate::<HttpTransport>(&plan, client, args.connections, stop, None).await
+        }
     };
 
     let summary = Summary::merge(stats, plan.duration);

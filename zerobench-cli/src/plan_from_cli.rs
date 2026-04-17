@@ -167,6 +167,7 @@ fn build_from_url(
         vars,
         duration: args.duration,
         warmup: None,
+        threads: 1,
     };
 
     Ok((plan, target, opts.clone()))
@@ -219,6 +220,7 @@ fn build_from_request_file(
         vars,
         duration: args.duration,
         warmup: None,
+        threads: 1,
     };
 
     Ok((plan, target, opts.clone()))
@@ -320,6 +322,7 @@ fn build_from_request_dir(
         vars,
         duration: args.duration,
         warmup: None,
+        threads: 1,
     };
     Ok((plan, target, opts.clone()))
 }

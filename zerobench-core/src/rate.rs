@@ -341,6 +341,87 @@ async fn run_stepped(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-threaded open-loop dispatcher
+// ---------------------------------------------------------------------------
+
+/// Multi-threaded open-loop dispatcher. Spawns `num_threads` OS threads,
+/// each with its own compio runtime, connection pool, and rate scheduler.
+///
+/// The target rate is split evenly: each thread runs its own schedulers at
+/// `rate / num_threads`. The total rate across all threads sums to the
+/// plan's target. This avoids cross-thread channel coordination (flume's
+/// async `recv` needs the same runtime's reactor).
+///
+/// When `num_threads <= 1`, takes a single-thread fast path with no
+/// thread-spawn overhead.
+pub fn run_open_loop_threaded<T: Transport>(
+    plan: Arc<crate::plan::Plan>,
+    target: Arc<crate::transport::Target>,
+    opts: Arc<crate::transport::TransportOpts>,
+    num_threads: usize,
+    total_connections: usize,
+    stop: StopSignal,
+    live: Option<Arc<LiveSnapshot>>,
+) -> Vec<TaskStats>
+where
+    T::Client: Send + 'static,
+{
+    if num_threads <= 1 {
+        return compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async {
+                let client = T::build_client(&target, &opts)
+                    .await
+                    .expect("build_client");
+                run_open_loop::<T>(&plan, client, total_connections, stop, live).await
+            });
+    }
+
+    let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
+    let scale = 1.0 / num_threads as f64;
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_thread_id| {
+            let plan = plan.clone();
+            let target = target.clone();
+            let opts = opts.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+
+            std::thread::spawn(move || {
+                // Build a per-thread plan with scaled rate profiles so
+                // each thread's schedulers emit rate/num_threads.
+                let mut thread_plan = (*plan).clone();
+                for scenario in &mut thread_plan.scenarios {
+                    scenario.rate = scenario.rate.scale(scale);
+                }
+
+                compio::runtime::Runtime::new()
+                    .expect("compio runtime")
+                    .block_on(async {
+                        let client = T::build_client(&target, &opts)
+                            .await
+                            .expect("build_client");
+                        run_open_loop::<T>(
+                            &thread_plan,
+                            client,
+                            conns_per_thread,
+                            stop,
+                            live,
+                        )
+                        .await
+                    })
+            })
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .flat_map(|h| h.join().expect("worker thread panicked"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Open-loop dispatcher
 // ---------------------------------------------------------------------------
 

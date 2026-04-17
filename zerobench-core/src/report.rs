@@ -592,21 +592,33 @@ fn target_rate_json(plan: &Plan) -> serde_json::Value {
 /// `RateProfile::Constant(r)` rendering once the profile enum lands.
 fn describe_target_rate(plan: &Plan) -> String {
     use crate::plan::RateProfile;
+    let threads = plan.threads;
+    let thread_suffix = if threads > 1 {
+        format!(" ({threads} threads)")
+    } else {
+        String::new()
+    };
     // Pick the first scenario's profile as the "plan rate". Most Phase-C
     // plans are single-scenario; multi-scenario open-loop plans with
     // differing rates render per-scenario below the header.
     match plan.scenarios.first().map(|s| &s.rate) {
-        Some(RateProfile::Constant(r)) => format!("{r:.0} req/s constant"),
+        Some(RateProfile::Constant(r)) => format!("{r:.0} req/s constant{thread_suffix}"),
         Some(RateProfile::Ramp { from, to, over }) => {
-            format!("{:.0} → {:.0} req/s over {}", from, to, format_duration(*over))
+            format!(
+                "{:.0} → {:.0} req/s over {}{}",
+                from,
+                to,
+                format_duration(*over),
+                thread_suffix,
+            )
         }
         Some(RateProfile::Stepped(steps)) => {
-            format!("stepped, {} step(s)", steps.len())
+            format!("stepped, {} step(s){}", steps.len(), thread_suffix)
         }
         Some(RateProfile::Saturate { max_concurrency }) => {
-            format!("saturate ({max_concurrency} tasks)")
+            format!("saturate ({max_concurrency} tasks){thread_suffix}")
         }
-        None => "saturate".into(),
+        None => format!("saturate{thread_suffix}"),
     }
 }
 

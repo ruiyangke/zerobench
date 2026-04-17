@@ -160,6 +160,70 @@ pub async fn run_saturate<T: Transport>(
 }
 
 // ---------------------------------------------------------------------------
+// Public API — multi-threaded saturate dispatcher
+// ---------------------------------------------------------------------------
+
+/// Multi-threaded saturate dispatcher. Spawns `num_threads` OS threads,
+/// each with its own compio runtime and connection pool. Each thread
+/// runs `conns_per_thread` concurrent worker tasks. Stats are collected
+/// per-thread and returned as a flat `Vec` for merging.
+///
+/// When `num_threads <= 1`, takes a single-thread fast path with no
+/// thread-spawn overhead.
+pub fn run_saturate_threaded<T: Transport>(
+    plan: Arc<Plan>,
+    target: Arc<crate::transport::Target>,
+    opts: Arc<crate::transport::TransportOpts>,
+    num_threads: usize,
+    total_connections: usize,
+    stop: StopSignal,
+    live: Option<Arc<LiveSnapshot>>,
+) -> Vec<TaskStats>
+where
+    T::Client: Send + 'static,
+{
+    if num_threads <= 1 {
+        return compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async {
+                let client = T::build_client(&target, &opts)
+                    .await
+                    .expect("build_client");
+                run_saturate::<T>(&plan, client, total_connections, stop, live).await
+            });
+    }
+
+    let conns_per_thread = (total_connections + num_threads - 1) / num_threads;
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_thread_id| {
+            let plan = plan.clone();
+            let target = target.clone();
+            let opts = opts.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+
+            std::thread::spawn(move || {
+                // TODO: CPU pinning (requires unsafe, denied by workspace lint).
+                compio::runtime::Runtime::new()
+                    .expect("compio runtime")
+                    .block_on(async {
+                        let client = T::build_client(&target, &opts)
+                            .await
+                            .expect("build_client");
+                        run_saturate::<T>(&plan, client, conns_per_thread, stop, live).await
+                    })
+            })
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .flat_map(|h| h.join().expect("worker thread panicked"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Worker — saturate mode
 // ---------------------------------------------------------------------------
 

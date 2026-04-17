@@ -258,6 +258,7 @@ fn finalize_state(
         vars: state.vars,
         duration,
         warmup: state.warmup,
+        threads: 1,
     };
     Ok((plan, state.transport))
 }

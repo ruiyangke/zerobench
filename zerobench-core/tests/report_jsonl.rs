@@ -106,6 +106,7 @@ fn make_summary_and_plan() -> (Summary, Plan) {
         vars,
         duration: Duration::from_secs(30),
         warmup: None,
+        threads: 1,
     };
     (summary, plan)
 }

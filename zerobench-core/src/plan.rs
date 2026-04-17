@@ -37,6 +37,14 @@ pub struct Plan {
     pub duration: Duration,
     /// Optional warmup phase — requests are fired but stats discarded.
     pub warmup: Option<Duration>,
+    /// Number of OS worker threads used for this run. Informational —
+    /// consumed by the terminal reporter's header line. Default 1.
+    #[serde(default = "default_threads")]
+    pub threads: usize,
+}
+
+fn default_threads() -> usize {
+    1
 }
 
 impl Plan {
@@ -47,6 +55,7 @@ impl Plan {
             vars: VarRegistry::new(),
             duration: Duration::from_secs(30),
             warmup: None,
+            threads: 1,
         }
     }
 }
@@ -117,6 +126,30 @@ pub enum RateProfile {
         /// Number of concurrent worker tasks.
         max_concurrency: usize,
     },
+}
+
+impl RateProfile {
+    /// Return a new profile with all rates multiplied by `factor`.
+    ///
+    /// Used by the multi-threaded open-loop dispatcher to split the
+    /// target rate evenly across threads (each thread runs at
+    /// `rate / num_threads`).
+    pub fn scale(&self, factor: f64) -> Self {
+        match self {
+            Self::Constant(rps) => Self::Constant(rps * factor),
+            Self::Ramp { from, to, over } => Self::Ramp {
+                from: from * factor,
+                to: to * factor,
+                over: *over,
+            },
+            Self::Stepped(steps) => Self::Stepped(
+                steps.iter().map(|(d, r)| (*d, r * factor)).collect(),
+            ),
+            Self::Saturate { max_concurrency } => Self::Saturate {
+                max_concurrency: ((*max_concurrency as f64 * factor).ceil() as usize).max(1),
+            },
+        }
+    }
 }
 
 /// One unit of work inside a scenario iteration.
@@ -251,6 +284,79 @@ mod http_serde {
         pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HeaderName, D::Error> {
             let s = <String>::deserialize(d)?;
             HeaderName::from_bytes(s.as_bytes()).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_constant() {
+        let p = RateProfile::Constant(1000.0);
+        match p.scale(0.25) {
+            RateProfile::Constant(r) => assert!((r - 250.0).abs() < 1e-9),
+            other => panic!("expected Constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scale_ramp() {
+        let p = RateProfile::Ramp {
+            from: 100.0,
+            to: 1000.0,
+            over: Duration::from_secs(10),
+        };
+        match p.scale(0.5) {
+            RateProfile::Ramp { from, to, over } => {
+                assert!((from - 50.0).abs() < 1e-9);
+                assert!((to - 500.0).abs() < 1e-9);
+                assert_eq!(over, Duration::from_secs(10));
+            }
+            other => panic!("expected Ramp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scale_stepped() {
+        let p = RateProfile::Stepped(vec![
+            (Duration::from_secs(0), 100.0),
+            (Duration::from_secs(5), 500.0),
+        ]);
+        match p.scale(0.25) {
+            RateProfile::Stepped(steps) => {
+                assert_eq!(steps.len(), 2);
+                assert!((steps[0].1 - 25.0).abs() < 1e-9);
+                assert!((steps[1].1 - 125.0).abs() < 1e-9);
+                // Durations are preserved.
+                assert_eq!(steps[0].0, Duration::from_secs(0));
+                assert_eq!(steps[1].0, Duration::from_secs(5));
+            }
+            other => panic!("expected Stepped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scale_saturate() {
+        let p = RateProfile::Saturate { max_concurrency: 100 };
+        match p.scale(0.25) {
+            RateProfile::Saturate { max_concurrency } => {
+                assert_eq!(max_concurrency, 25);
+            }
+            other => panic!("expected Saturate, got {other:?}"),
+        }
+        // Minimum 1.
+        let p2 = RateProfile::Saturate { max_concurrency: 1 };
+        match p2.scale(0.01) {
+            RateProfile::Saturate { max_concurrency } => {
+                assert_eq!(max_concurrency, 1);
+            }
+            other => panic!("expected Saturate, got {other:?}"),
         }
     }
 }

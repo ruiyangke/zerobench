@@ -125,6 +125,7 @@ fn construct_full_plan_and_read_fields_back() {
         vars,
         duration: Duration::from_secs(30),
         warmup: Some(Duration::from_secs(2)),
+        threads: 1,
     };
 
     assert_eq!(plan.scenarios.len(), 1);
@@ -166,6 +167,7 @@ fn plan_is_clone_for_sharing_across_threads() {
         vars,
         duration: Duration::from_secs(1),
         warmup: None,
+        threads: 1,
     };
 
     let cloned = plan.clone();
@@ -256,6 +258,7 @@ fn plan_roundtrips_through_serde_json() {
         vars,
         duration: Duration::from_secs(30),
         warmup: Some(Duration::from_secs(2)),
+        threads: 1,
     };
 
     let json = serde_json::to_string(&original).expect("Plan serialization must succeed");

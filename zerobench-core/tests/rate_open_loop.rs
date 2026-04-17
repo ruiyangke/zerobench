@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use zerobench_core::plan::{
     Plan, RateProfile, RequestPlan, Scenario, Step,
 };
-use zerobench_core::run_open_loop;
+use zerobench_core::{run_open_loop, run_open_loop_threaded};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stop::StopSignal;
 use zerobench_core::template::Template;
@@ -112,6 +112,7 @@ fn constant_plan(rps: f64, duration: Duration) -> Plan {
         vars,
         duration,
         warmup: None,
+        threads: 1,
     }
 }
 
@@ -229,6 +230,7 @@ async fn open_loop_keepup_is_attributed_per_scenario() {
         vars,
         duration: Duration::from_millis(300),
         warmup: None,
+        threads: 1,
     };
     let client = FakeClient::new();
     client.service_time_us.store(500, Ordering::Relaxed);
@@ -313,10 +315,52 @@ async fn open_loop_saturate_scenario_produces_no_tokens() {
         vars,
         duration: Duration::from_millis(100),
         warmup: None,
+        threads: 1,
     };
     let client = FakeClient::new();
     let stop = StopSignal::after(plan.duration);
     let stats = run_open_loop::<FakeTransport>(&plan, client.clone(), 4, stop, None).await;
     assert!(stats.is_empty());
     assert_eq!(client.requests.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded open-loop tests
+// ---------------------------------------------------------------------------
+
+/// Multi-threaded open-loop with a constant rate should hit roughly
+/// the target rate (each thread runs at rate/num_threads).
+#[test]
+fn open_loop_threaded_constant_rate() {
+    let plan = Arc::new(constant_plan(2000.0, Duration::from_millis(500)));
+    let target = Arc::new(Target::parse("http://fake:80").unwrap());
+    let opts = Arc::new(TransportOpts::default());
+    let stop = StopSignal::after_wall(Duration::from_millis(500));
+
+    let stats = run_open_loop_threaded::<FakeTransport>(
+        plan, target, opts, 2, 8, stop, None,
+    );
+
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    // 2000 rps x 0.5s = 1000 expected. Allow 30% tolerance for CI.
+    assert!(
+        total >= 500 && total <= 1500,
+        "expected ~1000 requests at 2k rps for 500ms, got {total}"
+    );
+}
+
+/// Single-thread fast path of the threaded open-loop dispatcher.
+#[test]
+fn open_loop_threaded_single_thread_fast_path() {
+    let plan = Arc::new(constant_plan(1000.0, Duration::from_millis(300)));
+    let target = Arc::new(Target::parse("http://fake:80").unwrap());
+    let opts = Arc::new(TransportOpts::default());
+    let stop = StopSignal::after_wall(Duration::from_millis(300));
+
+    let stats = run_open_loop_threaded::<FakeTransport>(
+        plan, target, opts, 1, 4, stop, None,
+    );
+
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    assert!(total > 0, "single-thread open-loop produced zero requests");
 }

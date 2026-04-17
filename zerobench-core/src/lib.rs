@@ -18,12 +18,12 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
-pub use dispatcher::run_saturate;
+pub use dispatcher::{run_saturate, run_saturate_threaded};
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use plan::{
     Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
-pub use rate::{run_open_loop, run_scheduler, KeepupCounter, Token};
+pub use rate::{run_open_loop, run_open_loop_threaded, run_scheduler, KeepupCounter, Token};
 pub use report::{
     print_json, print_jsonl_tick, print_prometheus, print_terminal, ColorChoice,
 };
