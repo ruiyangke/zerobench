@@ -81,6 +81,9 @@ yansi = "1"
 # Async channels (for open-loop scheduler/worker coordination)
 flume = { version = "0.12", default-features = false, features = ["async"] }
 
+# Fast integer formatting
+itoa = "1"
+
 # Allocator
 mimalloc = { version = "0.1", default-features = false }
 

@@ -29,6 +29,11 @@ pub mod conn_tokio;
 #[cfg(all(feature = "h1", feature = "runtime-tokio"))]
 pub mod h1_tokio;
 
+// --- Raw H1 backend (opt-in, no hyper) ---
+#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
+#[allow(unsafe_code)]
+pub mod raw_h1;
+
 // --- Transport dispatch (works on either backend) ---
 #[cfg(feature = "h1")]
 mod transport_impl;
@@ -47,8 +52,14 @@ pub use h2::Http2Client;
 #[cfg(all(feature = "h1", feature = "runtime-tokio"))]
 pub use h1_tokio::Http1PoolTokio;
 
+// --- Re-exports: raw H1 backend ---
+#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
+pub use raw_h1::{RawH1Handle, RawH1Pool};
+
 // --- Re-exports: transport dispatch ---
 #[cfg(feature = "h1")]
 pub use transport_impl::HttpTransport;
 #[cfg(all(feature = "h1", feature = "runtime-compio"))]
 pub use transport_impl::HttpClient;
+#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
+pub use transport_impl::RawH1Transport;

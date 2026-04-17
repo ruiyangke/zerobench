@@ -13,6 +13,7 @@ default = ["h1", "runtime-compio"]
 h1 = []
 h2 = ["hyper/http2"]
 h3 = []   # placeholder — wires h3 + compio-quic in Phase 8
+raw-h1 = ["dep:httparse", "dep:itoa"]
 runtime-compio = ["dep:compio", "dep:compio-tls", "dep:cyper-core", "zerobench-core/runtime-compio"]
 runtime-tokio = ["dep:tokio", "dep:tokio-rustls", "dep:hyper-util", "zerobench-core/runtime-tokio"]
 
@@ -28,6 +29,10 @@ bytes = { workspace = true }
 compio = { workspace = true, optional = true }
 compio-tls = { workspace = true, optional = true }
 cyper-core = { workspace = true, optional = true }
+
+# Raw H1 backend (opt-in)
+httparse = { workspace = true, optional = true }
+itoa = { workspace = true, optional = true }
 
 # Tokio backend (opt-in)
 tokio = { workspace = true, optional = true }

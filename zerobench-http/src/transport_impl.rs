@@ -204,6 +204,36 @@ async fn build_h2(
     ))
 }
 
+// =========================================================================
+// Raw H1 transport (opt-in, no hyper)
+// =========================================================================
+
+/// Zero-sized type that carries the [`Transport`] impl for the raw
+/// HTTP/1.1 client (httparse + compio, no hyper). Selected via `--raw`.
+#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
+pub struct RawH1Transport;
+
+#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
+impl Transport for RawH1Transport {
+    type Client = crate::raw_h1::RawH1Handle;
+
+    async fn build_client(
+        target: &Target,
+        opts: &TransportOpts,
+    ) -> Result<Self::Client, TransportError> {
+        let pool = crate::raw_h1::RawH1Pool::new(target, opts).await?;
+        Ok(crate::raw_h1::RawH1Handle(Arc::new(pool)))
+    }
+
+    async fn exchange(
+        client: &Self::Client,
+        plan: &RequestPlan,
+        ctx: &mut ScenarioContext,
+    ) -> Result<Response, TransportError> {
+        client.exchange(plan, ctx).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

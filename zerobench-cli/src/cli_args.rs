@@ -214,6 +214,16 @@ pub struct CliArgs {
     #[arg(long = "ws", action = ArgAction::SetTrue)]
     pub ws: bool,
 
+    /// Use raw HTTP/1.1 client (httparse + compio, no hyper).
+    ///
+    /// Maximum throughput but no HTTP/2 support and no TLS. Response
+    /// headers are not parsed into a `HeaderMap`, so extracts that
+    /// depend on response headers will not work. Only available when
+    /// the binary was built with `--features raw-h1`.
+    #[cfg(feature = "raw-h1")]
+    #[arg(long = "raw", action = ArgAction::SetTrue)]
+    pub raw: bool,
+
     /// Text payload to send on each WebSocket iteration. Defaults to
     /// `"ping"`. Only visible when the binary was built with `ws`.
     ///

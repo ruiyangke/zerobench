@@ -145,6 +145,17 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return run_sse(&args, &plan, &target, &opts).await;
     }
 
+    // Raw H1 transport — separate dispatch path using RawH1Transport
+    // instead of the hyper-based HttpTransport. Same engine, different
+    // wire implementation.
+    #[cfg(feature = "raw-h1")]
+    if args.raw {
+        return run_with_transport::<zerobench_http::RawH1Transport>(
+            &args, plan, target, opts, open_loop, tui_enabled,
+        )
+        .await;
+    }
+
     // Stand up the transport client for the single-threaded path.
     // Multi-threaded dispatch builds per-thread clients inside each
     // worker thread (each thread needs its own compio runtime to own
@@ -522,6 +533,179 @@ fn build_transport_info(
         protocol,
         tls: target.tls,
         alpn,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic transport dispatch — used by --raw (and potentially future
+// alternative transports) to avoid duplicating the full run() body.
+// ---------------------------------------------------------------------------
+
+/// Run a benchmark with an arbitrary [`Transport`] impl.
+///
+/// Handles single-threaded and multi-threaded dispatch, JSONL streaming,
+/// TUI dashboard, and the full render / exit-code path. This is the
+/// generic counterpart to the `HttpTransport`-hardcoded code in `run()`.
+#[cfg(feature = "raw-h1")]
+async fn run_with_transport<T: Transport>(
+    args: &CliArgs,
+    mut plan: zerobench_core::plan::Plan,
+    target: zerobench_core::transport::Target,
+    opts: zerobench_core::transport::TransportOpts,
+    open_loop: bool,
+    tui_enabled: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    plan.threads = args.threads;
+
+    let client = if args.threads <= 1 {
+        Some(T::build_client(&target, &opts).await?)
+    } else {
+        None
+    };
+
+    let live = if matches!(args.format, CliFormat::Jsonl) || tui_enabled {
+        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
+    } else {
+        None
+    };
+
+    let ticker_stop = StopSignal::new();
+
+    #[cfg(feature = "runtime-compio")]
+    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
+        let live = live.clone();
+        let stop = ticker_stop.clone();
+        Some(compio::runtime::spawn(
+            async move { jsonl_ticker(live, stop).await },
+        ))
+    } else {
+        None
+    };
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    let ticker_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    let multi_threaded = args.threads > 1;
+    #[cfg(feature = "runtime-compio")]
+    let stop = if multi_threaded {
+        StopSignal::after_wall(plan.duration)
+    } else {
+        StopSignal::after(plan.duration)
+    };
+    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    let stop = if multi_threaded {
+        StopSignal::after_wall(plan.duration)
+    } else {
+        StopSignal::after(plan.duration)
+    };
+
+    // TUI is not supported with --raw in v1 — the raw transport is a
+    // max-throughput mode; TUI overhead is unwanted. We skip the TUI
+    // spawn here. If --tui was also passed, the dashboard just doesn't
+    // appear (the terminal report at the end still prints).
+    let stats = if multi_threaded {
+        let plan = std::sync::Arc::new(plan.clone());
+        let target = std::sync::Arc::new(target.clone());
+        let opts = std::sync::Arc::new(opts);
+        let num_threads = args.threads;
+        let connections = args.connections;
+        let stop_for_dispatch = stop.clone();
+        let live_for_dispatch = live.clone();
+
+        let needs_reactor = live.is_some();
+        if needs_reactor {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let stats = if open_loop {
+                    run_open_loop_threaded::<T>(
+                        plan, target, opts, num_threads, connections,
+                        stop_for_dispatch, live_for_dispatch,
+                    )
+                } else {
+                    run_saturate_threaded::<T>(
+                        plan, target, opts, num_threads, connections,
+                        stop_for_dispatch, live_for_dispatch,
+                    )
+                };
+                let _ = tx.send(stats);
+            });
+            loop {
+                if let Ok(stats) = rx.try_recv() {
+                    break stats;
+                }
+                zerobench_core::runtime::runtime_sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } else {
+            if open_loop {
+                run_open_loop_threaded::<T>(
+                    plan, target.into(), opts, num_threads, connections,
+                    stop, live.clone(),
+                )
+            } else {
+                run_saturate_threaded::<T>(
+                    plan, target.into(), opts, num_threads, connections,
+                    stop, live.clone(),
+                )
+            }
+        }
+    } else {
+        let client = client.expect("client built for single-threaded path");
+        if open_loop {
+            run_open_loop::<T>(
+                &plan, client, args.connections, stop, live.clone(),
+            )
+            .await
+        } else {
+            run_saturate::<T>(
+                &plan, client, args.connections, stop, live.clone(),
+            )
+            .await
+        }
+    };
+
+    ticker_stop.stop();
+    if let Some(h) = ticker_handle {
+        let _ = h.await;
+    }
+
+    let summary = Summary::merge(stats, plan.duration);
+
+    let color = match args.color {
+        CliColor::Always => ColorChoice::Always,
+        CliColor::Auto => ColorChoice::Auto,
+        CliColor::Never => ColorChoice::Never,
+    };
+    match args.format {
+        CliFormat::Terminal => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            print_json(&summary, &plan, &mut out)?;
+        }
+        CliFormat::Jsonl => {
+            let stderr = std::io::stderr();
+            let is_tty = stderr.is_terminal();
+            let mut out = stderr.lock();
+            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+        }
+        CliFormat::Prom => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
+        }
+    }
+
+    let total_errors = summary.errors.total();
+    if total_errors > 0 {
+        Ok(ExitCode::from(1))
+    } else if summary.requests == 0 {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
 }
 
