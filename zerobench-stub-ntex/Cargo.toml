@@ -1,0 +1,23 @@
+[package]
+name = "zerobench-stub-ntex"
+description = "ntex-based stub server for benchmarking zerobench (compio/io_uring)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "zerobench-stub-ntex"
+path = "src/main.rs"
+
+[dependencies]
+ntex = { version = "3", features = ["compio"] }
+ntex-compio = "3"
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
