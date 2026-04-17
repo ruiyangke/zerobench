@@ -186,6 +186,7 @@ fn mio_h2_worker_records_requests() {
         &stop,
         plan.scenarios.len(),
         None, // saturate mode
+        None, // no TLS
     );
 
     assert!(
@@ -209,6 +210,7 @@ fn mio_h2_threaded_records_requests() {
         10, // 10 total streams
         plan.duration,
         None, // saturate mode
+        None, // no TLS
     );
 
     assert_eq!(all_stats.len(), 2, "expected 2 thread stats");
@@ -219,30 +221,174 @@ fn mio_h2_threaded_records_requests() {
     );
 }
 
+/// Passing an HTTPS target no longer panics -- TLS is supported.
+/// Connecting to a non-existent TLS server produces connect errors.
 #[test]
-fn mio_h2_rejects_tls_target() {
-    let result = std::panic::catch_unwind(|| {
-        let target = Target::parse("https://127.0.0.1:443").unwrap();
-        let mut vars = VarRegistry::new();
-        let url = Template::compile("https://127.0.0.1:443/bench", &mut vars).unwrap();
-        let req = RequestPlan::get(url);
-        let scenario = Scenario {
-            name: "tls".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: 1,
-            },
-            steps: vec![Step::Request(req)],
-        };
-        let plan = Plan {
-            scenarios: vec![scenario],
-            vars,
-            duration: Duration::from_secs(1),
-            warmup: None,
-            threads: 1,
-        };
-        zerobench_http::mio_h2::run_mio_h2_threaded(
-            &target, &plan, 1, 1, Duration::from_secs(1), None,
-        );
+fn mio_h2_https_without_server_records_connect_errors() {
+    let target = Target::parse("https://127.0.0.1:19443").unwrap();
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("https://127.0.0.1:19443/bench", &mut vars).unwrap();
+    let req = RequestPlan::get(url);
+    let scenario = Scenario {
+        name: "tls".into(),
+        rate: RateProfile::Saturate {
+            max_concurrency: 1,
+        },
+        steps: vec![Step::Request(req)],
+    };
+    let plan = Plan {
+        scenarios: vec![scenario],
+        vars,
+        duration: Duration::from_secs(1),
+        warmup: None,
+        threads: 1,
+    };
+    let opts = zerobench_core::transport::TransportOpts {
+        insecure_tls: true,
+        ..Default::default()
+    };
+    let tls_config = Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"h2"]));
+    let stats = zerobench_http::mio_h2::run_mio_h2_threaded(
+        &target, &plan, 1, 1, Duration::from_secs(1), None, tls_config,
+    );
+    // No panic -- graceful handling.
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    let total_errors: u64 = stats.iter().map(|s| s.errors.total()).sum();
+    assert!(total > 0 || total_errors > 0, "expected connect attempts");
+}
+
+// ---------------------------------------------------------------------------
+// TLS smoke tests
+// ---------------------------------------------------------------------------
+
+/// Spawn a tokio-based H2+TLS server with a self-signed certificate.
+fn spawn_h2_tls_server(body: &'static [u8]) -> SocketAddr {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::ServerConfig;
+
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("self-signed cert");
+    let cert_der: CertificateDer<'static> = cert.into();
+    let key_der: PrivatePkcs8KeyDer<'static> =
+        PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
+        .expect("server config");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let config = Arc::new(config);
+
+    let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                stream.set_nodelay(true).ok();
+                let acceptor = acceptor.clone();
+
+                tokio::task::spawn_local(async move {
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let io = TokioIo::new(tls_stream);
+
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let body = body;
+                        async move {
+                            Ok::<_, Infallible>(Response::new(Full::new(
+                                Bytes::from_static(body),
+                            )))
+                        }
+                    });
+                    let _ = http2::Builder::new(TokioExec)
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
     });
-    assert!(result.is_err(), "expected panic for TLS target");
+
+    let addr = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    addr
+}
+
+#[test]
+fn mio_h2_tls_with_alpn() {
+    let addr = spawn_h2_tls_server(b"h2-tls-ok");
+
+    let mut vars = VarRegistry::new();
+    let url = Template::compile(&format!("https://127.0.0.1:{}/bench", addr.port()), &mut vars)
+        .unwrap();
+    let req = RequestPlan::get(url);
+    let scenario = Scenario {
+        name: "mio-h2-tls-smoke".into(),
+        rate: RateProfile::Saturate { max_concurrency: 10 },
+        steps: vec![Step::Request(req)],
+    };
+    let plan = Plan {
+        scenarios: vec![scenario],
+        vars,
+        duration: Duration::from_secs(2),
+        warmup: None,
+        threads: 1,
+    };
+    let mut target = Target::parse(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
+    target.sni = Some("localhost".into());
+
+    let request = build_request(&plan, &target);
+
+    // Build TLS config with insecure verifier + ALPN h2.
+    let opts = zerobench_core::transport::TransportOpts {
+        insecure_tls: true,
+        ..Default::default()
+    };
+    let tls_config = Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"h2"]));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ws = stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        ws.store(true, Ordering::Relaxed);
+    });
+
+    let stats = zerobench_http::mio_h2::run_mio_h2_worker(
+        &target,
+        &request,
+        10, // 10 concurrent streams
+        &stop,
+        plan.scenarios.len(),
+        None, // saturate mode
+        tls_config,
+    );
+
+    assert!(
+        stats.requests > 0,
+        "expected at least some H2+TLS requests, got {} (errors: connect={}, read={}, write={})",
+        stats.requests, stats.errors.connect, stats.errors.read, stats.errors.write,
+    );
 }

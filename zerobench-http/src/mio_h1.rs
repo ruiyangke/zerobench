@@ -29,10 +29,16 @@
 //!   from `intended_start` (when the token was generated), not from the
 //!   actual write — this is coordinated-omission-free measurement.
 //!
-//! # Limitations
+//! # TLS support
 //!
-//! - **No TLS**: mio mode only supports `http://` targets. Pass an `https://`
-//!   URL and it will panic at startup with a clear message.
+//! When the target is `https://`, connections are wrapped in a
+//! [`MioTlsStream`](super::mio_tls::MioTlsStream) backed by `rustls`.
+//! The TLS handshake is driven to completion via mio poll events before
+//! the request loop starts. The `--insecure` flag disables certificate
+//! verification (self-signed, expired, hostname mismatch).
+//!
+//! # Other limitations
+//!
 //! - **No per-request template expansion**: request bytes are pre-built once
 //!   at startup. `{{uuid}}` gets one UUID for the entire run. This is the
 //!   same trade-off `wrk` makes — fixed wire bytes for maximum throughput.
@@ -46,11 +52,13 @@ use std::time::{Duration, Instant};
 
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
+use rustls::ClientConfig;
 
 use zerobench_core::plan::{Plan, Step};
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::Target;
 
+use super::mio_tls::{MioStream, MioTlsStream};
 use super::raw_h1_common::{find_connection_close, find_content_length_raw};
 
 /// Find the end of HTTP headers (`\r\n\r\n`). Returns the byte offset
@@ -67,7 +75,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 /// State machine for a single HTTP/1.1 keep-alive connection.
 struct Conn {
-    stream: TcpStream,
+    stream: MioStream,
     state: ConnState,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
@@ -108,7 +116,7 @@ enum ConnState {
 }
 
 impl Conn {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: MioStream) -> Self {
         let now = Instant::now();
         Self {
             stream,
@@ -282,6 +290,7 @@ pub fn run_mio_worker(
     stop: &AtomicBool,
     num_scenarios: usize,
     target_rps: Option<f64>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> TaskStats {
     let addr: SocketAddr = target.addr().parse().expect("valid socket address");
     let mut poll = Poll::new().expect("mio::Poll::new");
@@ -295,24 +304,59 @@ pub fn run_mio_worker(
     // Pre-allocate idle list with capacity; filled below for open-loop.
     let mut idle_conns: Vec<usize> = Vec::with_capacity(num_conns);
 
+    let sni_name = target.sni_name().to_string();
+
     // Open connections and register with mio.
     let mut connections: Vec<Conn> = Vec::with_capacity(num_conns);
     for i in 0..num_conns {
-        let mut stream = match TcpStream::connect(addr) {
+        let mut tcp = match TcpStream::connect(addr) {
             Ok(s) => s,
             Err(_) => {
                 stats.record_error(0, ErrorKind::Connect);
                 continue;
             }
         };
-        stream.set_nodelay(true).ok();
+        tcp.set_nodelay(true).ok();
+
+        // Register the raw TCP stream with mio first (needed for both
+        // plain and TLS paths — mio watches the socket fd, not the
+        // TLS wrapper).
         poll.registry()
             .register(
-                &mut stream,
+                &mut tcp,
                 Token(i),
                 Interest::READABLE | Interest::WRITABLE,
             )
             .expect("mio register");
+
+        let stream = if let Some(ref config) = tls_config {
+            let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), &sni_name) {
+                Ok(s) => s,
+                Err(_) => {
+                    stats.record_error(0, ErrorKind::Connect);
+                    continue;
+                }
+            };
+            // Drive the TLS handshake to completion using mio poll events.
+            if let Err(_) = tls_stream.complete_handshake(&mut poll, Token(i)) {
+                stats.record_error(0, ErrorKind::Connect);
+                continue;
+            }
+            // Re-register after handshake: mio uses edge-triggered epoll
+            // (EPOLLET), so events consumed during the handshake won't
+            // re-fire. Reregister forces fresh notification delivery.
+            poll.registry()
+                .reregister(
+                    tls_stream.tcp_stream_mut(),
+                    Token(i),
+                    Interest::READABLE | Interest::WRITABLE,
+                )
+                .expect("mio reregister after TLS handshake");
+            MioStream::Tls(tls_stream)
+        } else {
+            MioStream::Plain(tcp)
+        };
+
         let conn = Conn::new(stream);
         connections.push(conn);
     }
@@ -435,7 +479,10 @@ pub fn run_mio_worker(
                             }
                         }
                     }
-                    _ => {} // spurious writable while reading, or idle in open-loop — ignore
+                    // For TLS, writable events while reading are NOT
+                    // spurious — pending encrypted output needs to be
+                    // flushed before the server can respond.
+                    _ => conn.stream.flush_tls(),
                 }
             }
 
@@ -530,12 +577,8 @@ pub fn run_mio_threaded(
     total_conns: usize,
     duration: Duration,
     target_rps: Option<f64>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> Vec<TaskStats> {
-    assert!(
-        !target.tls,
-        "mio-h1 mode does not support TLS (https://). Use http:// or remove --mio."
-    );
-
     let request_bytes = build_static_request(plan, target);
     let stop = Arc::new(AtomicBool::new(false));
     let conns_per_thread = total_conns.div_ceil(num_threads);
@@ -555,6 +598,7 @@ pub fn run_mio_threaded(
             let request_bytes = request_bytes.clone();
             let stop = stop.clone();
             let num_scenarios = plan.scenarios.len();
+            let tls_config = tls_config.clone();
 
             std::thread::spawn(move || {
                 run_mio_worker(
@@ -564,6 +608,7 @@ pub fn run_mio_threaded(
                     &stop,
                     num_scenarios,
                     per_thread_rps,
+                    tls_config,
                 )
             })
         })

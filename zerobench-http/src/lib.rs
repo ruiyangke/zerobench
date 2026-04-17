@@ -38,6 +38,10 @@ pub mod raw_h1;
 #[cfg(all(feature = "raw-h1", feature = "runtime-tokio"))]
 pub mod raw_h1_tokio;
 
+// --- Mio TLS wrapper (shared by mio-h1 and mio-h2) ---
+#[cfg(feature = "mio-h1")]
+pub mod mio_tls;
+
 // --- Mio H1 backend (opt-in, synchronous epoll, no async runtime) ---
 #[cfg(feature = "mio-h1")]
 pub mod mio_h1;

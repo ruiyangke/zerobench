@@ -270,7 +270,7 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // thread runs its own mio::Poll in a synchronous event loop.
     #[cfg(feature = "mio-h1")]
     if args.mio {
-        return run_mio(&args, plan, target).await;
+        return run_mio(&args, plan, target, &opts).await;
     }
 
     // Stand up the transport client for the single-threaded path.
@@ -859,16 +859,20 @@ fn run_mio_sync(
         }
     }
 
-    let (mut plan, target, _opts) = plan_from_cli::build(args)?;
+    let (mut plan, target, opts) = plan_from_cli::build(args)?;
     plan.threads = args.threads;
-
-    if target.tls {
-        return Err("--mio does not support TLS (https://). Use http:// or remove --mio.".into());
-    }
 
     let num_threads = args.threads.max(1);
 
     let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+
+    // Build TLS config when targeting https://.
+    let tls_config = if target.tls {
+        let alpn: &[&[u8]] = if use_h2 { &[b"h2"] } else { &[b"http/1.1"] };
+        Some(zerobench_http::mio_tls::build_tls_config(&opts, alpn))
+    } else {
+        None
+    };
 
     let stats = if use_h2 {
         #[cfg(feature = "mio-h2")]
@@ -880,6 +884,7 @@ fn run_mio_sync(
                 args.connections,
                 plan.duration,
                 args.rate,
+                tls_config,
             )
         }
         #[cfg(not(feature = "mio-h2"))]
@@ -895,6 +900,7 @@ fn run_mio_sync(
             args.connections,
             plan.duration,
             args.rate,
+            tls_config,
         )
     };
 
@@ -950,15 +956,20 @@ async fn run_mio(
     args: &CliArgs,
     mut plan: zerobench_core::plan::Plan,
     target: zerobench_core::transport::Target,
+    opts: &zerobench_core::transport::TransportOpts,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if target.tls {
-        return Err("--mio does not support TLS (https://). Use http:// or remove --mio.".into());
-    }
-
     plan.threads = args.threads;
     let num_threads = args.threads.max(1);
 
     let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+
+    // Build TLS config when targeting https://.
+    let tls_config = if target.tls {
+        let alpn: &[&[u8]] = if use_h2 { &[b"h2"] } else { &[b"http/1.1"] };
+        Some(zerobench_http::mio_tls::build_tls_config(opts, alpn))
+    } else {
+        None
+    };
 
     let stats = if use_h2 {
         #[cfg(feature = "mio-h2")]
@@ -970,6 +981,7 @@ async fn run_mio(
                 args.connections,
                 plan.duration,
                 args.rate,
+                tls_config,
             )
         }
         #[cfg(not(feature = "mio-h2"))]
@@ -985,6 +997,7 @@ async fn run_mio(
             args.connections,
             plan.duration,
             args.rate,
+            tls_config,
         )
     };
 

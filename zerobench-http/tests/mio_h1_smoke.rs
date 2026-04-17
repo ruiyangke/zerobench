@@ -152,6 +152,7 @@ fn mio_worker_records_requests() {
         &worker_stop,
         plan.scenarios.len(),
         None, // saturate mode
+        None, // no TLS
     );
 
     // Stop the server.
@@ -189,6 +190,7 @@ fn mio_threaded_records_requests() {
         8,  // 8 total connections
         plan.duration,
         None, // saturate mode
+        None, // no TLS
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -201,30 +203,43 @@ fn mio_threaded_records_requests() {
     );
 }
 
+/// Passing an HTTPS target no longer panics -- TLS is supported. But
+/// connecting to a non-existent TLS server produces connect errors (no
+/// panic, graceful stats).
 #[test]
-fn mio_rejects_tls_target() {
-    let result = std::panic::catch_unwind(|| {
-        let target = Target::parse("https://127.0.0.1:443").unwrap();
-        let mut vars = VarRegistry::new();
-        let url = Template::compile("https://127.0.0.1:443/bench", &mut vars).unwrap();
-        let req = RequestPlan::get(url);
-        let scenario = Scenario {
-            name: "tls".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: 1,
-            },
-            steps: vec![Step::Request(req)],
-        };
-        let plan = Plan {
-            scenarios: vec![scenario],
-            vars,
-            duration: Duration::from_secs(1),
-            warmup: None,
-            threads: 1,
-        };
-        zerobench_http::mio_h1::run_mio_threaded(&target, &plan, 1, 1, Duration::from_secs(1), None);
-    });
-    assert!(result.is_err(), "expected panic for TLS target");
+fn mio_https_without_server_records_connect_errors() {
+    let target = Target::parse("https://127.0.0.1:19443").unwrap();
+    let mut vars = VarRegistry::new();
+    let url = Template::compile("https://127.0.0.1:19443/bench", &mut vars).unwrap();
+    let req = RequestPlan::get(url);
+    let scenario = Scenario {
+        name: "tls".into(),
+        rate: RateProfile::Saturate {
+            max_concurrency: 1,
+        },
+        steps: vec![Step::Request(req)],
+    };
+    let plan = Plan {
+        scenarios: vec![scenario],
+        vars,
+        duration: Duration::from_secs(1),
+        warmup: None,
+        threads: 1,
+    };
+    // With TLS config but no server -- should not panic, just record errors.
+    let opts = zerobench_core::transport::TransportOpts {
+        insecure_tls: true,
+        ..Default::default()
+    };
+    let tls_config = Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]));
+    let stats = zerobench_http::mio_h1::run_mio_threaded(
+        &target, &plan, 1, 1, Duration::from_secs(1), None, tls_config,
+    );
+    // No panic -- that's the key assertion. Stats may have connect errors.
+    let total: u64 = stats.iter().map(|s| s.requests).sum();
+    let total_errors: u64 = stats.iter().map(|s| s.errors.total()).sum();
+    // Either requests or errors must be > 0 (connection was attempted).
+    assert!(total > 0 || total_errors > 0, "expected connect attempts");
 }
 
 #[test]
@@ -267,6 +282,7 @@ fn mio_open_loop_respects_target_rate() {
         &worker_stop,
         plan.scenarios.len(),
         Some(target_rps),
+        None, // no TLS
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -319,6 +335,7 @@ fn mio_open_loop_records_keepup_on_overload() {
         &worker_stop,
         plan.scenarios.len(),
         Some(1_000_000.0), // 1M req/s — way more than 2 connections can handle
+        None, // no TLS
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -327,5 +344,228 @@ fn mio_open_loop_records_keepup_on_overload() {
         stats.errors.keepup > 0,
         "expected keepup drops > 0, got {}",
         stats.errors.keepup
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TLS smoke tests
+// ---------------------------------------------------------------------------
+
+/// Spawn a blocking TLS server using rustls + std::net. Returns the
+/// listen address.
+fn spawn_tls_server(stop: Arc<AtomicBool>) -> SocketAddr {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::ServerConfig;
+
+    // Generate self-signed cert for localhost.
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("self-signed cert");
+    let cert_der: CertificateDer<'static> = cert.into();
+    let key_der: PrivatePkcs8KeyDer<'static> =
+        PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
+        .expect("server config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let config = Arc::new(config);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\ntls-ok";
+
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((tcp_stream, _)) => {
+                    let stop = stop.clone();
+                    let config = config.clone();
+                    let response = response.to_vec();
+                    std::thread::spawn(move || {
+                        tcp_stream.set_nodelay(true).ok();
+                        tcp_stream.set_nonblocking(false).ok();
+                        let conn = rustls::ServerConnection::new(config).unwrap();
+                        let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
+
+                        let mut buf = [0u8; 4096];
+                        while !stop.load(Ordering::Relaxed) {
+                            match tls.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    if tls.write_all(&response).is_err() {
+                                        break;
+                                    }
+                                    if tls.flush().is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    addr
+}
+
+/// Low-level test: manually drive a single MioTlsStream through
+/// handshake + HTTP request + response to validate the TLS wrapper
+/// works correctly with mio.
+#[test]
+fn mio_tls_stream_low_level() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let addr = spawn_tls_server(stop.clone());
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut poll = mio::Poll::new().unwrap();
+    let saddr: std::net::SocketAddr = addr;
+    let mut tcp = mio::net::TcpStream::connect(saddr).unwrap();
+    tcp.set_nodelay(true).ok();
+    let token = mio::Token(0);
+    poll.registry()
+        .register(&mut tcp, token, mio::Interest::READABLE | mio::Interest::WRITABLE)
+        .unwrap();
+
+    let opts = zerobench_core::transport::TransportOpts {
+        insecure_tls: true,
+        ..Default::default()
+    };
+    let config = zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]);
+    let mut tls = zerobench_http::mio_tls::MioTlsStream::new(tcp, config, "localhost").unwrap();
+    tls.complete_handshake(&mut poll, token).unwrap();
+
+    // Write HTTP request
+    let req = b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let n = tls.write(req).unwrap();
+    assert_eq!(n, req.len());
+    tls.flush().unwrap();
+
+    // Read response (poll until readable)
+    let mut events = mio::Events::with_capacity(64);
+    let mut response = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for TLS response");
+        }
+        poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
+        let mut buf = [0u8; 4096];
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+        // Check if we have a complete response.
+        if response.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+
+    let resp_str = String::from_utf8_lossy(&response);
+    assert!(
+        resp_str.contains("200 OK"),
+        "expected 200 OK in response, got: {resp_str}"
+    );
+}
+
+#[test]
+fn mio_h1_tls_with_self_signed_cert() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let addr = spawn_tls_server(stop.clone());
+
+    let mut vars = VarRegistry::new();
+    let url = Template::compile(&format!("https://127.0.0.1:{}/bench", addr.port()), &mut vars)
+        .unwrap();
+    let req = RequestPlan::get(url);
+    let scenario = Scenario {
+        name: "mio-tls-smoke".into(),
+        rate: RateProfile::Saturate { max_concurrency: 4 },
+        steps: vec![Step::Request(req)],
+    };
+    let plan = Plan {
+        scenarios: vec![scenario],
+        vars,
+        duration: Duration::from_secs(2),
+        warmup: None,
+        threads: 1,
+    };
+    let mut target = Target::parse(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
+    target.sni = Some("localhost".into());
+
+    // Build request bytes.
+    let request_bytes = {
+        use zerobench_core::rng;
+        use zerobench_core::scenario_context::ScenarioContext;
+
+        let step = plan.scenarios[0].steps.first().unwrap();
+        let rp = match step {
+            Step::Request(r) => r,
+            _ => panic!("expected request step"),
+        };
+        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
+        let mut buf = Vec::new();
+        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
+        buf
+    };
+
+    // Build TLS config with insecure verifier (self-signed cert).
+    let opts = zerobench_core::transport::TransportOpts {
+        insecure_tls: true,
+        ..Default::default()
+    };
+    let tls_config = Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]));
+
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let ws = worker_stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        ws.store(true, Ordering::Relaxed);
+    });
+
+    let stats = zerobench_http::mio_h1::run_mio_worker(
+        &target,
+        &request_bytes,
+        4, // 4 connections
+        &worker_stop,
+        plan.scenarios.len(),
+        None, // saturate mode
+        tls_config,
+    );
+
+    stop.store(true, Ordering::Relaxed);
+
+    assert!(
+        stats.requests > 0,
+        "expected at least some TLS requests, got {} (errors: connect={}, read={}, write={})",
+        stats.requests, stats.errors.connect, stats.errors.read, stats.errors.write,
+    );
+    assert!(
+        stats.bytes_sent > 0,
+        "expected bytes_sent > 0 over TLS, got {}",
+        stats.bytes_sent,
+    );
+    assert!(
+        stats.bytes_recv > 0,
+        "expected bytes_recv > 0 over TLS, got {}",
+        stats.bytes_recv,
     );
 }

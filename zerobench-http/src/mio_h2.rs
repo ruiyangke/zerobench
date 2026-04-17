@@ -48,21 +48,25 @@ use h2::client::{self, ResponseFuture, SendRequest};
 use h2::RecvStream;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Token};
+use rustls::ClientConfig;
 
 use zerobench_core::plan::{Plan, Step};
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::Target;
 
+use super::mio_tls::{MioStream, MioTlsStream};
+
 // ---------------------------------------------------------------------------
 // MioAsyncAdapter — bridges mio TcpStream to tokio I/O traits
 // ---------------------------------------------------------------------------
 
-/// Wraps mio's `TcpStream` to implement tokio's `AsyncRead` / `AsyncWrite`.
+/// Wraps a `MioStream` (plain TCP or TLS) to implement tokio's
+/// `AsyncRead` / `AsyncWrite`.
 ///
 /// All operations are non-blocking — returns `Poll::Pending` on `WouldBlock`.
 /// No tokio runtime involved; polling is driven by the mio event loop.
 struct MioAsyncAdapter {
-    stream: TcpStream,
+    stream: MioStream,
 }
 
 impl tokio::io::AsyncRead for MioAsyncAdapter {
@@ -337,6 +341,7 @@ pub fn run_mio_h2_worker(
     stop: &AtomicBool,
     num_scenarios: usize,
     target_rps: Option<f64>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> TaskStats {
     let addr: SocketAddr = target.addr().parse().expect("valid socket address");
     let mut poll = mio::Poll::new().expect("mio::Poll::new");
@@ -344,19 +349,48 @@ pub fn run_mio_h2_worker(
     let mut stats = TaskStats::new(num_scenarios);
 
     // Connect TCP.
-    let mut stream = match TcpStream::connect(addr) {
+    let mut tcp = match TcpStream::connect(addr) {
         Ok(s) => s,
         Err(_) => {
             stats.record_error(0, ErrorKind::Connect);
             return stats;
         }
     };
-    stream.set_nodelay(true).ok();
+    tcp.set_nodelay(true).ok();
 
     let token = Token(0);
     poll.registry()
-        .register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
+        .register(&mut tcp, token, Interest::READABLE | Interest::WRITABLE)
         .expect("mio register");
+
+    // Wrap in TLS if needed.
+    let stream = if let Some(ref config) = tls_config {
+        let sni_name = target.sni_name();
+        let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), sni_name) {
+            Ok(s) => s,
+            Err(_) => {
+                stats.record_error(0, ErrorKind::Connect);
+                return stats;
+            }
+        };
+        if let Err(_) = tls_stream.complete_handshake(&mut poll, token) {
+            stats.record_error(0, ErrorKind::Connect);
+            return stats;
+        }
+        // Re-register after handshake: mio uses edge-triggered epoll
+        // (EPOLLET), so events consumed during the handshake won't
+        // re-fire. Reregister forces fresh notification delivery.
+        poll.registry()
+            .reregister(
+                tls_stream.tcp_stream_mut(),
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("mio reregister after TLS handshake");
+        MioStream::Tls(tls_stream)
+    } else {
+        MioStream::Plain(tcp)
+    };
 
     // Create a mio::Waker so h2's internal wake() calls break us out
     // of poll.poll() immediately — no waiting for socket events.
@@ -489,12 +523,8 @@ pub fn run_mio_h2_threaded(
     total_streams: usize,
     duration: Duration,
     target_rps: Option<f64>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> Vec<TaskStats> {
-    assert!(
-        !target.tls,
-        "mio-h2 mode does not support TLS (https://). Use http:// or remove --mio."
-    );
-
     let request = build_h2_request(plan, target);
     let stop = Arc::new(AtomicBool::new(false));
     let streams_per_thread = total_streams.div_ceil(num_threads);
@@ -514,6 +544,7 @@ pub fn run_mio_h2_threaded(
             let request = request.clone();
             let stop = stop.clone();
             let num_scenarios = plan.scenarios.len();
+            let tls_config = tls_config.clone();
 
             std::thread::spawn(move || {
                 run_mio_h2_worker(
@@ -523,6 +554,7 @@ pub fn run_mio_h2_threaded(
                     &stop,
                     num_scenarios,
                     per_thread_rps,
+                    tls_config,
                 )
             })
         })
