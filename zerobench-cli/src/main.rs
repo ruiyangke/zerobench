@@ -148,9 +148,16 @@ async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Raw H1 transport — separate dispatch path using RawH1Transport
     // instead of the hyper-based HttpTransport. Same engine, different
     // wire implementation.
-    #[cfg(feature = "raw-h1")]
+    #[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
     if args.raw {
         return run_with_transport::<zerobench_http::RawH1Transport>(
+            &args, plan, target, opts, open_loop, tui_enabled,
+        )
+        .await;
+    }
+    #[cfg(all(feature = "raw-h1", feature = "runtime-tokio", not(feature = "runtime-compio")))]
+    if args.raw {
+        return run_with_transport::<zerobench_http::RawH1TransportTokio>(
             &args, plan, target, opts, open_loop, tui_enabled,
         )
         .await;

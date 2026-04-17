@@ -46,6 +46,10 @@ rustls = { workspace = true }
 compio = { workspace = true }
 compio-tls = { workspace = true }
 rcgen = { workspace = true }
+tokio = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+futures-util = { workspace = true }
 
 [lints]
 workspace = true
