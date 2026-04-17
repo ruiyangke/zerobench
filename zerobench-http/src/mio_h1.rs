@@ -20,6 +20,15 @@
 //!   }
 //! ```
 //!
+//! # Modes
+//!
+//! - **Saturate (closed-loop)**: `target_rps = None`. Each connection fires
+//!   the next request immediately after a response. Classic closed-loop.
+//! - **Open-loop (constant-rate)**: `target_rps = Some(rps)`. Requests are
+//!   scheduled at a fixed interval via a token-bucket. Latency is measured
+//!   from `intended_start` (when the token was generated), not from the
+//!   actual write — this is coordinated-omission-free measurement.
+//!
 //! # Limitations
 //!
 //! - **No TLS**: mio mode only supports `http://` targets. Pass an `https://`
@@ -58,6 +67,10 @@ struct Conn {
     write_offset: usize,
     /// Wall-clock instant when the current request was started (write began).
     t0: Instant,
+    /// For open-loop mode: the time this request was SCHEDULED to start
+    /// (may be earlier than actual write time if the connection was busy).
+    /// For saturate mode: same as `t0`.
+    intended_start: Instant,
     /// Time-to-first-byte captured when we finish parsing response headers.
     /// Stored here so it survives the ReadingHeaders -> ReadingBody transition.
     ttfb: Duration,
@@ -84,24 +97,31 @@ enum ConnState {
 
 impl Conn {
     fn new(stream: TcpStream) -> Self {
+        let now = Instant::now();
         Self {
             stream,
             state: ConnState::Idle,
             read_buf: Vec::with_capacity(8192),
             write_buf: Vec::with_capacity(512),
             write_offset: 0,
-            t0: Instant::now(),
+            t0: now,
+            intended_start: now,
             ttfb: Duration::ZERO,
             status: 0,
         }
     }
 
     /// Load `request_bytes` into the write buffer and transition to Writing.
-    fn prepare_request(&mut self, request_bytes: &[u8]) {
+    ///
+    /// `intended_start` is the scheduled time for this request. In saturate
+    /// mode, pass `Instant::now()`. In open-loop mode, pass the token
+    /// timestamp so latency is measured CO-free.
+    fn prepare_request(&mut self, request_bytes: &[u8], intended_start: Instant) {
         self.write_buf.clear();
         self.write_buf.extend_from_slice(request_bytes);
         self.write_offset = 0;
         self.read_buf.clear();
+        self.intended_start = intended_start;
         self.t0 = Instant::now();
         self.ttfb = Duration::ZERO;
         self.status = 0;
@@ -225,17 +245,36 @@ impl Conn {
 /// machine filters spurious wakeups (e.g. writable while reading) — this
 /// avoids 2 `reregister` syscalls per request at the cost of occasional
 /// no-op event handling, which is cheaper at high req/s.
+///
+/// # Open-loop mode
+///
+/// When `target_rps` is `Some(rps)`, requests are dispatched at a fixed
+/// rate using a token-bucket scheduler. Latency is measured from the
+/// token's `intended_start` (coordinated-omission-free). Connections that
+/// complete a response are returned to an idle pool rather than immediately
+/// starting the next request; they wait for the next token.
+///
+/// When all connections are busy and tokens pile up, the surplus is counted
+/// as `keepup` errors — requests that *would* have been sent but couldn't.
 pub fn run_mio_worker(
     target: &Target,
     request_bytes: &[u8],
     num_conns: usize,
     stop: &AtomicBool,
     num_scenarios: usize,
+    target_rps: Option<f64>,
 ) -> TaskStats {
     let addr: SocketAddr = target.addr().parse().expect("valid socket address");
     let mut poll = Poll::new().expect("mio::Poll::new");
     let mut events = Events::with_capacity(1024);
     let mut stats = TaskStats::new(num_scenarios);
+
+    let open_loop = target_rps.is_some();
+    let token_interval = target_rps.map(|rps| Duration::from_secs_f64(1.0 / rps));
+    let started_at = Instant::now();
+    let mut next_token_at = started_at;
+    // Pre-allocate idle list with capacity; filled below for open-loop.
+    let mut idle_conns: Vec<usize> = Vec::with_capacity(num_conns);
 
     // Open connections and register with mio.
     let mut connections: Vec<Conn> = Vec::with_capacity(num_conns);
@@ -255,14 +294,59 @@ pub fn run_mio_worker(
                 Interest::READABLE | Interest::WRITABLE,
             )
             .expect("mio register");
-        let mut conn = Conn::new(stream);
-        conn.prepare_request(request_bytes);
+        let conn = Conn::new(stream);
         connections.push(conn);
     }
 
-    let poll_timeout = Some(Duration::from_millis(100));
+    if open_loop {
+        // All connections start idle; tokens will assign them work.
+        for i in 0..connections.len() {
+            idle_conns.push(i);
+        }
+    } else {
+        // Saturate mode: start all connections immediately.
+        let now = Instant::now();
+        for conn in &mut connections {
+            conn.prepare_request(request_bytes, now);
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+
+        // --- Open-loop: generate tokens and assign to idle connections ---
+        if let Some(interval) = token_interval {
+            // Dispatch tokens to idle connections.
+            while now >= next_token_at {
+                if let Some(conn_idx) = idle_conns.pop() {
+                    let conn = &mut connections[conn_idx];
+                    conn.prepare_request(request_bytes, next_token_at);
+                    // Try immediate write.
+                    match conn.try_write() {
+                        Ok(true) => conn.state = ConnState::ReadingHeaders,
+                        Ok(false) => {} // queued, will complete on writable event
+                        Err(_) => {
+                            conn.state = ConnState::Dead;
+                            stats.record_error(0, ErrorKind::Write);
+                        }
+                    }
+                } else {
+                    // No idle connection available — count as keepup drop.
+                    stats.record_error(0, ErrorKind::Keepup);
+                }
+                next_token_at += interval;
+            }
+        }
+
+        // --- Calculate poll timeout ------------------------------------
+        let poll_timeout = if open_loop && !idle_conns.is_empty() {
+            // Wake up when the next token is due.
+            let until_next = next_token_at.saturating_duration_since(Instant::now());
+            Some(until_next.min(Duration::from_millis(100)))
+        } else {
+            Some(Duration::from_millis(100))
+        };
+
         if poll.poll(&mut events, poll_timeout).is_err() {
             break;
         }
@@ -278,7 +362,7 @@ pub fn run_mio_worker(
                 continue;
             }
 
-            // --- Handle writable (Writing or Idle) -------------------------
+            // --- Handle writable (Writing or Idle) ---------------------
             if event.is_writable() {
                 match conn.state {
                     ConnState::Writing => match conn.try_write() {
@@ -291,9 +375,9 @@ pub fn run_mio_worker(
                             stats.record_error(0, ErrorKind::Write);
                         }
                     },
-                    ConnState::Idle => {
-                        conn.prepare_request(request_bytes);
-                        // Fall through — try_write in the same iteration.
+                    ConnState::Idle if !open_loop => {
+                        // Saturate: start next request immediately.
+                        conn.prepare_request(request_bytes, Instant::now());
                         match conn.try_write() {
                             Ok(true) => {
                                 conn.state = ConnState::ReadingHeaders;
@@ -305,11 +389,11 @@ pub fn run_mio_worker(
                             }
                         }
                     }
-                    _ => {} // spurious writable while reading — ignore
+                    _ => {} // spurious writable while reading, or idle in open-loop — ignore
                 }
             }
 
-            // --- Handle readable (ReadingHeaders or ReadingBody) -----------
+            // --- Handle readable (ReadingHeaders or ReadingBody) -------
             if event.is_readable()
                 && matches!(
                     conn.state,
@@ -317,23 +401,30 @@ pub fn run_mio_worker(
                 )
             {
                 match conn.try_read() {
-                    Ok(Some((status, ttfb, total))) => {
+                    Ok(Some((_status, ttfb, _total))) => {
                         let bytes_sent = conn.write_buf.len() as u64;
                         let bytes_recv = conn.read_buf.len() as u64;
-                        stats.record(0, total, ttfb, bytes_sent, bytes_recv);
-                        let _ = status; // status recorded but not asserted in mio mode
+                        // CO-free latency: measured from intended_start.
+                        let co_free_latency = conn.intended_start.elapsed();
+                        stats.record(0, co_free_latency, ttfb, bytes_sent, bytes_recv);
 
                         if matches!(conn.state, ConnState::Idle) {
-                            // Pipeline next request immediately.
-                            conn.prepare_request(request_bytes);
-                            match conn.try_write() {
-                                Ok(true) => {
-                                    conn.state = ConnState::ReadingHeaders;
-                                }
-                                Ok(false) => {}
-                                Err(_) => {
-                                    conn.state = ConnState::Dead;
-                                    stats.record_error(0, ErrorKind::Write);
+                            if open_loop {
+                                // Return connection to the idle pool;
+                                // the token scheduler will assign the next request.
+                                idle_conns.push(idx);
+                            } else {
+                                // Saturate: pipeline next request immediately.
+                                conn.prepare_request(request_bytes, Instant::now());
+                                match conn.try_write() {
+                                    Ok(true) => {
+                                        conn.state = ConnState::ReadingHeaders;
+                                    }
+                                    Ok(false) => {}
+                                    Err(_) => {
+                                        conn.state = ConnState::Dead;
+                                        stats.record_error(0, ErrorKind::Write);
+                                    }
                                 }
                             }
                         }
@@ -358,12 +449,17 @@ pub fn run_mio_worker(
 /// Spawn `num_threads` OS threads, each with its own mio event loop and an
 /// even share of `total_conns`. Blocks until `duration` elapses, then
 /// joins all threads and returns their stats.
+///
+/// `target_rps`: `None` for saturate (closed-loop), `Some(rps)` for
+/// open-loop constant-rate mode. The total rate is split evenly across
+/// threads (each thread gets `rps / num_threads`).
 pub fn run_mio_threaded(
     target: &Target,
     plan: &Plan,
     num_threads: usize,
     total_conns: usize,
     duration: Duration,
+    target_rps: Option<f64>,
 ) -> Vec<TaskStats> {
     assert!(
         !target.tls,
@@ -373,6 +469,7 @@ pub fn run_mio_threaded(
     let request_bytes = build_static_request(plan, target);
     let stop = Arc::new(AtomicBool::new(false));
     let conns_per_thread = total_conns.div_ceil(num_threads);
+    let per_thread_rps = target_rps.map(|rps| rps / num_threads as f64);
 
     // Timer thread — signals stop after `duration`.
     let stop_timer = stop.clone();
@@ -390,7 +487,14 @@ pub fn run_mio_threaded(
             let num_scenarios = plan.scenarios.len();
 
             std::thread::spawn(move || {
-                run_mio_worker(&target, &request_bytes, conns_per_thread, &stop, num_scenarios)
+                run_mio_worker(
+                    &target,
+                    &request_bytes,
+                    conns_per_thread,
+                    &stop,
+                    num_scenarios,
+                    per_thread_rps,
+                )
             })
         })
         .collect();

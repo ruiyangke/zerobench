@@ -874,6 +874,7 @@ fn run_mio_sync(
         num_threads,
         args.connections,
         plan.duration,
+        args.rate,
     );
 
     let summary = Summary::merge(stats, plan.duration);
@@ -942,6 +943,7 @@ async fn run_mio(
         num_threads,
         args.connections,
         plan.duration,
+        args.rate,
     );
 
     let summary = Summary::merge(stats, plan.duration);

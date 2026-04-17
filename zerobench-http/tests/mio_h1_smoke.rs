@@ -151,6 +151,7 @@ fn mio_worker_records_requests() {
         4, // 4 connections
         &worker_stop,
         plan.scenarios.len(),
+        None, // saturate mode
     );
 
     // Stop the server.
@@ -187,6 +188,7 @@ fn mio_threaded_records_requests() {
         2,  // 2 threads
         8,  // 8 total connections
         plan.duration,
+        None, // saturate mode
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -220,7 +222,110 @@ fn mio_rejects_tls_target() {
             warmup: None,
             threads: 1,
         };
-        zerobench_http::mio_h1::run_mio_threaded(&target, &plan, 1, 1, Duration::from_secs(1));
+        zerobench_http::mio_h1::run_mio_threaded(&target, &plan, 1, 1, Duration::from_secs(1), None);
     });
     assert!(result.is_err(), "expected panic for TLS target");
+}
+
+#[test]
+fn mio_open_loop_respects_target_rate() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let addr = spawn_server(server_stop);
+
+    let (plan, target) = simple_plan(addr);
+    let request_bytes = {
+        use zerobench_core::rng;
+        use zerobench_core::scenario_context::ScenarioContext;
+
+        let step = plan.scenarios[0].steps.first().unwrap();
+        let rp = match step {
+            Step::Request(r) => r,
+            _ => panic!("expected request step"),
+        };
+        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
+        let mut buf = Vec::new();
+        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
+        buf
+    };
+
+    // Target 1000 req/s for 2 seconds → expect ~2000 requests (±20%).
+    let target_rps = 1000.0;
+    let run_secs = 2;
+
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let ws = worker_stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(run_secs));
+        ws.store(true, Ordering::Relaxed);
+    });
+
+    let stats = zerobench_http::mio_h1::run_mio_worker(
+        &target,
+        &request_bytes,
+        10, // plenty of connections
+        &worker_stop,
+        plan.scenarios.len(),
+        Some(target_rps),
+    );
+
+    stop.store(true, Ordering::Relaxed);
+
+    let expected = (target_rps * run_secs as f64) as u64;
+    let lo = (expected as f64 * 0.80) as u64;
+    let hi = (expected as f64 * 1.20) as u64;
+    assert!(
+        stats.requests >= lo && stats.requests <= hi,
+        "expected ~{expected} requests (range {lo}..{hi}), got {}",
+        stats.requests
+    );
+}
+
+#[test]
+fn mio_open_loop_records_keepup_on_overload() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let addr = spawn_server(server_stop);
+
+    let (plan, target) = simple_plan(addr);
+    let request_bytes = {
+        use zerobench_core::rng;
+        use zerobench_core::scenario_context::ScenarioContext;
+
+        let step = plan.scenarios[0].steps.first().unwrap();
+        let rp = match step {
+            Step::Request(r) => r,
+            _ => panic!("expected request step"),
+        };
+        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
+        let mut buf = Vec::new();
+        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
+        buf
+    };
+
+    // Target 1M req/s with only 2 connections against a blocking server.
+    // The token scheduler will outpace connection capacity, producing keepup drops.
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let ws = worker_stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        ws.store(true, Ordering::Relaxed);
+    });
+
+    let stats = zerobench_http::mio_h1::run_mio_worker(
+        &target,
+        &request_bytes,
+        2, // only 2 connections — bottleneck
+        &worker_stop,
+        plan.scenarios.len(),
+        Some(1_000_000.0), // 1M req/s — way more than 2 connections can handle
+    );
+
+    stop.store(true, Ordering::Relaxed);
+
+    assert!(
+        stats.errors.keepup > 0,
+        "expected keepup drops > 0, got {}",
+        stats.errors.keepup
+    );
 }
