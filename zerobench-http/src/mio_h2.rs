@@ -50,11 +50,75 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Token};
 use rustls::ClientConfig;
 
-use zerobench_core::plan::{Plan, Step};
+use rand::Rng;
+use zerobench_core::LiveSnapshot;
+use zerobench_core::plan::{Plan, Protocol, Step};
+use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
-use zerobench_core::transport::Target;
+use zerobench_core::transport::{Target, TransportOpts};
 
 use super::mio_tls::{MioStream, MioTlsStream};
+
+// ---------------------------------------------------------------------------
+// Connect helpers — split resolve / connect so we can re-resolve on failure
+// ---------------------------------------------------------------------------
+
+/// Attempt a single non-blocking TCP connect to `addr`.
+#[inline]
+fn connect_once(addr: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect(addr)
+}
+
+/// Connect to `target`, re-resolving once on transient failure.
+///
+/// See `mio_h1::connect_with_retry` for the full rationale. Short version:
+/// rolling deploys flip DNS; a stale first resolution is often the real
+/// cause of ECONNREFUSED / EHOSTUNREACH. One retry is enough without
+/// masking genuine server-down failures.
+fn connect_with_retry(
+    target: &Target,
+    opts: &TransportOpts,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let addr = target.resolve(opts)?;
+    match connect_once(addr) {
+        Ok(s) => Ok((s, addr)),
+        Err(e) if matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable | io::ErrorKind::TimedOut
+        ) => {
+            let fresh = target.resolve(opts)?;
+            connect_once(fresh).map(|s| (s, fresh))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread stream distribution — same shape as H1's distribute_conns.
+// ---------------------------------------------------------------------------
+
+/// Distribute `total` HTTP/2 streams across `threads` workers exactly.
+///
+/// Unlike the H1 case, each worker in H2 runs a single TCP connection
+/// multiplexing the streams — so the "conns" we split here are really
+/// streams. The arithmetic is identical and we delegate to the same
+/// formula: first `total % threads` threads take the ceiling, the rest
+/// take the floor. `threads` is clamped to `[1, total]`.
+fn distribute_streams(total: usize, threads: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(total);
+    let base = total / threads;
+    let remainder = total % threads;
+    let mut out = Vec::with_capacity(threads);
+    for i in 0..threads {
+        out.push(if i < remainder { base + 1 } else { base });
+    }
+    debug_assert_eq!(out.iter().sum::<usize>(), total);
+    out
+}
 
 // ---------------------------------------------------------------------------
 // MioAsyncAdapter — bridges mio TcpStream to tokio I/O traits
@@ -159,6 +223,8 @@ struct H2Stream {
     /// Once headers arrive, we drain the body here. `None` means we're
     /// still waiting for headers.
     body: Option<RecvStream>,
+    /// Which scenario this stream belongs to — for per-scenario stats.
+    scenario_id: u16,
 }
 
 /// State for a single H2 connection (one per worker thread).
@@ -179,7 +245,7 @@ impl H2Conn {
     /// response streams.
     ///
     /// Returns `true` if the connection is still alive.
-    fn poll_progress(&mut self, cx: &mut Context<'_>, now: Instant, stats: &mut TaskStats) -> bool {
+    fn poll_progress(&mut self, cx: &mut Context<'_>, now: Instant, stats: &mut TaskStats, live: Option<&LiveSnapshot>) -> bool {
         // 1. Drive the connection — this processes incoming frames and
         //    unblocks any pending send operations.
         match Pin::new(&mut self.connection).poll(cx) {
@@ -209,9 +275,14 @@ impl H2Conn {
                         // Fall through to drain the body below.
                     }
                     Poll::Ready(Err(_)) => {
+                        let sid = self.streams[i].scenario_id;
                         self.streams.swap_remove(i);
                         self.idle_slots += 1;
-                        stats.record_error(0, ErrorKind::Read);
+                        stats.record_error(sid, ErrorKind::Read);
+                        if let Some(l) = live {
+                            l.record_error(ErrorKind::Read);
+                            l.record_scenario_error(sid, ErrorKind::Read);
+                        }
                         continue;
                     }
                     Poll::Pending => {
@@ -248,7 +319,12 @@ impl H2Conn {
                 let stream = self.streams.swap_remove(i);
                 let co_free_latency = now.duration_since(stream.intended_start);
                 let ttfb = now.duration_since(stream.t0);
-                stats.record(0, co_free_latency, ttfb, 0, 0);
+                let sid = stream.scenario_id;
+                stats.record(sid, co_free_latency, ttfb, 0, 0);
+                if let Some(l) = live {
+                    l.record(co_free_latency.as_nanos() as u64, 0, 0);
+                    l.record_scenario(sid, co_free_latency.as_nanos() as u64, 0, 0);
+                }
                 self.idle_slots += 1;
                 // Don't increment i — swap_remove moved the last element here.
             } else if stream.body.is_some() {
@@ -269,6 +345,7 @@ impl H2Conn {
         &mut self,
         request: &http::Request<()>,
         intended_start: Instant,
+        scenario_id: u16,
     ) -> bool {
         if self.idle_slots == 0 {
             return false;
@@ -281,12 +358,12 @@ impl H2Conn {
         // `true` = end of stream (no body to send for benchmarks).
         match self.send_request.send_request(req, true) {
             Ok((response_fut, _send_stream)) => {
-                // No body to send — we passed `true` for end_of_stream.
                 self.streams.push(H2Stream {
                     response_fut,
                     t0: Instant::now(),
                     intended_start,
                     body: None,
+                    scenario_id,
                 });
                 self.idle_slots -= 1;
                 true
@@ -335,28 +412,60 @@ fn handshake_blocking(
 /// Run the mio + H2 event loop on the calling thread. Blocks until `stop`
 /// is set. Returns per-thread stats.
 pub fn run_mio_h2_worker(
+    plan: &Plan,
     target: &Target,
-    request: &http::Request<()>,
+    opts: &TransportOpts,
     max_streams: usize,
     stop: &AtomicBool,
-    num_scenarios: usize,
     target_rps: Option<f64>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<&LiveSnapshot>,
 ) -> TaskStats {
-    let addr: SocketAddr = target.addr().parse().expect("valid socket address");
     let mut poll = mio::Poll::new().expect("mio::Poll::new");
     let mut events = Events::with_capacity(256);
+    let num_scenarios = plan.scenarios.len();
     let mut stats = TaskStats::new(num_scenarios);
+    let mut ctx = ScenarioContext::new(plan.vars.len(), zerobench_core::rng::from_entropy());
 
-    // Connect TCP.
-    let mut tcp = match TcpStream::connect(addr) {
-        Ok(s) => s,
+    // Filter out SSE/WS scenarios — H2 only serves HTTP.
+    let http_indices: Vec<usize> = plan
+        .scenarios
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| (s.protocol() == Protocol::Http).then_some(i))
+        .collect();
+    if http_indices.is_empty() {
+        return stats;
+    }
+
+    // Helper: record error to both TaskStats and LiveSnapshot (if present).
+    #[inline(always)]
+    fn err(stats: &mut TaskStats, live: Option<&LiveSnapshot>, scenario_id: u16, kind: ErrorKind) {
+        stats.record_error(scenario_id, kind);
+        if let Some(l) = live {
+            l.record_error(kind);
+            l.record_scenario_error(scenario_id, kind);
+        }
+    }
+
+    fn pick_scenario(http_indices: &[usize], ctx: &mut ScenarioContext) -> usize {
+        if http_indices.len() <= 1 {
+            http_indices[0]
+        } else {
+            http_indices[ctx.rng.gen_range(0..http_indices.len())]
+        }
+    }
+
+    // Connect TCP. `connect_with_retry` re-resolves once on transient
+    // failures so rolling-deploy DNS flips don't fail the whole worker.
+    let mut tcp = match connect_with_retry(target, opts) {
+        Ok((s, _)) => s,
         Err(_) => {
-            stats.record_error(0, ErrorKind::Connect);
+            err(&mut stats, live, 0, ErrorKind::Connect);
             return stats;
         }
     };
-    tcp.set_nodelay(true).ok();
+    tcp.set_nodelay(opts.tcp_nodelay).ok();
 
     let token = Token(0);
     poll.registry()
@@ -369,12 +478,12 @@ pub fn run_mio_h2_worker(
         let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), sni_name) {
             Ok(s) => s,
             Err(_) => {
-                stats.record_error(0, ErrorKind::Connect);
+                err(&mut stats, live, 0, ErrorKind::Connect);
                 return stats;
             }
         };
         if let Err(_) = tls_stream.complete_handshake(&mut poll, token) {
-            stats.record_error(0, ErrorKind::Connect);
+            err(&mut stats, live, 0, ErrorKind::Connect);
             return stats;
         }
         // Re-register after handshake: mio uses edge-triggered epoll
@@ -401,7 +510,7 @@ pub fn run_mio_h2_worker(
     let (send_request, connection) = match handshake_blocking(adapter, &mut poll, &mut events, &waker) {
         Ok(pair) => pair,
         Err(_) => {
-            stats.record_error(0, ErrorKind::Connect);
+            err(&mut stats, live, 0, ErrorKind::Connect);
             return stats;
         }
     };
@@ -425,9 +534,12 @@ pub fn run_mio_h2_worker(
     if !open_loop {
         let now = Instant::now();
         for _ in 0..max_streams {
-            if !h2.start_request(request, now) {
+            let sid = pick_scenario(&http_indices, &mut ctx) as u16;
+            let req = build_h2_request_from_plan(plan, sid as usize, target, &mut ctx);
+            if !h2.start_request(&req, now, sid) {
                 break;
             }
+            ctx.clear_all();
         }
     }
 
@@ -442,7 +554,7 @@ pub fn run_mio_h2_worker(
             // Cap the queue — excess tokens are keepup drops.
             while pending_tokens.len() > max_pending {
                 pending_tokens.pop_front();
-                stats.record_error(0, ErrorKind::Keepup);
+                err(&mut stats, live, 0, ErrorKind::Keepup);
             }
         }
 
@@ -451,7 +563,10 @@ pub fn run_mio_h2_worker(
             while let Some(&intended) = pending_tokens.front() {
                 if h2.idle_slots > 0 {
                     pending_tokens.pop_front();
-                    h2.start_request(request, intended);
+                    let sid = pick_scenario(&http_indices, &mut ctx) as u16;
+                    let req = build_h2_request_from_plan(plan, sid as usize, target, &mut ctx);
+                    h2.start_request(&req, intended, sid);
+                    ctx.clear_all();
                 } else {
                     break;
                 }
@@ -477,19 +592,22 @@ pub fn run_mio_h2_worker(
         // --- Drive H2 connection + check completed streams -------------
         let mut cx = Context::from_waker(&waker);
 
-        let alive = h2.poll_progress(&mut cx, batch_now, &mut stats);
+        let alive = h2.poll_progress(&mut cx, batch_now, &mut stats, live);
         if !alive {
             // Connection died — record error and exit.
-            stats.record_error(0, ErrorKind::Read);
+            err(&mut stats, live, 0, ErrorKind::Read);
             break;
         }
 
         // --- Saturate: refill stream slots after completions -----------
         if !open_loop {
             while h2.idle_slots > 0 {
-                if !h2.start_request(request, batch_now) {
+                let sid = pick_scenario(&http_indices, &mut ctx) as u16;
+                let req = build_h2_request_from_plan(plan, sid as usize, target, &mut ctx);
+                if !h2.start_request(&req, batch_now, sid) {
                     break;
                 }
+                ctx.clear_all();
             }
         }
 
@@ -498,7 +616,10 @@ pub fn run_mio_h2_worker(
             while let Some(&intended) = pending_tokens.front() {
                 if h2.idle_slots > 0 {
                     pending_tokens.pop_front();
-                    h2.start_request(request, intended);
+                    let sid = pick_scenario(&http_indices, &mut ctx) as u16;
+                    let req = build_h2_request_from_plan(plan, sid as usize, target, &mut ctx);
+                    h2.start_request(&req, intended, sid);
+                    ctx.clear_all();
                 } else {
                     break;
                 }
@@ -513,48 +634,68 @@ pub fn run_mio_h2_worker(
 // Multi-threaded driver
 // ---------------------------------------------------------------------------
 
-/// Spawn `num_threads` OS threads, each with its own TCP connection and mio
-/// event loop driving `streams_per_thread` H2 streams. Blocks until
-/// `duration` elapses.
+/// Spawn up to `num_threads` OS threads, each with its own TCP connection
+/// and mio event loop driving an exact share of `total_streams`. Blocks
+/// until `duration` elapses.
+///
+/// Stream distribution mirrors the H1 fix: first `total_streams % threads`
+/// workers take `floor + 1` streams, the rest take the floor. `num_threads`
+/// is clamped to `min(num_threads, total_streams)` so we never spin up
+/// workers that own zero streams.
 pub fn run_mio_h2_threaded(
     target: &Target,
+    opts: &TransportOpts,
     plan: &Plan,
     num_threads: usize,
     total_streams: usize,
     duration: Duration,
     target_rps: Option<f64>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<LiveSnapshot>>,
+    stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
-    let request = build_h2_request(plan, target);
-    let stop = Arc::new(AtomicBool::new(false));
-    let streams_per_thread = total_streams.div_ceil(num_threads);
-    let per_thread_rps = target_rps.map(|rps| rps / num_threads as f64);
-
-    // Timer thread — signals stop after `duration`.
-    let stop_timer = stop.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(duration);
-        stop_timer.store(true, Ordering::Relaxed);
+    // When an external stop flag is provided (e.g. from the TUI),
+    // use it directly — the caller manages the timer. Otherwise
+    // create our own timer thread.
+    let stop = stop_flag.unwrap_or_else(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let timer = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            timer.store(true, Ordering::Relaxed);
+        });
+        flag
     });
+    let per_thread_streams = distribute_streams(total_streams, num_threads);
+    let active_threads = per_thread_streams.len();
+    let per_thread_rps = if active_threads == 0 {
+        None
+    } else {
+        target_rps.map(|rps| rps / active_threads as f64)
+    };
+    let plan = Arc::new(plan.clone());
 
     // Spawn worker threads.
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
+    let handles: Vec<_> = per_thread_streams
+        .into_iter()
+        .map(|streams| {
             let target = target.clone();
-            let request = request.clone();
+            let opts = opts.clone();
+            let plan = plan.clone();
             let stop = stop.clone();
-            let num_scenarios = plan.scenarios.len();
             let tls_config = tls_config.clone();
+            let live = live.clone();
 
             std::thread::spawn(move || {
                 run_mio_h2_worker(
+                    &plan,
                     &target,
-                    &request,
-                    streams_per_thread,
+                    &opts,
+                    streams,
                     &stop,
-                    num_scenarios,
                     per_thread_rps,
                     tls_config,
+                    live.as_deref(),
                 )
             })
         })
@@ -570,40 +711,73 @@ pub fn run_mio_h2_threaded(
 // Request builder — expand once at startup
 // ---------------------------------------------------------------------------
 
-/// Pre-build the HTTP/2 request from the first scenario's first step.
-/// Templates are expanded once (not per-request).
-fn build_h2_request(plan: &Plan, target: &Target) -> http::Request<()> {
-    use zerobench_core::rng;
-    use zerobench_core::scenario_context::ScenarioContext;
+/// Build an HTTP/2 request from a specific scenario with per-request
+/// template expansion. `scenario_idx` selects the scenario;
+/// `ctx` provides the RNG, counter, and var state.
+///
+/// Uses [`ScenarioContext::take_url_buf`] / [`ScenarioContext::return_url_buf`]
+/// and [`ScenarioContext::take_header_bufs`] / [`ScenarioContext::return_header_bufs`]
+/// so we don't reach into the buffer fields directly — those are now
+/// `#[doc(hidden)]` and the accessors are the supported API.
+fn build_h2_request_from_plan(
+    plan: &Plan,
+    scenario_idx: usize,
+    target: &Target,
+    ctx: &mut ScenarioContext,
+) -> http::Request<()> {
+    // Walk the scenario's steps to find the first HTTP Request step,
+    // skipping leading Pause/PauseRandom. Post-Tier-1 the caller already
+    // filters non-HTTP scenarios (see `http_indices` in the worker), so
+    // a Request must exist — if not, the plan is malformed.
+    let request_plan = plan.scenarios[scenario_idx]
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Request(r) => Some(r),
+            _ => None,
+        })
+        .expect("mio-h2 HTTP scenario must contain at least one Request step");
 
-    let step = plan
-        .scenarios
-        .first()
-        .and_then(|s| s.steps.first())
-        .expect("plan must have at least one scenario with one step");
-
-    let request_plan = match step {
-        Step::Request(r) => r,
-        _ => panic!("mio-h2 mode requires the first step to be a Request"),
+    // Expand the URL template into the context's reusable URL buffer
+    // using the closure-style accessor. `with_url_buf` clears the buffer
+    // before we write into it and re-installs it on return.
+    let url_buf = {
+        let mut taken = ctx.take_url_buf();
+        taken.clear();
+        request_plan.url.expand_into(&mut taken, &mut ctx.expand_ctx());
+        taken
     };
-
-    let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-    let mut url_buf = Vec::with_capacity(256);
-    let mut ectx = ctx.expand_ctx();
-    request_plan.url.expand_into(&mut url_buf, &mut ectx);
     let url_str = std::str::from_utf8(&url_buf).unwrap_or("/");
-
-    // Extract path + query from the expanded URL.
     let path = extract_path_and_query(url_str);
 
-    // H2 requests use :method, :path, :scheme, :authority pseudo-headers.
-    // The `http::Request` builder sets these when given a URI + method.
-    http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(request_plan.method.as_str())
         .uri(path.as_ref())
-        .header("host", target.addr())
-        .body(())
-        .expect("failed to build H2 request")
+        .header("host", target.addr());
+
+    // Expand header templates. `take_header_bufs` hands us both scratch
+    // `Vec<u8>`s; we return them together once all headers are consumed.
+    let (mut hdr_name, mut hdr_val) = ctx.take_header_bufs();
+    for (name_tpl, val_tpl) in &request_plan.headers {
+        hdr_name.clear();
+        hdr_val.clear();
+        // Re-borrow ExpandCtx fresh for each header — rng is unique so
+        // we can't hold it across the header loop iterations.
+        let mut ectx = ctx.expand_ctx();
+        name_tpl.expand_into(&mut hdr_name, &mut ectx);
+        val_tpl.expand_into(&mut hdr_val, &mut ectx);
+        if let (Ok(name), Ok(val)) = (
+            std::str::from_utf8(&hdr_name),
+            std::str::from_utf8(&hdr_val),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    // Hand both buffer families back to the context for the next request.
+    ctx.return_url_buf(url_buf);
+    ctx.return_header_bufs(hdr_name, hdr_val);
+
+    builder.body(()).expect("failed to build H2 request")
 }
 
 /// Extract origin-form path+query from a potentially absolute URL.
@@ -659,5 +833,54 @@ mod tests {
         assert_eq!(extract_path_and_query("http://h:80/foo?q=1"), "/foo?q=1");
         assert_eq!(extract_path_and_query("/bar"), "/bar");
         assert_eq!(extract_path_and_query(""), "/");
+    }
+
+    // ------------------------------------------------------------------
+    // distribute_streams — mirrors the H1 distribute_conns fix
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn distribute_streams_small_total_large_threads() {
+        let per = distribute_streams(20, 32);
+        assert_eq!(per.iter().sum::<usize>(), 20);
+        assert_eq!(per.len(), 20);
+    }
+
+    #[test]
+    fn distribute_streams_even() {
+        let per = distribute_streams(100, 4);
+        assert_eq!(per.iter().sum::<usize>(), 100);
+        assert_eq!(per.len(), 4);
+        assert!(per.iter().all(|&n| n == 25));
+    }
+
+    #[test]
+    fn distribute_streams_uneven() {
+        let per = distribute_streams(7, 3);
+        assert_eq!(per.iter().sum::<usize>(), 7);
+        assert_eq!(per, vec![3, 2, 2]);
+    }
+
+    #[test]
+    fn distribute_streams_one_stream_many_threads() {
+        let per = distribute_streams(1, 8);
+        assert_eq!(per, vec![1]);
+    }
+
+    #[test]
+    fn distribute_streams_zero_total() {
+        assert!(distribute_streams(0, 4).is_empty());
+    }
+
+    #[test]
+    fn distribute_streams_many_pairs_exact_total() {
+        for (total, threads) in [(20, 32), (100, 4), (7, 3), (1, 8), (0, 4), (1000, 17)] {
+            let per = distribute_streams(total, threads);
+            assert_eq!(
+                per.iter().sum::<usize>(),
+                total,
+                "({total}, {threads}) distribution lost count"
+            );
+        }
     }
 }

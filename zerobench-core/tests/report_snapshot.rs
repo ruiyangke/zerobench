@@ -125,11 +125,17 @@ fn terminal_single_scenario_contains_expected_fields() {
     let s = String::from_utf8(out).expect("utf8");
 
     // Header labels.
-    assert!(s.contains("target rate"), "missing 'target rate':\n{s}");
-    assert!(s.contains("actual rate"), "missing 'actual rate':\n{s}");
+    assert!(s.contains("target"), "missing 'target':\n{s}");
+    assert!(
+        !s.contains("actual rate"),
+        "'actual rate' should be gone (merged into 'throughput'):\n{s}"
+    );
     assert!(s.contains("duration"), "missing 'duration':\n{s}");
     assert!(s.contains("latency"), "missing 'latency':\n{s}");
     assert!(s.contains("throughput"), "missing 'throughput':\n{s}");
+    // The fixture records 100 bytes sent / 50 received per request, so
+    // the transfer line must render (skipped only when both are zero).
+    assert!(s.contains("transfer"), "missing 'transfer' line:\n{s}");
     assert!(s.contains("errors"), "missing 'errors':\n{s}");
     assert!(s.contains("assertions"), "missing 'assertions':\n{s}");
 

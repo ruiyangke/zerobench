@@ -53,10 +53,24 @@ pub struct ScenarioContext {
     pub counter: Cell<u64>,
     /// Reusable buffer for URL template expansion. Avoids a `Vec`
     /// allocation per request on the hot path.
+    ///
+    /// # Encapsulation
+    ///
+    /// Kept `pub` (with `#[doc(hidden)]`) for the legacy in-crate users;
+    /// external callers should prefer [`ScenarioContext::take_url_buf`]
+    /// / [`ScenarioContext::return_url_buf`] or the closure-style
+    /// [`ScenarioContext::with_url_buf`] helper, which compose more
+    /// cleanly with the split borrow of `rng` / `counter` / `vars`
+    /// that template expansion needs.
+    #[doc(hidden)]
     pub url_buf: Vec<u8>,
-    /// Reusable buffer for header-name template expansion.
+    /// Reusable buffer for header-name template expansion. See the
+    /// `url_buf` docs for encapsulation guidance.
+    #[doc(hidden)]
     pub hdr_name_buf: Vec<u8>,
-    /// Reusable buffer for header-value template expansion.
+    /// Reusable buffer for header-value template expansion. See the
+    /// `url_buf` docs for encapsulation guidance.
+    #[doc(hidden)]
     pub hdr_val_buf: Vec<u8>,
     /// Reusable buffer for body template expansion.
     pub body_buf: Vec<u8>,
@@ -149,6 +163,74 @@ impl ScenarioContext {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Reusable buffer accessors
+    //
+    // The URL / header-name / header-value buffers exist to avoid a
+    // `Vec::with_capacity` allocation on every request. Callers that
+    // need to expand a template into one of them while *also* borrowing
+    // `rng` / `counter` / `vars` (the classic split-borrow dance) use
+    // the `take_*` / `return_*` pair or the closure-style `with_*_buf`
+    // helper below. Both APIs preserve capacity across iterations.
+    // ------------------------------------------------------------------
+
+    /// Take ownership of the URL template buffer, replacing it with an
+    /// empty `Vec`. The caller expands into the returned buffer, then
+    /// hands it back via [`ScenarioContext::return_url_buf`] so the
+    /// capacity is retained for the next iteration.
+    pub fn take_url_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.url_buf)
+    }
+
+    /// Return a previously taken URL buffer to the context. Overwrites
+    /// whatever is in `self.url_buf` — callers are expected to only
+    /// return the buffer once per iteration.
+    pub fn return_url_buf(&mut self, buf: Vec<u8>) {
+        self.url_buf = buf;
+    }
+
+    /// Take both header-name and header-value buffers. Returned as a
+    /// tuple so the caller can clear / expand into them while holding
+    /// a split borrow of `rng` / `counter` / `vars` for template
+    /// expansion. Pair with [`ScenarioContext::return_header_bufs`].
+    pub fn take_header_bufs(&mut self) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::mem::take(&mut self.hdr_name_buf),
+            std::mem::take(&mut self.hdr_val_buf),
+        )
+    }
+
+    /// Return previously taken header buffers.
+    pub fn return_header_bufs(&mut self, name: Vec<u8>, val: Vec<u8>) {
+        self.hdr_name_buf = name;
+        self.hdr_val_buf = val;
+    }
+
+    /// Borrow the URL buffer and an [`ExpandCtx`] together in a
+    /// closure-style API. Clears the buffer before the closure runs;
+    /// the buffer's capacity is preserved across calls.
+    ///
+    /// Prefer this over the `take` / `return` pair when the whole
+    /// expansion happens inside a single scope — the closure form
+    /// statically prevents forgetting to return the buffer.
+    pub fn with_url_buf<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<u8>, ExpandCtx<'_>) -> R,
+    ) -> R {
+        let mut buf = std::mem::take(&mut self.url_buf);
+        buf.clear();
+        let result = {
+            let ectx = ExpandCtx {
+                rng: &mut self.rng,
+                counter: &self.counter,
+                scenario_vars: &self.vars,
+            };
+            f(&mut buf, ectx)
+        };
+        self.url_buf = buf;
+        result
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -238,5 +320,56 @@ mod tests {
             ectx.scenario_vars[0].as_ref().map(|b| b.as_ref()),
             Some(b"v".as_ref())
         );
+    }
+
+    #[test]
+    fn take_and_return_url_buf_preserves_capacity() {
+        let mut ctx = ScenarioContext::new(0, from_seed(1));
+        let cap = ctx.url_buf.capacity();
+        let mut buf = ctx.take_url_buf();
+        assert_eq!(buf.capacity(), cap);
+        // After take, the context's buffer is empty (and default-allocated).
+        assert_eq!(ctx.url_buf.capacity(), 0);
+        buf.extend_from_slice(b"hello");
+        ctx.return_url_buf(buf);
+        assert_eq!(&ctx.url_buf[..], b"hello");
+        assert!(ctx.url_buf.capacity() >= cap);
+    }
+
+    #[test]
+    fn take_and_return_header_bufs() {
+        let mut ctx = ScenarioContext::new(0, from_seed(1));
+        let (mut n, mut v) = ctx.take_header_bufs();
+        n.extend_from_slice(b"x-foo");
+        v.extend_from_slice(b"bar");
+        ctx.return_header_bufs(n, v);
+        assert_eq!(&ctx.hdr_name_buf[..], b"x-foo");
+        assert_eq!(&ctx.hdr_val_buf[..], b"bar");
+    }
+
+    #[test]
+    fn with_url_buf_clears_before_closure() {
+        let mut ctx = ScenarioContext::new(0, from_seed(1));
+        ctx.url_buf.extend_from_slice(b"stale");
+        let len = ctx.with_url_buf(|buf, _ectx| {
+            assert!(buf.is_empty(), "buffer should be cleared before closure");
+            buf.extend_from_slice(b"ok");
+            buf.len()
+        });
+        assert_eq!(len, 2);
+        // The context's buffer now contains the closure's output.
+        assert_eq!(&ctx.url_buf[..], b"ok");
+    }
+
+    #[test]
+    fn with_url_buf_exposes_expand_ctx() {
+        let mut ctx = ScenarioContext::new(1, from_seed(1));
+        ctx.set_var(VarSlot(0), Bytes::from_static(b"val"));
+        ctx.with_url_buf(|buf, ectx| {
+            // scenario_vars reachable through the closure's ectx.
+            assert_eq!(ectx.scenario_vars.len(), 1);
+            buf.extend_from_slice(ectx.scenario_vars[0].as_ref().unwrap().as_ref());
+        });
+        assert_eq!(&ctx.url_buf[..], b"val");
     }
 }

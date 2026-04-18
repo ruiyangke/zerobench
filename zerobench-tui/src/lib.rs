@@ -17,8 +17,8 @@
 //!
 //! # Concurrency
 //!
-//! The TUI runs inside the same compio runtime as the benchmark
-//! workers. A single loop drives three things:
+//! The TUI runs on a dedicated OS thread — no async runtime required.
+//! A single loop drives three things:
 //!
 //! - A 10 Hz render tick — redraws the ratatui terminal.
 //! - A 1 Hz snapshot tick — swaps the `LiveSnapshot` bucket and
@@ -75,7 +75,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 /// for saturate. `total_duration` is used for the progress bar;
 /// `url_label` is shown in the header. `transport` feeds the transport
 /// info line (protocol · mode · TLS).
-pub async fn run_tui(
+pub fn run_tui(
     snapshot: Arc<LiveSnapshot>,
     stop: StopSignal,
     target_rate: Option<f64>,
@@ -95,8 +95,7 @@ pub async fn run_tui(
         url_label,
         transport,
         scenario_names,
-    )
-    .await;
+    );
 
     // Clean-exit restore. Ratatui's own panic hook handles the crash
     // path.
@@ -105,7 +104,7 @@ pub async fn run_tui(
     result
 }
 
-async fn run_tui_inner(
+fn run_tui_inner(
     snapshot: Arc<LiveSnapshot>,
     stop: StopSignal,
     target_rate: Option<f64>,
@@ -185,7 +184,7 @@ async fn run_tui_inner(
         };
         let wait = wake_at.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
-            compio::time::sleep(wait).await;
+            std::thread::sleep(wait);
         }
     }
 

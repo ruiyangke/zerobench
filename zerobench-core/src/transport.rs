@@ -1,48 +1,40 @@
-//! The transport abstraction.
-//!
-//! A [`Transport`] knows how to turn a [`crate::plan::RequestPlan`] into a
-//! real wire exchange. Concrete implementations live in sibling crates
-//! (`zerobench-http` for HTTP/1/2, `zerobench-ws` for WebSocket,
-//! `zerobench-sse` for Server-Sent Events); they share this trait so the
-//! engine layer can dispatch uniformly.
-//!
-//! # Design
+//! Transport types — target, options, response, errors.
 //!
 //! - [`Target`] describes the remote endpoint (host, port, TLS).
 //! - [`TransportOpts`] carries the knobs shared across all transports
 //!   (timeouts, pool size, TCP_NODELAY, TLS-insecure toggle).
-//! - [`Response`] is a `Transport`'s return value — status, headers, a
-//!   body (buffered or streamed), and the four numbers every benchmark
-//!   ultimately cares about: bytes sent, bytes received, TTFB, total
-//!   duration.
-//! - [`ScenarioContext`] is re-exported here from
-//!   [`crate::scenario_context`] for ergonomic imports.
-//!
-//! # `Send` and `async fn` in traits
-//!
-//! We use `async fn` in trait (stabilised in Rust 1.75) and **do not**
-//! require the returned future to be `Send`. Rationale: compio's runtime
-//! is strictly single-threaded per worker — each worker thread runs its
-//! own runtime and its own per-thread `Transport::Client` — so futures
-//! never cross threads. The [`Transport::Client`] itself *is* bounded as
-//! `Clone + Send + 'static` so the plan-build step (on a control thread)
-//! can move a client handle into each worker.
-//!
-//! If a future transport backend needs a multi-threaded runtime, we can
-//! add a `Send` bound to `exchange` at that point — but `async fn` in
-//! trait makes that addition a non-breaking change for existing impls.
+//! - [`Response`] is a completed exchange — status, headers, buffered
+//!   body, and the four numbers every benchmark cares about: bytes sent,
+//!   bytes received, TTFB, total duration.
+//! - [`TransportError`] is the error type every transport backend uses.
 
-use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-
-use http::HeaderMap;
-
-use crate::plan::RequestPlan;
-use crate::scenario_context::ScenarioContext;
 
 // ---------------------------------------------------------------------------
 // Target
 // ---------------------------------------------------------------------------
+
+/// Preferred address family when resolving a hostname.
+///
+/// Dual-stack hosts like `localhost` resolve to both `127.0.0.1` and `::1`;
+/// the order of the returned list is resolver- and libc-dependent, so we
+/// let callers pin the family explicitly when it matters.
+///
+/// * `Any` — take whichever address the resolver returned first (current
+///   behaviour; reasonable default).
+/// * `V4` — return the first IPv4 address, error if none.
+/// * `V6` — return the first IPv6 address, error if none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddrFamily {
+    /// No preference — first address the resolver returned wins.
+    #[default]
+    Any,
+    /// Only IPv4 addresses are acceptable.
+    V4,
+    /// Only IPv6 addresses are acceptable.
+    V6,
+}
 
 /// Where to open connections.
 ///
@@ -63,6 +55,10 @@ pub struct Target {
     /// connecting to an internal load-balancer by IP but validating
     /// against a public certificate).
     pub sni: Option<String>,
+    /// Preferred address family for DNS resolution. Defaults to
+    /// [`AddrFamily::Any`]; set to [`AddrFamily::V4`] / [`AddrFamily::V6`]
+    /// to pin the family when the resolver returns a dual-stack mix.
+    pub addr_family: AddrFamily,
 }
 
 impl Target {
@@ -146,6 +142,7 @@ impl Target {
             port,
             tls,
             sni: None,
+            addr_family: AddrFamily::Any,
         })
     }
 
@@ -165,6 +162,66 @@ impl Target {
     /// the override if set, otherwise the connect hostname.
     pub fn sni_name(&self) -> &str {
         self.sni.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Resolve the target to a `SocketAddr`, honouring the optional
+    /// `--resolve HOST:PORT:ADDR` overrides from `opts` and the
+    /// address-family preference on `self`.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. If `opts.resolve_overrides` contains a tuple matching
+    ///    `(self.host, self.port)`, the `addr` string from that tuple is
+    ///    parsed as an IP literal and used directly — no system DNS call.
+    ///    This mirrors `curl --resolve` and is the primary escape hatch
+    ///    for benchmarking behind split-horizon DNS.
+    /// 2. Otherwise the system resolver is consulted and the first
+    ///    address matching `self.addr_family` is returned.
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] / [`io::ErrorKind::AddrNotAvailable`]
+    /// when no address matches the request — callers map this to
+    /// [`TransportError::Connect`] at the wire layer.
+    pub fn resolve(&self, opts: &TransportOpts) -> std::io::Result<SocketAddr> {
+        use std::net::ToSocketAddrs;
+
+        // 1. Check resolve_overrides first — curl-style --resolve.
+        for (host, port, addr) in opts.resolve_overrides.iter() {
+            if host.eq_ignore_ascii_case(&self.host) && *port == self.port {
+                let ip: IpAddr = addr.parse().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid --resolve address literal: {addr}"),
+                    )
+                })?;
+                return Ok(SocketAddr::new(ip, self.port));
+            }
+        }
+
+        // 2. Fall back to system resolution with address-family filter.
+        let addrs = self.addr().to_socket_addrs()?;
+        let picked = match self.addr_family {
+            AddrFamily::Any => addrs.into_iter().next(),
+            AddrFamily::V4 => addrs.into_iter().find(|a| a.is_ipv4()),
+            AddrFamily::V6 => addrs.into_iter().find(|a| a.is_ipv6()),
+        };
+        picked.ok_or_else(|| {
+            let kind = match self.addr_family {
+                AddrFamily::Any => std::io::ErrorKind::AddrNotAvailable,
+                _ => std::io::ErrorKind::NotFound,
+            };
+            std::io::Error::new(
+                kind,
+                format!(
+                    "DNS resolution returned no {} addresses for {}",
+                    match self.addr_family {
+                        AddrFamily::Any => "",
+                        AddrFamily::V4 => "IPv4 ",
+                        AddrFamily::V6 => "IPv6 ",
+                    },
+                    self.addr()
+                ),
+            )
+        })
     }
 }
 
@@ -207,7 +264,7 @@ pub struct TransportOpts {
     /// benchmarks want minimum write latency.
     pub tcp_nodelay: bool,
     /// Accept invalid TLS certificates (self-signed, expired, hostname
-    /// mismatch). Only wired in through `compio-tls` / `rustls` — users
+    /// mismatch). Only wired through `rustls` — users
     /// who need it opt in explicitly with `-k` / `--insecure`.
     pub insecure_tls: bool,
     /// Preferred HTTP protocol version for the client side.
@@ -218,6 +275,14 @@ pub struct TransportOpts {
     /// performs an ALPN probe (`h2, http/1.1`) and picks the protocol
     /// the server chose — H2 if offered, H1 otherwise.
     pub http_version: HttpVersionPref,
+    /// curl-compatible `--resolve HOST:PORT:ADDR` overrides.
+    ///
+    /// Each tuple `(host, port, addr)` tells the transport "when asked
+    /// to connect to `host:port`, skip DNS and use `addr` instead".
+    /// Empty when no overrides were passed. The resolver lookup is
+    /// performed in the transport layer; the CLI only parses and
+    /// forwards the list.
+    pub resolve_overrides: Vec<(String, u16, String)>,
 }
 
 impl Default for TransportOpts {
@@ -229,6 +294,7 @@ impl Default for TransportOpts {
             tcp_nodelay: true,
             insecure_tls: false,
             http_version: HttpVersionPref::Auto,
+            resolve_overrides: Vec::new(),
         }
     }
 }
@@ -255,154 +321,6 @@ pub enum HttpVersionPref {
 }
 
 // ---------------------------------------------------------------------------
-// Response
-// ---------------------------------------------------------------------------
-
-/// A completed exchange.
-///
-/// Every field is populated before `exchange` returns. `bytes_sent` and
-/// `bytes_received` are the **on-wire** counts (post-TLS-encrypt /
-/// pre-TLS-decrypt if applicable), measured by a `CountingStream`
-/// sitting beneath hyper.
-pub struct Response {
-    /// Numeric status code — pulled directly from `http::StatusCode`
-    /// so callers don't need a dependency on `http` just to check it.
-    pub status: u16,
-    /// Response headers verbatim. Hyper guarantees header names are
-    /// lowercased, but values are preserved as received.
-    pub headers: HeaderMap,
-    /// Response body — buffered for short bodies, streamed for SSE/WS.
-    pub body: ResponseBody,
-    /// On-wire bytes written for this exchange (request line + headers
-    /// + body + any framing).
-    pub bytes_sent: u64,
-    /// On-wire bytes read for this exchange (status line + headers +
-    /// body + any framing).
-    pub bytes_received: u64,
-    /// Time from sending the first byte to receiving the first byte of
-    /// the response's status line.
-    pub ttfb: Duration,
-    /// Total time from sending the first byte to the last byte of the
-    /// response body being consumed.
-    pub total: Duration,
-}
-
-impl fmt::Debug for Response {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Response")
-            .field("status", &self.status)
-            .field("headers", &self.headers)
-            .field("body", &self.body)
-            .field("bytes_sent", &self.bytes_sent)
-            .field("bytes_received", &self.bytes_received)
-            .field("ttfb", &self.ttfb)
-            .field("total", &self.total)
-            .finish()
-    }
-}
-
-/// Response body — either fully collected bytes or a stream of chunks.
-pub enum ResponseBody {
-    /// Fully collected body, read into memory before `exchange` returns.
-    /// This is what all v0.0.1 HTTP transports produce; SSE and WS
-    /// transports will use [`ResponseBody::Stream`].
-    Buffered(bytes::Bytes),
-    /// Incrementally produced body chunks. The stream is `!Send` because
-    /// it typically wraps compio IO types, which aren't `Send`. compio
-    /// runs a dedicated runtime per worker thread; the stream is produced
-    /// and consumed on the same thread, so a `Send` bound would only
-    /// rule out correct implementations.
-    Stream(
-        std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = std::io::Result<bytes::Bytes>>>,
-        >,
-    ),
-}
-
-impl ResponseBody {
-    /// `true` iff this is a [`ResponseBody::Buffered`] variant with zero
-    /// bytes. Streaming bodies return `false` regardless of whether the
-    /// stream will ultimately yield any chunks — we can't know without
-    /// consuming it.
-    pub fn is_empty(&self) -> bool {
-        match self {
-            ResponseBody::Buffered(b) => b.is_empty(),
-            ResponseBody::Stream(_) => false,
-        }
-    }
-
-    /// Length of a [`ResponseBody::Buffered`] body, or `None` for a
-    /// streaming body (Content-Length may not be authoritative on
-    /// chunked transfer-encoding).
-    pub fn len(&self) -> Option<usize> {
-        match self {
-            ResponseBody::Buffered(b) => Some(b.len()),
-            ResponseBody::Stream(_) => None,
-        }
-    }
-}
-
-impl fmt::Debug for ResponseBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ResponseBody::Buffered(b) => f
-                .debug_struct("ResponseBody::Buffered")
-                .field("len", &b.len())
-                .finish(),
-            ResponseBody::Stream(_) => f
-                .debug_struct("ResponseBody::Stream")
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Transport trait
-// ---------------------------------------------------------------------------
-
-/// The abstraction every concrete transport implements.
-///
-/// Implementors:
-///
-/// - [`HttpTransport`](../../zerobench_http/struct.HttpTransport.html)
-///   for HTTP/1 (and, gated behind `h2`, HTTP/2).
-/// - `WsTransport` and `SseTransport` in their respective crates.
-///
-/// Each transport's `Client` is a cheap-to-clone handle (typically
-/// `Arc<Pool>`) holding protocol-specific state. The dispatcher clones
-/// one handle per worker; workers share the pool but own their own
-/// [`ScenarioContext`].
-pub trait Transport: Send + 'static {
-    /// Cheap-to-clone per-thread client handle. Bounded `Clone + Send +
-    /// 'static` so it can be moved onto worker threads; the underlying
-    /// data structures are free to be thread-local (typical: `Arc<Pool>`
-    /// where `Pool` lives in a single thread's runtime).
-    type Client: Clone + Send + 'static;
-
-    /// Pre-open the pool (or otherwise prepare to send requests) against
-    /// `target` with the given `opts`. Must not return until the client
-    /// is ready to accept an `exchange` call.
-    ///
-    /// Returns [`TransportError::Connect`] on the first fatal connect
-    /// failure — partial pools (some slots failed) are an implementation
-    /// choice left to each concrete transport.
-    fn build_client(
-        target: &Target,
-        opts: &TransportOpts,
-    ) -> impl std::future::Future<Output = Result<Self::Client, TransportError>>;
-
-    /// Execute one exchange: send the request described by `plan`,
-    /// receive the response, and populate a [`Response`]. `ctx` is
-    /// threaded through template expansion (URL, headers, body) and
-    /// is available to extractors if the transport performs any.
-    fn exchange(
-        client: &Self::Client,
-        plan: &RequestPlan,
-        ctx: &mut ScenarioContext,
-    ) -> impl std::future::Future<Output = Result<Response, TransportError>>;
-}
-
-// ---------------------------------------------------------------------------
 // TransportError
 // ---------------------------------------------------------------------------
 
@@ -424,7 +342,7 @@ pub enum TransportError {
     #[error("timeout")]
     Timeout,
 
-    /// Protocol-level error from hyper / h3 / compio-ws — header
+    /// Protocol-level error — header
     /// parsing, frame decode, invalid Content-Length, etc.
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -561,6 +479,7 @@ mod tests {
             port: 443,
             tls: true,
             sni: None,
+            addr_family: AddrFamily::Any,
         };
         assert_eq!(t.addr(), "example.com:443");
     }
@@ -572,6 +491,7 @@ mod tests {
             port: 443,
             tls: true,
             sni: Some("api.example.com".into()),
+            addr_family: AddrFamily::Any,
         };
         assert_eq!(t.sni_name(), "api.example.com");
     }
@@ -593,22 +513,147 @@ mod tests {
     }
 
     #[test]
-    fn response_body_buffered_len_and_empty() {
-        let b = ResponseBody::Buffered(bytes::Bytes::from_static(b"hello"));
-        assert_eq!(b.len(), Some(5));
-        assert!(!b.is_empty());
-
-        let e = ResponseBody::Buffered(bytes::Bytes::new());
-        assert_eq!(e.len(), Some(0));
-        assert!(e.is_empty());
+    fn addr_family_default_is_any() {
+        assert_eq!(AddrFamily::default(), AddrFamily::Any);
+        let t = Target::parse("http://h").unwrap();
+        assert_eq!(t.addr_family, AddrFamily::Any);
     }
 
     #[test]
-    fn response_body_stream_len_is_none() {
-        let stream = futures_util::stream::empty::<std::io::Result<bytes::Bytes>>();
-        let b = ResponseBody::Stream(Box::pin(stream));
-        assert_eq!(b.len(), None);
-        // Streams can't report empty because we don't want to consume them.
-        assert!(!b.is_empty());
+    fn resolve_uses_override_v4() {
+        let mut t = Target::parse("http://example.com:8080").unwrap();
+        t.addr_family = AddrFamily::Any;
+        let opts = TransportOpts {
+            resolve_overrides: vec![(
+                "example.com".to_string(),
+                8080,
+                "10.0.0.1".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        let addr = t.resolve(&opts).unwrap();
+        assert_eq!(addr.ip(), "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(addr.port(), 8080);
     }
+
+    #[test]
+    fn resolve_uses_override_v6() {
+        let t = Target::parse("http://example.com:443").unwrap();
+        let opts = TransportOpts {
+            resolve_overrides: vec![(
+                "example.com".to_string(),
+                443,
+                "::1".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        let addr = t.resolve(&opts).unwrap();
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 443);
+    }
+
+    #[test]
+    fn resolve_override_is_case_insensitive_host() {
+        let t = Target::parse("http://ExAmPlE.CoM:80").unwrap();
+        let opts = TransportOpts {
+            resolve_overrides: vec![(
+                "example.com".to_string(),
+                80,
+                "10.0.0.5".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        let addr = t.resolve(&opts).unwrap();
+        assert_eq!(addr.ip(), "10.0.0.5".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_override_port_must_match() {
+        let t = Target::parse("http://example.com:8080").unwrap();
+        let opts = TransportOpts {
+            // Wrong port — must fall through to DNS (which will fail
+            // deterministically here because example.com is arbitrary).
+            resolve_overrides: vec![(
+                "example.com".to_string(),
+                9999,
+                "10.0.0.1".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        // Without a matching override we go to real DNS. On a sandbox
+        // without network, this may fail; we only assert the override
+        // didn't hijack the lookup.
+        let addr = t.resolve(&opts);
+        if let Ok(a) = addr {
+            assert_ne!(a.ip(), "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        }
+    }
+
+    #[test]
+    fn resolve_override_invalid_ip_is_error() {
+        let t = Target::parse("http://example.com:80").unwrap();
+        let opts = TransportOpts {
+            resolve_overrides: vec![(
+                "example.com".to_string(),
+                80,
+                "not-an-ip".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        let err = t.resolve(&opts).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn resolve_loopback_v4_via_override() {
+        // Using an override avoids DNS dependence.
+        let mut t = Target::parse("http://localhost:1234").unwrap();
+        t.addr_family = AddrFamily::V4;
+        let opts = TransportOpts {
+            resolve_overrides: vec![(
+                "localhost".to_string(),
+                1234,
+                "127.0.0.1".to_string(),
+            )],
+            ..TransportOpts::default()
+        };
+        let addr = t.resolve(&opts).unwrap();
+        assert!(addr.is_ipv4());
+    }
+
+    #[test]
+    fn resolve_ipv4_literal_as_target_any() {
+        // Numeric hosts bypass the resolver cleanly on every platform.
+        let t = Target::parse("http://127.0.0.1:1234").unwrap();
+        let opts = TransportOpts::default();
+        let addr = t.resolve(&opts).unwrap();
+        assert_eq!(addr, "127.0.0.1:1234".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_ipv6_literal_as_target_any() {
+        let t = Target::parse("http://[::1]:1234").unwrap();
+        let opts = TransportOpts::default();
+        let addr = t.resolve(&opts).unwrap();
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 1234);
+    }
+
+    #[test]
+    fn resolve_ipv4_only_with_v4_family_pass() {
+        let mut t = Target::parse("http://127.0.0.1:80").unwrap();
+        t.addr_family = AddrFamily::V4;
+        let opts = TransportOpts::default();
+        assert!(t.resolve(&opts).unwrap().is_ipv4());
+    }
+
+    #[test]
+    fn resolve_ipv4_only_with_v6_family_fails() {
+        let mut t = Target::parse("http://127.0.0.1:80").unwrap();
+        t.addr_family = AddrFamily::V6;
+        let opts = TransportOpts::default();
+        let err = t.resolve(&opts).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
 }

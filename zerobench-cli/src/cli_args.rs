@@ -18,12 +18,84 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+// ---------------------------------------------------------------------------
+// `--version` long form — features + build profile baked in at compile time.
+// ---------------------------------------------------------------------------
+
+// Per-feature suffixes. Each is `", name"` when its cfg flag is on,
+// else `""`. Using cfg attributes on `const` items gives us `&'static
+// str` literals that `concat!` can splice.
+#[cfg(feature = "h2")]
+const FEAT_H2: &str = ", h2";
+#[cfg(not(feature = "h2"))]
+const FEAT_H2: &str = "";
+
+#[cfg(feature = "sse")]
+const FEAT_SSE: &str = ", sse";
+#[cfg(not(feature = "sse"))]
+const FEAT_SSE: &str = "";
+
+#[cfg(feature = "ws")]
+const FEAT_WS: &str = ", ws";
+#[cfg(not(feature = "ws"))]
+const FEAT_WS: &str = "";
+
+#[cfg(feature = "tui")]
+const FEAT_TUI: &str = ", tui";
+#[cfg(not(feature = "tui"))]
+const FEAT_TUI: &str = "";
+
+#[cfg(feature = "script")]
+const FEAT_SCRIPT: &str = ", script";
+#[cfg(not(feature = "script"))]
+const FEAT_SCRIPT: &str = "";
+
+#[cfg(debug_assertions)]
+const BUILD_PROFILE: &str = "debug";
+#[cfg(not(debug_assertions))]
+const BUILD_PROFILE: &str = "release";
+
+/// Compose the long version string at first call and leak into a
+/// `&'static str` clap can own. We can't `concat!` across non-literal
+/// `const` references, so we build it at startup instead. The leak is
+/// a tiny one-time allocation (~60 bytes) for the lifetime of the
+/// process, which is acceptable for a CLI tool.
+pub fn long_version() -> &'static str {
+    use std::sync::OnceLock;
+    static S: OnceLock<&'static str> = OnceLock::new();
+    S.get_or_init(|| {
+        let s = format!(
+            "{ver}\nFeatures: h1{h2}{sse}{ws}{tui}{script}\nBuild: {prof}, mio/epoll",
+            ver = env!("CARGO_PKG_VERSION"),
+            h2 = FEAT_H2,
+            sse = FEAT_SSE,
+            ws = FEAT_WS,
+            tui = FEAT_TUI,
+            script = FEAT_SCRIPT,
+            prof = BUILD_PROFILE,
+        );
+        Box::leak(s.into_boxed_str())
+    })
+}
+
 /// `zerobench` — fast, correct HTTP benchmarking tool.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "zerobench",
     version,
-    about = "Fast, correct HTTP benchmarking — open-loop, HDR-precise, io_uring-native"
+    long_version = long_version(),
+    about = "HTTP/1, HTTP/2, WebSocket, and SSE benchmarking — open-loop, HDR-precise, mio/epoll",
+    after_help = "EXAMPLES:\n  \
+        zerobench http://localhost:8080                         # 30s saturate, 50 conns\n  \
+        zerobench http://localhost:8080 -d 1m -c 200            # 1 minute, 200 conns\n  \
+        zerobench http://localhost:8080 -r 10k --tui            # open-loop 10k req/s + live dashboard\n  \
+        zerobench https://api.example.com -H 'Auth: x' --json '{\"k\":1}'\n  \
+        zerobench --sse http://localhost:8080/events -c 100     # SSE stream bench\n  \
+        zerobench --ws   ws://localhost:8080/chat  -c 100       # WebSocket bench\n  \
+        zerobench diff baseline.json current.json               # regression diff\n\
+        \n\
+        Full help: `zerobench --help`. Docs: https://github.com/zeroship-dev/zerobench\
+        "
 )]
 pub struct CliArgs {
     /// Optional sub-command (`diff`, ...). When omitted, the positional
@@ -32,222 +104,209 @@ pub struct CliArgs {
     pub command: Option<Subcommand>,
 
     /// Target URL. Optional when `--request-file` or `--requests` is
-    /// passed — the URL is derived from the `.http` file's Host header
-    /// (or from an absolute URL in the request line). Mutually
-    /// exclusive with the two file-based input modes so a command like
-    /// `zerobench --request-file foo.http http://bar/` doesn't silently
-    /// ignore one of the two inputs.
+    /// given — the URL is derived from the file's Host header.
     #[arg(conflicts_with_all = ["request_file", "requests"])]
     pub url: Option<String>,
 
+    // ---------- Input ----------
+
     /// Parse a single `.http` request file (curl `--trace-ascii` format).
-    /// Mutually exclusive with `--requests` and with providing a URL
-    /// positional argument.
-    #[arg(long = "request-file", conflicts_with = "requests")]
+    #[arg(long = "request-file", conflicts_with = "requests",
+          help_heading = "Input")]
     pub request_file: Option<PathBuf>,
 
-    /// Parse every `*.http` in the given directory as a scenario. An
-    /// optional `scenarios.toml` in the same directory assigns per-
-    /// scenario weights; when absent, weights are equal.
-    #[arg(long = "requests", conflicts_with = "request_file")]
+    /// Parse every `*.http` in DIR as a scenario. Weights via
+    /// `scenarios.toml`; equal when absent.
+    #[arg(long = "requests", conflicts_with = "request_file",
+          help_heading = "Input")]
     pub requests: Option<PathBuf>,
 
-    /// Number of OS worker threads. Each thread gets its own compio
-    /// runtime and io_uring instance. Connections are distributed
-    /// evenly across threads. Default: number of available CPU cores.
-    #[arg(short = 't', long = "threads", default_value_t = num_cpus())]
+    // ---------- Load ----------
+
+    /// OS worker threads (each has its own mio poll). Default: CPU cores.
+    #[arg(short = 't', long = "threads", default_value_t = num_cpus(),
+          help_heading = "Load")]
     pub threads: usize,
 
-    /// Max concurrent connections / worker tasks (closed-loop) or
-    /// pool ceiling (open-loop). (For HTTP/2: maximum concurrent
-    /// streams on the shared connection.)
-    #[arg(short = 'c', long = "connections", default_value_t = 50)]
+    /// Max concurrent connections (H1) or streams (H2).
+    #[arg(short = 'c', long = "connections", default_value_t = 50,
+          help_heading = "Load")]
     pub connections: usize,
 
-    /// Measurement duration (e.g. `10s`, `1m`, `2m30s`).
+    /// Measurement duration (`10s`, `1m`, `2m30s`).
     #[arg(short = 'd', long = "duration", default_value = "30s",
-          value_parser = parse_duration_flag)]
+          value_parser = parse_duration_flag,
+          help_heading = "Load")]
     pub duration: Duration,
 
-    /// Run in closed-loop saturate mode — N workers, each looping
-    /// request-then-response. Mutually exclusive with `--rate`.
-    #[arg(long = "saturate", action = ArgAction::SetTrue, conflicts_with = "rate")]
+    /// Closed-loop saturate mode — N workers looping request-then-response.
+    /// Optional — this is the default when `--rate` is not given.
+    #[arg(long = "saturate", action = ArgAction::SetTrue,
+          conflicts_with = "rate",
+          help_heading = "Load")]
     pub saturate: bool,
 
-    /// Open-loop target rate in req/s (e.g. `100`, `10k`, `1.5k`).
+    /// Open-loop target rate in req/s (`100`, `10k`, `1.5k`).
     /// Mutually exclusive with `--saturate`.
-    #[arg(short = 'r', long = "rate", value_parser = parse_rate_flag)]
+    #[arg(short = 'r', long = "rate", value_parser = parse_rate_flag,
+          help_heading = "Load")]
     pub rate: Option<f64>,
 
-    /// HTTP method.
-    #[arg(short = 'X', long = "method", default_value = "GET")]
-    pub method: String,
+    /// Warmup phase before measurement (e.g. `5s`). Requests are fired
+    /// but stats discarded. Mio dispatch does not honour this yet (TODO).
+    #[arg(long = "warmup", value_parser = parse_duration_flag,
+          help_heading = "Load")]
+    pub warmup: Option<Duration>,
 
-    /// Add a header. Repeat to add multiple. Form: `Name: Value`.
-    /// Value may contain `{{...}}` templates.
-    #[arg(short = 'H', long = "header", value_parser = parse_header_flag)]
+    // ---------- Request ----------
+
+    /// HTTP method (default: GET; promoted to POST when a body is given).
+    #[arg(short = 'X', long = "method",
+          help_heading = "Request")]
+    pub method: Option<String>,
+
+    /// Add a header. Repeat for multiple. Form: `Name: Value`.
+    #[arg(short = 'H', long = "header", value_parser = parse_header_flag,
+          help_heading = "Request")]
     pub headers: Vec<(String, String)>,
 
-    /// Inline request body. May contain `{{...}}`. Implies `--method POST`
-    /// unless `-X` was given.
-    #[arg(long = "body", conflicts_with = "body_file")]
+    /// Inline request body. Implies POST unless `-X` was given.
+    #[arg(long = "body",
+          conflicts_with_all = ["body_file", "json", "form"],
+          help_heading = "Request")]
     pub body: Option<String>,
 
-    /// Request body from a file path. Loaded once at startup.
-    #[arg(long = "body-file")]
+    /// Request body from a file path.
+    #[arg(long = "body-file",
+          conflicts_with_all = ["json", "form"],
+          help_heading = "Request")]
     pub body_file: Option<PathBuf>,
 
+    /// JSON body. Sets `Content-Type: application/json` and implies POST.
+    #[arg(long = "json", conflicts_with = "form",
+          help_heading = "Request")]
+    pub json: Option<String>,
+
+    /// Form body (`k=v&other=thing`). Sets
+    /// `Content-Type: application/x-www-form-urlencoded` and implies POST.
+    #[arg(long = "form",
+          help_heading = "Request")]
+    pub form: Option<String>,
+
+    /// Basic auth `user:pass`. Adds `Authorization: Basic <b64>`.
+    /// Explicit `-H Authorization:` wins with a warning.
+    #[arg(long = "basic-auth", value_parser = parse_basic_auth_flag,
+          conflicts_with = "bearer",
+          help_heading = "Request")]
+    pub basic_auth: Option<String>,
+
+    /// Bearer token. Adds `Authorization: Bearer <token>`.
+    #[arg(long = "bearer",
+          help_heading = "Request")]
+    pub bearer: Option<String>,
+
+    // ---------- Assertions ----------
+
     /// Assertion: exact status code.
-    #[arg(long = "expect-status")]
+    #[arg(long = "expect-status",
+          help_heading = "Assertions")]
     pub expect_status: Option<u16>,
 
-    /// Assertion: status code is in this comma-separated list (e.g.
-    /// `200,201,204`).
+    /// Assertion: status code in list (e.g. `200,201,204`).
     #[arg(long = "expect-status-in", value_parser = parse_status_list,
-          num_args = 1)]
+          num_args = 1,
+          help_heading = "Assertions")]
     pub expect_status_in: Option<StatusList>,
 
-    /// Color output preference.
-    #[arg(long = "color", value_enum, default_value_t = CliColor::Auto)]
-    pub color: CliColor,
+    // ---------- Protocol ----------
 
-    /// Output format.
-    #[arg(long = "format", value_enum, default_value_t = CliFormat::Terminal)]
-    pub format: CliFormat,
+    /// Preferred HTTP version. `auto` lets HTTPS ALPN pick; HTTP stays H1.
+    #[arg(long = "http-version", value_enum,
+          default_value_t = CliHttpVersion::Auto,
+          help_heading = "Protocol")]
+    pub http_version: CliHttpVersion,
+
+    /// Force HTTP/2 with prior-knowledge framing (equivalent to
+    /// `--http-version h2`; our mio_h2 always uses prior knowledge on
+    /// plain HTTP).
+    #[arg(long = "http2-prior-knowledge", action = ArgAction::SetTrue,
+          help_heading = "Protocol")]
+    pub http2_prior_knowledge: bool,
+
+    /// Benchmark SSE streams instead of one-shot HTTP. `-c N` =
+    /// concurrent streams. Reporter adds an SSE block.
+    #[cfg(feature = "sse")]
+    #[arg(long = "sse", action = ArgAction::SetTrue,
+          help_heading = "Protocol")]
+    pub sse: bool,
+
+    /// Benchmark WebSocket RTT (RFC 6455) instead of one-shot HTTP.
+    /// `-c N` = concurrent connections. Accepts `ws://` and `wss://`.
+    #[cfg(feature = "ws")]
+    #[arg(long = "ws", action = ArgAction::SetTrue,
+          help_heading = "Protocol")]
+    pub ws: bool,
+
+    /// WebSocket payload per iteration (default `ping`). Sent as a text frame.
+    #[cfg(feature = "ws")]
+    #[arg(long = "message", default_value = "ping",
+          help_heading = "Protocol")]
+    pub ws_message: String,
+
+    // ---------- Network ----------
 
     /// TCP+TLS connect timeout.
     #[arg(long = "connect-timeout", default_value = "5s",
-          value_parser = parse_duration_flag)]
+          value_parser = parse_duration_flag,
+          help_heading = "Network")]
     pub connect_timeout: Duration,
 
     /// Per-request deadline.
     #[arg(long = "timeout", default_value = "30s",
-          value_parser = parse_duration_flag)]
+          value_parser = parse_duration_flag,
+          help_heading = "Network")]
     pub request_timeout: Duration,
 
-    /// Accept invalid TLS certificates (self-signed, expired, hostname
-    /// mismatch). No-op for http:// targets.
-    #[arg(short = 'k', long = "insecure", action = ArgAction::SetTrue)]
+    /// Accept invalid TLS certificates. No-op for http:// targets.
+    #[arg(short = 'k', long = "insecure", action = ArgAction::SetTrue,
+          help_heading = "Network")]
     pub insecure: bool,
 
-    /// Preferred HTTP protocol version.
-    ///
-    /// - `auto` (default): HTTP → H1; HTTPS → ALPN-negotiated (picks H2
-    ///   when the server offers it, falls back to H1 otherwise).
-    /// - `h1`: always HTTP/1.1.
-    /// - `h2`: always HTTP/2. Requires the binary to be built with the
-    ///   `h2` feature; otherwise the run exits with a clear error.
-    ///
-    /// With `-c N` the meaning of `N` depends on the version picked:
-    /// for H1, `N` is the number of pre-opened TCP connections; for H2,
-    /// `N` is the number of concurrent streams multiplexed over a single
-    /// connection.
-    #[arg(long = "http-version", value_enum,
-          default_value_t = CliHttpVersion::Auto)]
-    pub http_version: CliHttpVersion,
+    /// curl-style DNS override `HOST:PORT:ADDR`. Repeat for multiple.
+    /// E.g. `--resolve example.com:443:10.0.0.5`.
+    #[arg(long = "resolve", value_parser = parse_resolve_flag,
+          help_heading = "Network")]
+    pub resolve: Vec<(String, u16, String)>,
 
-    /// Show a live `ratatui` dashboard during the run.
-    ///
-    /// Refreshes at 10 Hz, consumes the same `LiveSnapshot` the JSONL
-    /// streaming path uses, and renders the standard terminal report
-    /// to stdout on exit so pipelines still capture the summary.
-    ///
-    /// Mutually exclusive with `--format jsonl` for v0.0.1 —
-    /// interleaving the TUI's redraws with JSONL lines on the same
-    /// stdout would corrupt both outputs. Requires stdout to be a TTY.
-    ///
-    /// This flag only appears when the binary was built with
-    /// `--features tui`.
+    // ---------- Output ----------
+
+    /// Color output preference.
+    #[arg(long = "color", value_enum, default_value_t = CliColor::Auto,
+          help_heading = "Output")]
+    pub color: CliColor,
+
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = CliFormat::Terminal,
+          help_heading = "Output")]
+    pub format: CliFormat,
+
+    /// Live ratatui dashboard during the run. Requires TTY; mutex with
+    /// `--format jsonl`.
     #[cfg(feature = "tui")]
-    #[arg(long = "tui", action = ArgAction::SetTrue)]
+    #[arg(long = "tui", action = ArgAction::SetTrue,
+          help_heading = "Output")]
     pub tui: bool,
 
-    /// Benchmark Server-Sent Events (SSE) streams instead of one-shot
-    /// HTTP requests.
-    ///
-    /// Each worker opens a long-lived SSE stream, reads `data:` events,
-    /// and records per-chunk latency until the stream closes or the
-    /// bench deadline fires. The reporter emits an additional block
-    /// with chunks/s, TTFB, chunk-gap percentiles, and clean-completion
-    /// count.
-    ///
-    /// With `-c N` in this mode, `N` is the number of concurrent SSE
-    /// streams. The default report's `requests` / `latency` figures are
-    /// *not* populated for SSE runs — they are stream-scoped, not
-    /// request-scoped. The SSE block is the authoritative output.
-    ///
-    /// Only available when the binary is built with `--features sse`
-    /// (on by default for the published `zerobench` crate).
-    #[cfg(feature = "sse")]
-    #[arg(long = "sse", action = ArgAction::SetTrue)]
-    pub sse: bool,
+    /// Write final report to FILE instead of stdout. Affects all formats.
+    #[arg(short = 'o', long = "output",
+          help_heading = "Output")]
+    pub output: Option<PathBuf>,
 
-    /// Benchmark WebSocket connections (RFC 6455) instead of one-shot
-    /// HTTP requests.
-    ///
-    /// Each worker opens one long-lived WebSocket connection against
-    /// the target, sends a text frame, reads the response frame, and
-    /// records the per-message round-trip time. Ping frames from the
-    /// server are auto-replied to; control frames are handled
-    /// internally.
-    ///
-    /// With `-c N` in this mode, `N` is the number of concurrent
-    /// WebSocket connections. The default report's `requests` /
-    /// `latency` figures are *not* populated; instead a dedicated
-    /// WebSocket block shows handshake time, RTT percentiles, messages
-    /// per second, byte totals, and per-category error counts.
-    ///
-    /// URLs accepted: `ws://host:port/path` (plain) and `wss://...`
-    /// (TLS — uses the same `--insecure` / webpki-roots machinery as
-    /// HTTPS).
-    ///
-    /// Mutually exclusive with `--sse` and with an explicit
-    /// `--http-version`. Only available when the binary is built with
-    /// `--features ws` (on by default for the published `zerobench`
-    /// crate).
-    ///
-    /// The `--http-version` check is enforced at runtime because
-    /// clap's `conflicts_with` mechanism fires against default-valued
-    /// flags too — we only want to reject *explicit* `--http-version`
-    /// combined with `--ws`.
-    #[cfg(feature = "ws")]
-    #[arg(long = "ws", action = ArgAction::SetTrue)]
-    pub ws: bool,
-
-    /// Use raw HTTP/1.1 client (httparse + compio, no hyper).
-    ///
-    /// Maximum throughput but no HTTP/2 support and no TLS. Response
-    /// headers are not parsed into a `HeaderMap`, so extracts that
-    /// depend on response headers will not work. Only available when
-    /// the binary was built with `--features raw-h1`.
-    #[cfg(feature = "raw-h1")]
-    #[arg(long = "raw", action = ArgAction::SetTrue)]
-    pub raw: bool,
-
-    /// Use the mio-based synchronous epoll event loop (no async runtime).
-    ///
-    /// Each worker thread runs its own `mio::Poll` with N/T connections
-    /// in a tight event loop. No futures, no wakers, no task scheduling.
-    /// Pre-builds request bytes once at startup — per-request template
-    /// variables are expanded once and reused.
-    ///
-    /// No TLS support. Only available when the binary was built with
-    /// `--features mio-h1`.
-    #[cfg(feature = "mio-h1")]
-    #[arg(long = "mio", action = ArgAction::SetTrue)]
-    pub mio: bool,
-
-    /// Text payload to send on each WebSocket iteration. Defaults to
-    /// `"ping"`. Only visible when the binary was built with `ws`.
-    ///
-    /// A different value is useful when benchmarking echo servers
-    /// that care about message length (e.g. testing large-payload
-    /// throughput) or servers that route on the message body. The
-    /// payload is treated as a text frame — servers see it as UTF-8
-    /// (we don't validate — it's up to the operator).
-    #[cfg(feature = "ws")]
-    #[arg(long = "message", default_value = "ping")]
-    pub ws_message: String,
+    /// Parse args, build plan, resolve DNS, print the config, exit 0.
+    /// No traffic is sent.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue,
+          help_heading = "Output")]
+    pub dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,8 +390,25 @@ pub struct RunArgs {
     /// Override the script's `rate(...)` — parsed with the same
     /// grammar as `-r` / `--rate` on the default subcommand.
     /// Implicitly overrides any per-scenario `.rate(...)` too.
-    #[arg(long = "rate", short = 'r', value_parser = parse_rate_flag)]
+    #[arg(long = "rate", short = 'r', value_parser = parse_rate_flag,
+          conflicts_with = "saturate")]
     pub rate: Option<f64>,
+
+    /// Override the script's rate/saturate profile with closed-loop
+    /// saturate across all scenarios. Useful for running the same
+    /// Rhai file in both throughput (`--rate ...`) and tail-latency
+    /// (`--saturate`) modes without editing the script.
+    #[arg(long = "saturate", action = ArgAction::SetTrue,
+          conflicts_with = "rate")]
+    pub saturate: bool,
+
+    /// Run scenarios concurrently, sharing the `-c N` connection pool
+    /// and interleaving scenario picks per request. By default each
+    /// scenario runs serially with the full pool to its own endpoint.
+    /// Parallel mode is useful for modelling a realistic mixed-traffic
+    /// client fleet under a fixed connection budget.
+    #[arg(long = "parallel", action = ArgAction::SetTrue)]
+    pub parallel: bool,
 
     /// Number of OS worker threads.
     #[arg(short = 't', long = "threads", default_value_t = num_cpus())]
@@ -366,6 +442,19 @@ pub struct RunArgs {
     /// targets.
     #[arg(short = 'k', long = "insecure", action = ArgAction::SetTrue)]
     pub insecure: bool,
+
+    /// Basic auth `user:pass`. Adds `Authorization: Basic <b64>`.
+    #[arg(long = "basic-auth", value_parser = parse_basic_auth_flag,
+          conflicts_with = "bearer")]
+    pub basic_auth: Option<String>,
+
+    /// Bearer token. Adds `Authorization: Bearer <token>`.
+    #[arg(long = "bearer")]
+    pub bearer: Option<String>,
+
+    /// Write final report to FILE instead of stdout.
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<PathBuf>,
 }
 
 /// Arguments for `zerobench diff`.
@@ -524,6 +613,47 @@ pub fn parse_status_list(s: &str) -> Result<StatusList, String> {
         .collect();
     out.map(StatusList)
         .map_err(|e| format!("invalid status list {s:?}: {e}"))
+}
+
+/// Validate `--basic-auth USER:PASS`. Must contain a `:`. Value is kept
+/// verbatim — the base64 encode happens in `plan_from_cli` so the
+/// parser stays allocation-light.
+pub fn parse_basic_auth_flag(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("empty basic-auth value".into());
+    }
+    if !s.contains(':') {
+        return Err(format!(
+            "expected 'USER:PASS' for --basic-auth, got {s:?}"
+        ));
+    }
+    Ok(s.to_string())
+}
+
+/// Parse a curl-compatible `HOST:PORT:ADDR` resolve override. The HOST
+/// and ADDR strings are allowed to be IPv6 literals (bracketed). We
+/// split on the final two `:` so `ADDR` can itself be an IPv6 literal
+/// like `[::1]`.
+pub fn parse_resolve_flag(s: &str) -> Result<(String, u16, String), String> {
+    // Find the last two ':' — those separate PORT:ADDR. Everything
+    // before is HOST.
+    let last = s
+        .rfind(':')
+        .ok_or_else(|| format!("expected 'HOST:PORT:ADDR' for --resolve, got {s:?}"))?;
+    let (head, addr) = s.split_at(last);
+    let addr = addr.trim_start_matches(':').to_string();
+    let mid = head
+        .rfind(':')
+        .ok_or_else(|| format!("expected 'HOST:PORT:ADDR' for --resolve, got {s:?}"))?;
+    let (host, port_str) = head.split_at(mid);
+    let port_str = port_str.trim_start_matches(':');
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid port in --resolve {s:?}: {port_str:?}"))?;
+    if host.is_empty() || addr.is_empty() {
+        return Err(format!("empty HOST or ADDR in --resolve {s:?}"));
+    }
+    Ok((host.to_string(), port, addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,5 +939,245 @@ mod tests {
         // Default should be num_cpus(), which is >= 1.
         assert!(args.threads >= 1);
         assert_eq!(args.threads, num_cpus());
+    }
+
+    // ---------- new flags (S1.6 — S3.28) ----------
+
+    #[test]
+    fn args_warmup_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--warmup",
+            "5s",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.warmup, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn args_warmup_invalid_form_rejected() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--warmup",
+            "abc",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("invalid") || msg.contains("duration"));
+    }
+
+    #[test]
+    fn args_basic_auth_parses_and_keeps_value() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--basic-auth",
+            "alice:hunter2",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.basic_auth.as_deref(), Some("alice:hunter2"));
+        assert!(args.bearer.is_none());
+    }
+
+    #[test]
+    fn args_basic_auth_requires_colon() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--basic-auth",
+            "no-colon-here",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("user:pass") || msg.contains("expected"));
+    }
+
+    #[test]
+    fn args_bearer_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--bearer",
+            "eyJabc",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.bearer.as_deref(), Some("eyJabc"));
+    }
+
+    #[test]
+    fn args_basic_auth_conflicts_with_bearer() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--basic-auth",
+            "a:b",
+            "--bearer",
+            "x",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot be used"));
+    }
+
+    #[test]
+    fn args_json_body_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--json",
+            "{\"k\":1}",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.json.as_deref(), Some("{\"k\":1}"));
+    }
+
+    #[test]
+    fn args_form_body_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--form",
+            "k=v&other=thing",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(args.form.as_deref(), Some("k=v&other=thing"));
+    }
+
+    #[test]
+    fn args_json_conflicts_with_body() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--json",
+            "{\"a\":1}",
+            "--body",
+            "raw",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot be used"));
+    }
+
+    #[test]
+    fn args_json_conflicts_with_form() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--json",
+            "{\"a\":1}",
+            "--form",
+            "k=v",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot be used"));
+    }
+
+    #[test]
+    fn args_resolve_parses_single() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--resolve",
+            "example.com:443:10.0.0.5",
+            "http://example.com/",
+        ])
+        .unwrap();
+        assert_eq!(args.resolve.len(), 1);
+        assert_eq!(args.resolve[0].0, "example.com");
+        assert_eq!(args.resolve[0].1, 443);
+        assert_eq!(args.resolve[0].2, "10.0.0.5");
+    }
+
+    #[test]
+    fn args_resolve_repeatable() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--resolve",
+            "a.example:80:1.1.1.1",
+            "--resolve",
+            "b.example:443:2.2.2.2",
+            "http://a.example/",
+        ])
+        .unwrap();
+        assert_eq!(args.resolve.len(), 2);
+    }
+
+    #[test]
+    fn args_resolve_rejects_missing_parts() {
+        let err = CliArgs::try_parse_from([
+            "zerobench",
+            "--resolve",
+            "bad-value",
+            "http://h:1/",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("host:port:addr") || msg.contains("invalid"));
+    }
+
+    #[test]
+    fn args_http2_prior_knowledge_flag() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--http2-prior-knowledge",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert!(args.http2_prior_knowledge);
+    }
+
+    #[test]
+    fn args_output_file_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "-o",
+            "/tmp/report.txt",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output.as_deref().and_then(|p| p.to_str()),
+            Some("/tmp/report.txt"),
+        );
+    }
+
+    #[test]
+    fn args_dry_run_flag_parses() {
+        let args = CliArgs::try_parse_from([
+            "zerobench",
+            "--dry-run",
+            "http://h:1/",
+        ])
+        .unwrap();
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn parse_resolve_valid_and_invalid() {
+        let ok = parse_resolve_flag("example.com:443:10.0.0.5").unwrap();
+        assert_eq!(ok.0, "example.com");
+        assert_eq!(ok.1, 443);
+        assert_eq!(ok.2, "10.0.0.5");
+
+        assert!(parse_resolve_flag("missing-everything").is_err());
+        assert!(parse_resolve_flag("host:addr").is_err());
+        assert!(parse_resolve_flag("host:notaport:1.2.3.4").is_err());
+        assert!(parse_resolve_flag(":443:1.1.1.1").is_err());
+        assert!(parse_resolve_flag("host:443:").is_err());
+    }
+
+    #[test]
+    fn parse_basic_auth_valid_and_invalid() {
+        assert!(parse_basic_auth_flag("a:b").is_ok());
+        assert!(parse_basic_auth_flag("alice:hunter:colon").is_ok());
+        assert!(parse_basic_auth_flag("").is_err());
+        assert!(parse_basic_auth_flag("nocolon").is_err());
+    }
+
+    #[test]
+    fn long_version_lists_default_features() {
+        let s = long_version();
+        assert!(s.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(s.contains("Features: h1"));
+        assert!(s.contains("mio/epoll"));
     }
 }

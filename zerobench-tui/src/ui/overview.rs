@@ -106,10 +106,23 @@ fn render_throughput_sparkline(frame: &mut Frame, area: Rect, state: &DashboardS
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Top row: big rps readout + peak/min/avg. Bottom rows: sparkline.
+    // Layout adapts to whether there are errors to surface. When
+    // `total_errors > 0` we insert a one-line compact error summary
+    // between the big rps readout and the sparkline so users don't
+    // have to press [4] to notice something is wrong.
+    let total_errors = state.total_errors.total();
+    let show_errors = total_errors > 0;
+
+    let mut constraints = Vec::with_capacity(3);
+    constraints.push(Constraint::Length(2)); // big rps + peak/min/avg
+    if show_errors {
+        constraints.push(Constraint::Length(1)); // compact error summary
+    }
+    constraints.push(Constraint::Min(1)); // sparkline fills the rest
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .constraints(constraints)
         .split(inner);
 
     let rps = state.requests_per_sec();
@@ -135,7 +148,13 @@ fn render_throughput_sparkline(frame: &mut Frame, area: Rect, state: &DashboardS
     ]);
     frame.render_widget(Paragraph::new(big), rows[0]);
 
-    let spark_area = rows[1];
+    let spark_area = if show_errors {
+        render_error_summary(frame, rows[1], state);
+        rows[2]
+    } else {
+        rows[1]
+    };
+
     let width = spark_area.width as usize;
     if width == 0 {
         return;
@@ -160,6 +179,40 @@ fn render_throughput_sparkline(frame: &mut Frame, area: Rect, state: &DashboardS
         .max(max_hint)
         .style(Style::new().fg(PALETTE[0]));
     frame.render_widget(sparkline, spark_area);
+}
+
+/// Compact one-line error summary shown on the Overview tab when
+/// `total_errors > 0`. Mirrors the categories on the Errors tab so
+/// users know which bucket is firing without switching tabs.
+fn render_error_summary(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let e = &state.total_errors;
+    let dim = Style::new().fg(Color::DarkGray);
+    let red_bold = Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD);
+
+    // Colour each counter red when non-zero, dim grey when zero —
+    // mirrors the Errors tab treatment so the meaning is consistent.
+    let counter_style = |n: u64| if n == 0 { dim } else { red_bold };
+
+    let spans = vec![
+        Span::styled(
+            "errors  ",
+            Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("connect ", dim),
+        Span::styled(format!("{}", e.connect), counter_style(e.connect)),
+        Span::raw("  "),
+        Span::styled("read ", dim),
+        Span::styled(format!("{}", e.read), counter_style(e.read)),
+        Span::raw("  "),
+        Span::styled("4xx ", dim),
+        Span::styled(format!("{}", e.status_4xx), counter_style(e.status_4xx)),
+        Span::raw("  "),
+        Span::styled("5xx ", dim),
+        Span::styled(format!("{}", e.status_5xx), counter_style(e.status_5xx)),
+        Span::styled("    (tap [4] for detail)", dim),
+    ];
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ---------------------------------------------------------------------------

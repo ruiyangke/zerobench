@@ -1,6 +1,6 @@
 [package]
 name = "zerobench-http"
-description = "HTTP/1/2/3 transport for zerobench, built on hyper + cyper-core"
+description = "HTTP/1 and HTTP/2 transport for zerobench — mio/epoll, zero async"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,59 +9,35 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = []  # no runtime by default — mio-h1 needs no async deps
-h1 = ["dep:hyper", "dep:http-body-util", "dep:futures-util"]
-h2 = ["h1", "hyper/http2"]
-h3 = []   # placeholder — wires h3 + compio-quic in Phase 8
-raw-h1 = ["dep:httparse", "dep:itoa", "dep:futures-util"]
-mio-h1 = ["dep:mio", "dep:httparse", "dep:itoa", "dep:memchr"]
+default = []
+mio-h1 = ["dep:mio", "dep:httparse", "dep:itoa", "dep:memchr", "dep:rand"]
 mio-h2 = ["mio-h1", "dep:h2", "dep:tokio"]
-runtime-compio = ["dep:compio", "dep:compio-tls", "dep:cyper-core", "zerobench-core/runtime-compio"]
-runtime-tokio = ["dep:tokio", "dep:tokio-rustls", "dep:hyper-util", "zerobench-core/runtime-tokio"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
 http = { workspace = true }
 bytes = { workspace = true }
 
-# Hyper-based H1/H2 (pulled in by h1/h2 features)
-hyper = { workspace = true, features = ["http1"], optional = true }
-http-body-util = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
-
-# Compio backend (default)
-compio = { workspace = true, optional = true }
-compio-tls = { workspace = true, optional = true }
-cyper-core = { workspace = true, optional = true }
-
-# Raw H1 backend (opt-in)
+# Raw H1 request/response helpers
 httparse = { workspace = true, optional = true }
 itoa = { workspace = true, optional = true }
 
-# Mio backend (opt-in, synchronous epoll)
+# Mio backend (synchronous epoll)
 mio = { workspace = true, optional = true }
 memchr = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
-# H2 protocol crate (mio-h2: manually polled, no async runtime)
+# H2 protocol crate (mio-h2: manually polled from mio)
 h2 = { workspace = true, optional = true }
 
-# Tokio backend (opt-in)
-tokio = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
+# Tokio — minimal (io-util only) for h2 crate's AsyncRead/AsyncWrite
+tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
+
 rustls = { workspace = true }
 
 [dev-dependencies]
-hyper = { workspace = true, features = ["http1", "http2", "server"] }
 rustls = { workspace = true }
-compio = { workspace = true }
-compio-tls = { workspace = true }
 rcgen = { workspace = true }
-tokio = { workspace = true }
-tokio-rustls = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
-futures-util = { workspace = true }
 
 [lints]
 workspace = true

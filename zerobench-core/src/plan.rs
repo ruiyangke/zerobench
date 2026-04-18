@@ -157,10 +157,77 @@ impl RateProfile {
 pub enum Step {
     /// Send an HTTP request and optionally extract/assert on the response.
     Request(RequestPlan),
+    /// Open an SSE stream and read chunks until completion.
+    SseStream(SsePlan),
+    /// Open a WebSocket, send one message, receive one message (one round).
+    WsRound(WsRoundPlan),
     /// Sleep a fixed duration before the next step.
     Pause(Duration),
     /// Sleep a uniformly-random duration in `[min, max]`.
     PauseRandom { min: Duration, max: Duration },
+}
+
+/// Compiled SSE stream plan. One iteration opens one stream, reads chunks
+/// until the server closes or `expect_chunks` is satisfied, then records
+/// the stream as completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsePlan {
+    /// Target URL — a template so `{{env:HOST}}/events/{{var:id}}` works.
+    pub url: Template,
+    /// Extra HTTP headers beyond the protocol-mandated `Accept:
+    /// text/event-stream`. Both sides are templates.
+    pub headers: SmallVec<[(Template, Template); 4]>,
+    /// Assertion: the stream must emit at least this many data events
+    /// before closing. `None` = no minimum, just count whatever arrives.
+    pub expect_chunks: Option<usize>,
+}
+
+/// Compiled WebSocket round plan. One iteration opens a WS connection,
+/// sends `message`, receives one reply, then closes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsRoundPlan {
+    /// Target URL — `ws://` or `wss://`. Templates are allowed in the
+    /// path/query (see [`crate::template::Template`]).
+    pub url: Template,
+    /// Extra HTTP headers beyond the protocol-mandated Upgrade/Sec-*
+    /// handshake headers. Both sides are templates.
+    pub headers: SmallVec<[(Template, Template); 4]>,
+    /// Text frame payload sent on every iteration.
+    pub message: Template,
+}
+
+/// Wire-level protocol a scenario speaks. Inferred from the first
+/// non-Pause step; used by the CLI dispatcher to route scenarios to the
+/// right backend (HTTP / SSE / WS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// HTTP request/response (via mio_h1 or mio_h2).
+    Http,
+    /// Server-Sent Events (via zerobench-sse).
+    Sse,
+    /// WebSocket (via zerobench-ws).
+    Ws,
+}
+
+impl Scenario {
+    /// Infer this scenario's protocol from the first non-Pause step.
+    ///
+    /// Mixed-protocol scenarios are out of scope for Tier 1 — the first
+    /// wire step wins. An empty-or-pauses-only scenario defaults to
+    /// [`Protocol::Http`] so it's routed to a backend that silently
+    /// skips it (the HTTP backend's `pick_scenario` filters scenarios
+    /// that have no Request step).
+    pub fn protocol(&self) -> Protocol {
+        for step in &self.steps {
+            match step {
+                Step::Request(_) => return Protocol::Http,
+                Step::SseStream(_) => return Protocol::Sse,
+                Step::WsRound(_) => return Protocol::Ws,
+                Step::Pause(_) | Step::PauseRandom { .. } => continue,
+            }
+        }
+        Protocol::Http
+    }
 }
 
 /// A single request's compiled description.
@@ -182,14 +249,11 @@ pub struct RequestPlan {
     /// Post-response assertions. Failure increments
     /// `errors.assertion_failed` but does not abort the scenario.
     pub checks: Vec<Assertion>,
-    /// The caller wants the response body delivered as a stream
-    /// ([`crate::transport::ResponseBody::Stream`]) rather than buffered.
-    /// Used by SSE plans so the runner can time each chunk as it arrives.
+    /// The caller wants the response body delivered as a stream rather
+    /// than buffered. Used by SSE plans so the runner can time each chunk
+    /// as it arrives.
     ///
-    /// Default `false` — the buffered path is the v0.0.1 baseline. Only
-    /// transports that advertise streaming support (`Http1Pool`, for now)
-    /// honour this flag; others transparently fall back to the buffered
-    /// path.
+    /// Default `false` — the buffered path is the v0.0.1 baseline.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expect_streaming: bool,
 }
@@ -206,6 +270,25 @@ impl RequestPlan {
             extract: Vec::new(),
             checks: Vec::new(),
             expect_streaming: false,
+        }
+    }
+
+    /// `true` if every template in this plan (URL, headers, body) is
+    /// fully static — no `{{...}}` parts. A static plan can be
+    /// pre-built once into wire bytes and reused without per-request
+    /// template expansion.
+    pub fn is_static(&self) -> bool {
+        if !self.url.is_static() {
+            return false;
+        }
+        for (name, val) in &self.headers {
+            if !name.is_static() || !val.is_static() {
+                return false;
+            }
+        }
+        match &self.body {
+            Some(BodySource::Template(t)) => t.is_static(),
+            _ => true,
         }
     }
 }
@@ -358,5 +441,74 @@ mod tests {
             }
             other => panic!("expected Saturate, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Protocol inference
+    // -----------------------------------------------------------------
+
+    fn lit(s: &str) -> Template {
+        Template::literal(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    #[test]
+    fn protocol_http_when_first_step_is_request() {
+        let sc = Scenario::new(
+            "h",
+            vec![Step::Request(RequestPlan::get(lit("/")))],
+        );
+        assert_eq!(sc.protocol(), Protocol::Http);
+    }
+
+    #[test]
+    fn protocol_sse_when_first_step_is_sse() {
+        let sc = Scenario::new(
+            "s",
+            vec![Step::SseStream(SsePlan {
+                url: lit("http://x/events"),
+                headers: SmallVec::new(),
+                expect_chunks: None,
+            })],
+        );
+        assert_eq!(sc.protocol(), Protocol::Sse);
+    }
+
+    #[test]
+    fn protocol_ws_when_first_step_is_ws() {
+        let sc = Scenario::new(
+            "w",
+            vec![Step::WsRound(WsRoundPlan {
+                url: lit("ws://x/"),
+                headers: SmallVec::new(),
+                message: lit("ping"),
+            })],
+        );
+        assert_eq!(sc.protocol(), Protocol::Ws);
+    }
+
+    #[test]
+    fn protocol_skips_pauses_and_picks_first_wire_step() {
+        let sc = Scenario::new(
+            "mixed",
+            vec![
+                Step::Pause(Duration::from_millis(5)),
+                Step::PauseRandom {
+                    min: Duration::from_millis(1),
+                    max: Duration::from_millis(2),
+                },
+                Step::WsRound(WsRoundPlan {
+                    url: lit("ws://x/"),
+                    headers: SmallVec::new(),
+                    message: lit("hi"),
+                }),
+            ],
+        );
+        assert_eq!(sc.protocol(), Protocol::Ws);
+    }
+
+    #[test]
+    fn protocol_defaults_to_http_for_empty_scenario() {
+        let sc = Scenario::new("empty", vec![]);
+        assert_eq!(sc.protocol(), Protocol::Http);
     }
 }

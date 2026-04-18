@@ -133,11 +133,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState, short: b
 
     // Row 1: url · status · elapsed.
     let actual_pct = state.actual_vs_target_pct();
-    let errors_present = state.total_errors.total() > 0;
+    let total_errors = state.total_errors.total();
     let status = if state.run_completed {
         common::Status::Done
     } else {
-        compute_status(actual_pct, errors_present)
+        compute_status(actual_pct, state.total_requests, total_errors)
     };
 
     let elapsed_s = state.elapsed().as_secs_f64();
@@ -155,6 +155,8 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState, short: b
         Span::raw(" "),
         if state.run_completed {
             Span::styled("done", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else if matches!(status, common::Status::Red) && state.total_requests == 0 {
+            Span::styled("connection failed", Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(
                 format!("{elapsed_s:.1}s / {total_s}s"),
@@ -190,9 +192,15 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState, short: b
         Some(rate) => format!("target {}", format_rate(rate)),
         None => "target saturate".to_string(),
     };
-    let actual_text = match actual_pct {
-        Some(pct) => format!("actual {} ({:.2}%)", format_rate(actual_rps), pct),
-        None => format!("actual {}", format_rate(actual_rps)),
+    let actual_text = if actual_rps < 0.5 && total_errors > 0 {
+        // Zero throughput + errors → show error count so the user
+        // knows immediately why nothing is flowing.
+        format!("actual 0 req/s · {} errors (see [4] Errors)", total_errors)
+    } else {
+        match actual_pct {
+            Some(pct) => format!("actual {} ({:.2}%)", format_rate(actual_rps), pct),
+            None => format!("actual {}", format_rate(actual_rps)),
+        }
     };
     let row2_left = Line::from(vec![
         Span::styled(" ", Style::new()),

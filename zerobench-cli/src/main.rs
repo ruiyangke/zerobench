@@ -1,35 +1,19 @@
 //! zerobench — CLI entry point.
 //!
-//! Flow:
-//! 1. Parse args via `clap`.
-//! 2. Build the `Plan` / `Target` / `TransportOpts` triple from args.
-//! 3. Open the HTTP transport client against the target.
-//! 4. Dispatch the bench — `run_saturate` (Task 7) or `run_open_loop`
-//!    (Task 10).
-//! 5. Merge per-task stats into a `Summary`.
-//! 6. Render via the chosen reporter.
-//! 7. Exit 0 on clean runs, 1 when errors/assertion failures occurred,
-//!    2 for usage errors.
+//! Synchronous, mio/epoll-based. Zero async runtime.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::io::IsTerminal;
+use std::fs::File;
+use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
 use zerobench_core::{
     print_json, print_terminal, ColorChoice, Summary,
 };
-#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
-use zerobench_core::StopSignal;
-#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
-use zerobench_core::{
-    run_open_loop, run_open_loop_threaded, run_saturate,
-    run_saturate_threaded, Transport,
-};
-#[cfg(feature = "h1")]
-use zerobench_http::HttpTransport;
 
 mod cli_args;
 mod diff;
@@ -38,13 +22,12 @@ mod plan_from_cli;
 use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
 // ---------------------------------------------------------------------------
-// Entry point — synchronous fn main() that dispatches to the right path
+// Entry point
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
     let args = CliArgs::parse();
 
-    // Route sub-commands first — they don't touch the transport layer.
     if let Some(cmd) = args.command.clone() {
         return match cmd {
             Subcommand::Diff(da) => match diff::run(&da) {
@@ -55,62 +38,27 @@ fn main() -> ExitCode {
                 }
             },
             #[cfg(feature = "script")]
-            Subcommand::Run(ra) => {
-                #[cfg(feature = "runtime-compio")]
-                {
-                    let rt = compio::runtime::Runtime::new().unwrap();
-                    return match rt.block_on(run_script(ra)) {
-                        Ok(code) => code,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            ExitCode::from(2)
-                        }
-                    };
-                }
-                #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-                {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    return match rt.block_on(run_script(ra)) {
-                        Ok(code) => code,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            ExitCode::from(2)
-                        }
-                    };
-                }
-                #[allow(unreachable_code)]
-                {
-                    eprintln!("error: script subcommand requires --features runtime-compio");
-                    ExitCode::from(2)
-                }
-            }
-        };
-    }
-
-    // Determine whether to use mio (synchronous path).
-    if should_use_mio(&args) {
-        #[cfg(feature = "mio-h1")]
-        {
-            return match run_mio_sync(&args) {
+            Subcommand::Run(ra) => match run_script_sync(ra) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");
                     ExitCode::from(2)
                 }
-            };
-        }
-        #[cfg(not(feature = "mio-h1"))]
-        {
-            eprintln!("error: mio-h1 feature not compiled in");
-            return ExitCode::from(2);
-        }
+            },
+        };
     }
 
-    // Async path — compio takes precedence when both are enabled.
-    #[cfg(feature = "runtime-compio")]
-    {
-        let rt = compio::runtime::Runtime::new().unwrap();
-        return match rt.block_on(run(args)) {
+    // S0.4 — no URL, no request file, no subcommand: print a friendly
+    // quickstart instead of clap's "error: ..." so CI health checks
+    // (e.g. `zerobench && echo ok`) pass.
+    if args.url.is_none() && args.request_file.is_none() && args.requests.is_none() {
+        print_quickstart();
+        return ExitCode::SUCCESS;
+    }
+
+    // S3.27 — dry run: resolve DNS, print a config block, exit.
+    if args.dry_run {
+        return match run_dry(&args) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -119,482 +67,127 @@ fn main() -> ExitCode {
         };
     }
 
-    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        return match rt.block_on(run(args)) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // No async runtime and not using mio — nothing we can do.
-    #[allow(unreachable_code)]
-    {
-        eprintln!("error: no runtime available. Rebuild with --features mio-h1 or --features runtime-compio");
-        ExitCode::from(2)
+    match run_mio_sync(&args) {
+        Ok(code) => code,
+        Err(e) => {
+            print_error_with_hint(&*e);
+            ExitCode::from(2)
+        }
     }
 }
 
-/// Determine whether to use the mio synchronous path.
-#[cfg(feature = "mio-h1")]
-fn should_use_mio(args: &CliArgs) -> bool {
-    // Explicit --mio flag
-    if args.mio {
-        return true;
-    }
+/// S0.4 — friendlier no-args landing page.
+fn print_quickstart() {
+    println!(
+        "zerobench — HTTP benchmarking (mio/epoll)\n\
+         \n\
+         Quick start:\n    \
+             zerobench http://localhost:8080             # 30s saturate\n    \
+             zerobench http://localhost:8080 -d 1m -c 200\n    \
+             zerobench --sse http://localhost:8080/events -c 100\n    \
+             zerobench run my.rhai                        # scripted scenarios\n    \
+             zerobench --help                             # full reference\n"
+    );
+}
 
-    // No async runtime compiled in — mio is the only option
-    #[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
-    {
-        let _ = args;
-        return true;
-    }
-
-    #[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
-    {
-        let _ = args;
-        false
+/// S2.21 — rewrite bare error strings with a practical hint. The
+/// underlying `BuildError` and `TargetError` types are owned by
+/// zerobench-core and immutable to the CLI, so we pattern-match on the
+/// formatted message substring.
+fn print_error_with_hint(e: &(dyn std::error::Error + 'static)) {
+    let msg = format!("{e}");
+    eprintln!("error: {msg}");
+    let lower = msg.to_lowercase();
+    if lower.contains("invalid port") {
+        eprintln!("hint: port must be 1-65535.");
+    } else if lower.contains("invalid url") || lower.contains("missing host") {
+        eprintln!("hint: URL must include scheme, e.g. http:// or https://");
+    } else if lower.contains("connection refused") {
+        eprintln!("hint: is the target server running on that host:port?");
     }
 }
 
-#[cfg(not(feature = "mio-h1"))]
-fn should_use_mio(args: &CliArgs) -> bool {
-    let _ = args;
-    false
-}
+/// S3.27 — parse args, build plan, resolve DNS, print config, exit 0.
+fn run_dry(args: &CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let (plan, target, opts) = plan_from_cli::build(args)?;
 
-#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
-async fn run(args: CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let open_loop = args.rate.is_some();
-
-    // --- TUI / JSONL mutual-exclusion guard -----------------------------
-    //
-    // For v0.0.1 the TUI and JSONL streamer both write to stdout; running
-    // both interleaves ANSI cursor moves with JSONL lines, corrupting
-    // anything downstream trying to parse either. Fail fast with a clean
-    // error rather than producing garbage.
-    //
-    // Checked before `build_client` so a mis-invocation surfaces as a
-    // clean usage error rather than a network failure.
-    #[cfg(feature = "tui")]
-    let tui_enabled = args.tui;
-    #[cfg(not(feature = "tui"))]
-    let tui_enabled = false;
-
-    if tui_enabled && matches!(args.format, CliFormat::Jsonl) {
-        return Err(
-            "--tui cannot be combined with --format jsonl (both write to stdout)".into(),
-        );
-    }
-    #[cfg(feature = "tui")]
-    if tui_enabled {
-        // The dashboard is unusable without a TTY (no place to render
-        // the alt-screen buffer) — surface that up-front instead of
-        // failing mid-run with a confusing crossterm error.
-        if !std::io::stdout().is_terminal() {
-            return Err("--tui requires stdout to be a TTY".into());
-        }
-    }
-
-    // WS takes a completely separate path — no hyper, no templates,
-    // no scenario engine. `build_ws_plan` produces the narrow
-    // `WsPlan` that the runner wants. The check runs *before*
-    // `plan_from_cli::build` because WS URLs (`ws://`, `wss://`) also
-    // pass `Target::parse` but the usual Plan path would then try to
-    // template and build an HTTP request — not what we want.
-    #[cfg(feature = "ws")]
-    if args.ws {
-        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-        return Err("--ws mode requires the compio runtime (compile with --features runtime-compio)".into());
-
-        // We also catch --ws + --sse here since both features may
-        // be compiled in.
-        #[cfg(feature = "sse")]
-        if args.sse {
-            return Err("--ws and --sse are mutually exclusive".into());
-        }
-        // Explicit --http-version with --ws is meaningless — the
-        // Upgrade handshake is HTTP/1.1 by spec.
-        #[cfg(feature = "runtime-compio")]
-        if !matches!(args.http_version, cli_args::CliHttpVersion::Auto) {
-            return Err(
-                "--ws cannot be combined with an explicit --http-version (the RFC 6455 Upgrade is HTTP/1.1 by spec)"
-                    .into(),
-            );
-        }
-        #[cfg(feature = "runtime-compio")]
-        return run_ws(&args).await;
-    }
-
-    let (mut plan, target, opts) = plan_from_cli::build(&args)?;
-    plan.threads = args.threads;
-
-    // SSE takes a different path — it opens its own fresh connections
-    // per iteration rather than going through the shared `Http1Pool`.
-    // The `Response`'s single-shot shape doesn't fit the "many chunks
-    // over time" semantics of SSE, and the SseRunner wants per-chunk
-    // timing anyway. Everything else goes through the standard
-    // saturate / open-loop dispatcher below.
-    #[cfg(feature = "sse")]
-    if args.sse {
-        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-        return Err("--sse mode requires the compio runtime (compile with --features runtime-compio)".into());
-
-        #[cfg(feature = "runtime-compio")]
-        return run_sse(&args, &plan, &target, &opts).await;
-    }
-
-    // Raw H1 transport — separate dispatch path using RawH1Transport
-    // instead of the hyper-based HttpTransport. Same engine, different
-    // wire implementation.
-    #[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
-    if args.raw {
-        return run_with_transport::<zerobench_http::RawH1Transport>(
-            &args, plan, target, opts, open_loop, tui_enabled,
-        )
-        .await;
-    }
-    #[cfg(all(feature = "raw-h1", feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    if args.raw {
-        return run_with_transport::<zerobench_http::RawH1TransportTokio>(
-            &args, plan, target, opts, open_loop, tui_enabled,
-        )
-        .await;
-    }
-
-    // Mio H1 transport — bypasses the async runtime entirely. Each worker
-    // thread runs its own mio::Poll in a synchronous event loop.
-    #[cfg(feature = "mio-h1")]
-    if args.mio {
-        return run_mio(&args, plan, target, &opts).await;
-    }
-
-    // Stand up the transport client for the single-threaded path.
-    // Multi-threaded dispatch builds per-thread clients inside each
-    // worker thread (each thread needs its own compio runtime to own
-    // the pool's IO handles), so we skip the main-thread client.
-    let client = if args.threads <= 1 {
-        Some(<HttpTransport as Transport>::build_client(&target, &opts).await?)
+    // Resolve DNS — `Target::resolve` already consults
+    // `opts.resolve_overrides` (populated from `--resolve` on the CLI)
+    // before falling back to the system resolver.
+    let scheme = if target.tls { "https" } else { "http" };
+    let url_label = if (target.tls && target.port == 443)
+        || (!target.tls && target.port == 80)
+    {
+        format!("{scheme}://{}", target.host)
     } else {
-        None
+        format!("{scheme}://{}:{}", target.host, target.port)
+    };
+    let resolved = match target.resolve(&opts) {
+        Ok(sa) => sa.to_string(),
+        Err(e) => format!("(unresolved: {e})"),
     };
 
-    // Set up live streaming for JSONL streaming OR the TUI dashboard —
-    // both consume the same `LiveSnapshot`. `LiveSnapshot::new`
-    // already returns an `Arc`, so we keep it as is rather than
-    // double-wrapping.
-    let live = if matches!(args.format, CliFormat::Jsonl) || tui_enabled {
-        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
+    let mode = if let Some(r) = args.rate {
+        format!("open-loop rate {r:.0} req/s")
     } else {
-        None
+        format!("saturate ({} tasks)", args.connections)
     };
 
-    // Spawn the per-second ticker task if we're streaming JSONL. The
-    // ticker writes one line per second to stdout; the final summary
-    // goes to stderr so pipelines capturing stdout get clean JSONL.
-    let ticker_stop = StopSignal::new();
-
-    #[cfg(feature = "runtime-compio")]
-    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
-        let live = live.clone();
-        let stop = ticker_stop.clone();
-        Some(compio::runtime::spawn(
-            async move { jsonl_ticker(live, stop).await },
-        ))
-    } else {
-        None
-    };
-
-    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
-        let live = live.clone();
-        let stop = ticker_stop.clone();
-        Some(tokio::task::spawn_local(
-            async move { jsonl_ticker(live, stop).await },
-        ))
-    } else {
-        None
-    };
-
-    // Run. The stop signal ticks after `plan.duration` elapses; the
-    // TUI also flips it when the user hits `q` so the dispatcher
-    // exits early and records the actual (shorter) duration.
-    //
-    // Multi-threaded dispatch blocks the calling thread on join(),
-    // which prevents compio's reactor from polling. Use `after_wall`
-    // (OS thread + std::thread::sleep) so the timer fires even when
-    // the main thread is blocked. Single-thread mode uses the
-    // original async-runtime-based `after` to avoid an unnecessary OS thread.
-    let multi_threaded = args.threads > 1;
-    #[cfg(feature = "runtime-compio")]
-    let stop = if multi_threaded {
-        StopSignal::after_wall(plan.duration)
-    } else {
-        StopSignal::after(plan.duration)
-    };
-    // On tokio, multi-threaded dispatch uses a dedicated tokio runtime
-    // that calls block_on internally, so the main tokio runtime stays
-    // responsive. Use the async `after` in both cases.
-    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    let stop = if multi_threaded {
-        StopSignal::after_wall(plan.duration)
-    } else {
-        StopSignal::after(plan.duration)
-    };
-
-    // Spawn the TUI task if `--tui` is on. The TUI owns the terminal
-    // for the duration of the run; its own loop calls
-    // `swap_and_snapshot` at 1 Hz to drain the shared LiveSnapshot.
-    //
-    // We share `stop` with the dispatcher: when the user hits `q`,
-    // the TUI stops it, which breaks the workers out of their loops.
-    // This matches the design spec — `q` terminates the whole run,
-    // not just the dashboard.
-    #[cfg(feature = "tui")]
-    let tui_handle = if tui_enabled {
-        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-        return Err("--tui mode requires the compio runtime (compile with --features runtime-compio)".into());
-
-        #[cfg(feature = "runtime-compio")]
-        {
-            let live = live.clone().expect("live snapshot set above when tui_enabled");
-            let target_rate_opt = args.rate;
-            let total_duration = plan.duration;
-            let url_label = format_url_label(&target);
-            let transport_info = build_transport_info(&args, &target, &opts);
-            let scenario_names: Vec<String> =
-                plan.scenarios.iter().map(|s| s.name.clone()).collect();
-            let stop_for_tui = stop.clone();
-            let handle = compio::runtime::spawn(async move {
-                zerobench_tui::run_tui(
-                    live,
-                    stop_for_tui,
-                    target_rate_opt,
-                    total_duration,
-                    url_label,
-                    transport_info,
-                    scenario_names,
-                )
-                .await
-            });
-            Some(handle)
-        }
-    } else {
-        None
-    };
-
-    let stats = if multi_threaded {
-        // Multi-threaded path: the threaded dispatchers are synchronous
-        // (they spawn OS threads internally and join). When TUI is
-        // enabled, run the dispatcher on a background OS thread so the
-        // main compio runtime can keep polling the TUI task.
-        let plan = std::sync::Arc::new(plan.clone());
-        let target = std::sync::Arc::new(target);
-        let opts = std::sync::Arc::new(opts);
-        let num_threads = args.threads;
-        let connections = args.connections;
-        let stop_for_dispatch = stop.clone();
-        let live_for_dispatch = live.clone();
-
-        // When the TUI or JSONL ticker is active, compio tasks on the
-        // main runtime need to keep being polled. Run the blocking
-        // threaded dispatcher on a background OS thread and poll a
-        // channel, yielding to the main reactor between checks.
-        let needs_reactor = tui_enabled || live.is_some();
-        if needs_reactor {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let stats = if open_loop {
-                    run_open_loop_threaded::<HttpTransport>(
-                        plan, target, opts, num_threads, connections,
-                        stop_for_dispatch, live_for_dispatch,
-                    )
-                } else {
-                    run_saturate_threaded::<HttpTransport>(
-                        plan, target, opts, num_threads, connections,
-                        stop_for_dispatch, live_for_dispatch,
-                    )
-                };
-                let _ = tx.send(stats);
-            });
-            loop {
-                if let Ok(stats) = rx.try_recv() {
-                    break stats;
-                }
-                zerobench_core::runtime::runtime_sleep(std::time::Duration::from_millis(50)).await;
-            }
+    println!("dry run — no traffic sent");
+    println!("target:     {url_label} \u{2192} {resolved}");
+    println!(
+        "plan:       {} scenario{}, {}, {}",
+        plan.scenarios.len(),
+        if plan.scenarios.len() == 1 { "" } else { "s" },
+        mode,
+        format_duration(plan.duration),
+    );
+    // The method & headers live on the first scenario's first step.
+    if let Some(zerobench_core::plan::Step::Request(req)) = plan
+        .scenarios
+        .first()
+        .and_then(|s| s.steps.first())
+    {
+        println!("method:     {}", req.method);
+        if req.headers.is_empty() {
+            println!("headers:    (none)");
         } else {
-            // No TUI or JSONL ticker: block the main thread directly —
-            // nothing else needs to run on the compio reactor.
-            if open_loop {
-                run_open_loop_threaded::<HttpTransport>(
-                    plan, target, opts, num_threads, connections,
-                    stop, live.clone(),
-                )
-            } else {
-                run_saturate_threaded::<HttpTransport>(
-                    plan, target, opts, num_threads, connections,
-                    stop, live.clone(),
-                )
-            }
+            println!("headers:    {} header(s)", req.headers.len());
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Format `Duration` for the dry-run block (`30s`, `1m`, `2m30s`).
+fn format_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s == 0 {
+        format!("{}ms", d.as_millis())
+    } else if s % 3600 == 0 {
+        format!("{}h", s / 3600)
+    } else if s % 60 == 0 {
+        format!("{}m", s / 60)
+    } else if s > 60 {
+        let m = s / 60;
+        let sec = s % 60;
+        format!("{m}m{sec}s")
     } else {
-        // Single-threaded fast path — original async dispatch with
-        // no thread-spawn overhead.
-        let client = client.expect("client built for single-threaded path");
-        if open_loop {
-            run_open_loop::<HttpTransport>(
-                &plan,
-                client,
-                args.connections,
-                stop,
-                live.clone(),
-            )
-            .await
-        } else {
-            run_saturate::<HttpTransport>(
-                &plan,
-                client,
-                args.connections,
-                stop,
-                live.clone(),
-            )
-            .await
-        }
-    };
-
-    // Stop the ticker and let it flush its final tick.
-    ticker_stop.stop();
-    if let Some(h) = ticker_handle {
-        let _ = h.await;
-    }
-
-    // Wait for the TUI task to restore the terminal before we print
-    // the final report. The shared `stop` has already tripped (either
-    // the timer fired or the user hit `q`), so the TUI loop is on
-    // its way out; we just wait for it to drop the alt-screen.
-    #[cfg(feature = "tui")]
-    if let Some(handle) = tui_handle {
-        let _ = handle.await;
-    }
-
-    let summary = Summary::merge(stats, plan.duration);
-
-    // Render.
-    let color = match args.color {
-        CliColor::Always => ColorChoice::Always,
-        CliColor::Auto => ColorChoice::Auto,
-        CliColor::Never => ColorChoice::Never,
-    };
-    match args.format {
-        CliFormat::Terminal => {
-            let stdout = std::io::stdout();
-            let is_tty = stdout.is_terminal();
-            let mut out = stdout.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Json => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            print_json(&summary, &plan, &mut out)?;
-        }
-        CliFormat::Jsonl => {
-            // JSONL lines were already streamed to stdout; emit the
-            // final terminal summary to stderr so stdout stays pure
-            // JSONL for downstream pipelines.
-            let stderr = std::io::stderr();
-            let is_tty = stderr.is_terminal();
-            let mut out = stderr.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Prom => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
-        }
-    }
-
-    // Exit code policy: 0 clean, 1 errors/assertion failures, 2 usage
-    // errors (handled in `main`).
-    let total_errors = summary.errors.total();
-    if total_errors > 0 {
-        Ok(ExitCode::from(1))
-    } else if summary.requests == 0 {
-        // Plan ran to completion with zero requests — usually means the
-        // server was unreachable or the duration was set absurdly low.
-        // Signal it as a non-zero exit so CI pipelines notice.
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
+        format!("{s}s")
     }
 }
 
-#[cfg(any(feature = "runtime-compio", feature = "runtime-tokio"))]
-/// Per-second ticker: wakes on integer-second boundaries relative to
-/// the `LiveSnapshot` start, calls `swap_and_snapshot`, emits one JSONL
-/// line to stdout. Exits when `stop` trips; emits one last tick on
-/// exit so any residual samples aren't lost.
-async fn jsonl_ticker(
-    live: std::sync::Arc<zerobench_core::LiveSnapshot>,
-    stop: StopSignal,
-) {
-    use std::io::Write;
-    let start = live.start();
-    let interval = std::time::Duration::from_secs(1);
-    let mut next = start + interval;
-    while !stop.is_stopped() {
-        let now = std::time::Instant::now();
-        let wait = if next > now {
-            next - now
-        } else {
-            std::time::Duration::ZERO
-        };
-        // Cap individual sleep at ~100ms so we wake promptly when
-        // `stop` trips between ticks.
-        let poll_wait = wait.min(std::time::Duration::from_millis(100));
-        zerobench_core::runtime::runtime_sleep(poll_wait).await;
-        if stop.is_stopped() {
-            break;
-        }
-        if std::time::Instant::now() < next {
-            // Hasn't been a full second yet — loop and poll again.
-            continue;
-        }
-        let tick = live.swap_and_snapshot();
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);
-        let _ = out.flush();
-        next += interval;
-    }
-
-    // Flush one final tick so stragglers aren't lost. We emit even
-    // when `tick.requests == 0` — a trailing partial window may still
-    // carry non-zero error counters (especially keepup under
-    // backpressure) or a short burst of samples that wouldn't reach a
-    // full integer-second boundary. The only case we suppress is the
-    // "completely empty" tick (no requests, no errors, no bytes) —
-    // emitting that would just be noise for downstream pipelines.
-    let tick = live.swap_and_snapshot();
-    let has_anything = tick.requests > 0
-        || tick.bytes_sent > 0
-        || tick.bytes_recv > 0
-        || tick.errors.total() > 0;
-    if has_anything {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let _ = zerobench_core::print_jsonl_tick(&tick, &mut out);
-        let _ = out.flush();
-    }
+/// Open `path` for writing the final report, returning the owned file
+/// so stdout-locking code can use a single `Write` trait object.
+fn open_output_file(path: &Path) -> Result<File, Box<dyn std::error::Error>> {
+    File::create(path).map_err(|e| {
+        format!("cannot open output file {}: {e}", path.display()).into()
+    })
 }
 
-/// Compact human-friendly URL for the TUI header bar — `http://host`
-/// or `https://host:port`, omitting the default port so the header
-/// stays readable.
+// ---------------------------------------------------------------------------
+// TUI helpers
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "tui")]
 fn format_url_label(target: &zerobench_core::transport::Target) -> String {
     let scheme = if target.tls { "https" } else { "http" };
@@ -606,13 +199,6 @@ fn format_url_label(target: &zerobench_core::transport::Target) -> String {
     }
 }
 
-/// Build the transport info block the TUI shows in its header row.
-///
-/// Maps CLI args + target + opts into the TUI's wire-ready
-/// `TransportInfo`. Protocol is derived from `--http-version` (Auto →
-/// "H1" / "H2" based on TLS + ALPN capability), mode comes from
-/// `--rate` vs saturate default, ALPN is the label the H2 negotiation
-/// would announce.
 #[cfg(feature = "tui")]
 fn build_transport_info(
     args: &CliArgs,
@@ -626,11 +212,6 @@ fn build_transport_info(
         Some(r) => RunMode::Rate(r),
         None => RunMode::Saturate(args.connections),
     };
-
-    // Pick a protocol label. `Auto` prefers H2 on TLS (ALPN would pick
-    // it) and H1 otherwise. The label is informational — the actual
-    // wire protocol is negotiated at connect time — but it matches
-    // what the user intended well enough for the header.
     let (protocol, alpn) = match opts.http_version {
         HttpVersionPref::Http1 => ("H1".to_string(), Some("http/1.1".to_string())),
         HttpVersionPref::Http2 => ("H2".to_string(), Some("h2".to_string())),
@@ -642,7 +223,6 @@ fn build_transport_info(
             }
         }
     };
-    // Only show ALPN when TLS is on — ALPN is strictly a TLS extension.
     let alpn = if target.tls { alpn } else { None };
 
     TransportInfo {
@@ -655,208 +235,38 @@ fn build_transport_info(
 }
 
 // ---------------------------------------------------------------------------
-// Generic transport dispatch — used by --raw (and potentially future
-// alternative transports) to avoid duplicating the full run() body.
-// ---------------------------------------------------------------------------
-
-/// Run a benchmark with an arbitrary [`Transport`] impl.
-///
-/// Handles single-threaded and multi-threaded dispatch, JSONL streaming,
-/// TUI dashboard, and the full render / exit-code path. This is the
-/// generic counterpart to the `HttpTransport`-hardcoded code in `run()`.
-#[cfg(all(feature = "raw-h1", any(feature = "runtime-compio", feature = "runtime-tokio")))]
-async fn run_with_transport<T: Transport>(
-    args: &CliArgs,
-    mut plan: zerobench_core::plan::Plan,
-    target: zerobench_core::transport::Target,
-    opts: zerobench_core::transport::TransportOpts,
-    open_loop: bool,
-    tui_enabled: bool,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    plan.threads = args.threads;
-
-    let client = if args.threads <= 1 {
-        Some(T::build_client(&target, &opts).await?)
-    } else {
-        None
-    };
-
-    let live = if matches!(args.format, CliFormat::Jsonl) || tui_enabled {
-        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
-    } else {
-        None
-    };
-
-    let ticker_stop = StopSignal::new();
-
-    #[cfg(feature = "runtime-compio")]
-    let ticker_handle = if let (Some(live), CliFormat::Jsonl) = (&live, &args.format) {
-        let live = live.clone();
-        let stop = ticker_stop.clone();
-        Some(compio::runtime::spawn(
-            async move { jsonl_ticker(live, stop).await },
-        ))
-    } else {
-        None
-    };
-    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    let ticker_handle: Option<tokio::task::JoinHandle<()>> = None;
-
-    let multi_threaded = args.threads > 1;
-    #[cfg(feature = "runtime-compio")]
-    let stop = if multi_threaded {
-        StopSignal::after_wall(plan.duration)
-    } else {
-        StopSignal::after(plan.duration)
-    };
-    #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-compio")))]
-    let stop = if multi_threaded {
-        StopSignal::after_wall(plan.duration)
-    } else {
-        StopSignal::after(plan.duration)
-    };
-
-    // TUI is not supported with --raw in v1 — the raw transport is a
-    // max-throughput mode; TUI overhead is unwanted. We skip the TUI
-    // spawn here. If --tui was also passed, the dashboard just doesn't
-    // appear (the terminal report at the end still prints).
-    let stats = if multi_threaded {
-        let plan = std::sync::Arc::new(plan.clone());
-        let target = std::sync::Arc::new(target.clone());
-        let opts = std::sync::Arc::new(opts);
-        let num_threads = args.threads;
-        let connections = args.connections;
-        let stop_for_dispatch = stop.clone();
-        let live_for_dispatch = live.clone();
-
-        let needs_reactor = live.is_some();
-        if needs_reactor {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let stats = if open_loop {
-                    run_open_loop_threaded::<T>(
-                        plan, target, opts, num_threads, connections,
-                        stop_for_dispatch, live_for_dispatch,
-                    )
-                } else {
-                    run_saturate_threaded::<T>(
-                        plan, target, opts, num_threads, connections,
-                        stop_for_dispatch, live_for_dispatch,
-                    )
-                };
-                let _ = tx.send(stats);
-            });
-            loop {
-                if let Ok(stats) = rx.try_recv() {
-                    break stats;
-                }
-                zerobench_core::runtime::runtime_sleep(std::time::Duration::from_millis(50)).await;
-            }
-        } else {
-            if open_loop {
-                run_open_loop_threaded::<T>(
-                    plan, target.into(), opts, num_threads, connections,
-                    stop, live.clone(),
-                )
-            } else {
-                run_saturate_threaded::<T>(
-                    plan, target.into(), opts, num_threads, connections,
-                    stop, live.clone(),
-                )
-            }
-        }
-    } else {
-        let client = client.expect("client built for single-threaded path");
-        if open_loop {
-            run_open_loop::<T>(
-                &plan, client, args.connections, stop, live.clone(),
-            )
-            .await
-        } else {
-            run_saturate::<T>(
-                &plan, client, args.connections, stop, live.clone(),
-            )
-            .await
-        }
-    };
-
-    ticker_stop.stop();
-    if let Some(h) = ticker_handle {
-        let _ = h.await;
-    }
-
-    let summary = Summary::merge(stats, plan.duration);
-
-    let color = match args.color {
-        CliColor::Always => ColorChoice::Always,
-        CliColor::Auto => ColorChoice::Auto,
-        CliColor::Never => ColorChoice::Never,
-    };
-    match args.format {
-        CliFormat::Terminal => {
-            let stdout = std::io::stdout();
-            let is_tty = stdout.is_terminal();
-            let mut out = stdout.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Json => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            print_json(&summary, &plan, &mut out)?;
-        }
-        CliFormat::Jsonl => {
-            let stderr = std::io::stderr();
-            let is_tty = stderr.is_terminal();
-            let mut out = stderr.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Prom => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
-        }
-    }
-
-    let total_errors = summary.errors.total();
-    if total_errors > 0 {
-        Ok(ExitCode::from(1))
-    } else if summary.requests == 0 {
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Mio dispatch — synchronous (called from main() without an async runtime)
 // ---------------------------------------------------------------------------
 
 /// Drive the mio-based benchmark — pure synchronous epoll, no async runtime.
 /// Builds the plan, spawns N OS threads with their own `mio::Poll`, waits
 /// for `plan.duration`, merges stats, renders.
-#[cfg(feature = "mio-h1")]
 fn run_mio_sync(
     args: &CliArgs,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // Guard: features that need an async runtime
-    #[cfg(not(any(feature = "runtime-compio", feature = "runtime-tokio")))]
-    {
-        #[cfg(feature = "sse")]
-        if args.sse {
-            return Err("--sse requires an async runtime. Rebuild with --features sse".into());
-        }
-        #[cfg(feature = "ws")]
-        if args.ws {
-            return Err("--ws requires an async runtime. Rebuild with --features ws".into());
-        }
-        #[cfg(feature = "tui")]
-        if args.tui {
-            return Err("--tui requires an async runtime. Rebuild with --features tui".into());
-        }
-        #[cfg(feature = "raw-h1")]
-        if args.raw {
-            return Err("--raw requires an async runtime. Rebuild with --features raw-h1".into());
-        }
+    // SSE and WS take dedicated paths — no shared dispatch with H1/H2.
+    #[cfg(feature = "sse")]
+    if args.sse {
+        return run_sse_sync(args);
+    }
+    #[cfg(feature = "ws")]
+    if args.ws {
+        return run_ws_sync(args);
+    }
+
+    #[cfg(feature = "tui")]
+    let tui_enabled = args.tui;
+    #[cfg(not(feature = "tui"))]
+    let tui_enabled = false;
+
+    if tui_enabled && matches!(args.format, CliFormat::Jsonl) {
+        return Err(
+            "--tui cannot be combined with --format jsonl (both write to stdout)".into(),
+        );
+    }
+    #[cfg(feature = "tui")]
+    if tui_enabled && !std::io::stdout().is_terminal() {
+        return Err("--tui requires stdout to be a TTY".into());
     }
 
     let (mut plan, target, opts) = plan_from_cli::build(args)?;
@@ -864,7 +274,10 @@ fn run_mio_sync(
 
     let num_threads = args.threads.max(1);
 
-    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+    // `--http2-prior-knowledge` is a discoverability alias for
+    // `--http-version h2` — honour both when picking the wire version.
+    let use_h2 = args.http2_prior_knowledge
+        || matches!(args.http_version, cli_args::CliHttpVersion::H2);
 
     // Build TLS config when targeting https://.
     let tls_config = if target.tls {
@@ -874,35 +287,98 @@ fn run_mio_sync(
         None
     };
 
+    // Set up LiveSnapshot + StopSignal for TUI (or pass None for headless).
+    let live = if tui_enabled {
+        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
+    } else {
+        None
+    };
+
+    // When TUI is active, create a shared stop signal that both the TUI
+    // (user presses q) and the timer can trip. The mio workers use the
+    // same underlying AtomicBool — no separate timer inside the backend.
+    let (stop, stop_flag) = if tui_enabled {
+        let s = zerobench_core::StopSignal::after_wall(plan.duration);
+        let flag = std::sync::Arc::clone(s.flag());
+        (Some(s), Some(flag))
+    } else {
+        (None, None)
+    };
+
+    // Spawn TUI on a dedicated OS thread when enabled.
+    #[cfg(feature = "tui")]
+    let tui_handle = if tui_enabled {
+        let live_for_tui = live.clone().unwrap();
+        let stop_for_tui = stop.clone().unwrap();
+        let url_label = format_url_label(&target);
+        let transport = build_transport_info(args, &target, &opts);
+        let scenario_names: Vec<String> =
+            plan.scenarios.iter().map(|s| s.name.clone()).collect();
+        let total_duration = plan.duration;
+        let target_rate = args.rate;
+
+        Some(std::thread::spawn(move || {
+            zerobench_tui::run_tui(
+                live_for_tui,
+                stop_for_tui,
+                target_rate,
+                total_duration,
+                url_label,
+                transport,
+                scenario_names,
+            )
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "tui"))]
+    let tui_handle: Option<std::thread::JoinHandle<std::io::Result<()>>> = None;
+
     let stats = if use_h2 {
-        #[cfg(feature = "mio-h2")]
+        #[cfg(feature = "h2")]
         {
             zerobench_http::mio_h2::run_mio_h2_threaded(
                 &target,
+                &opts,
                 &plan,
                 num_threads,
                 args.connections,
                 plan.duration,
                 args.rate,
                 tls_config,
+                live,
+                stop_flag,
             )
         }
-        #[cfg(not(feature = "mio-h2"))]
+        #[cfg(not(feature = "h2"))]
         {
-            return Err("--http-version h2 with --mio requires the mio-h2 feature. \
-                         Rebuild with --features mio-h2.".into());
+            return Err("--http-version h2 with --mio requires the h2 feature. \
+                         Rebuild with --features h2.".into());
         }
     } else {
         zerobench_http::mio_h1::run_mio_threaded(
             &target,
+            &opts,
             &plan,
             num_threads,
             args.connections,
             plan.duration,
             args.rate,
             tls_config,
+            live,
+            stop_flag,
         )
     };
+
+    // Trip the stop signal so the TUI sees the run as completed.
+    if let Some(ref s) = stop {
+        s.stop();
+    }
+
+    // Wait for TUI to exit (user presses q after inspecting charts).
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
+    }
 
     let summary = Summary::merge(stats, plan.duration);
 
@@ -911,30 +387,13 @@ fn run_mio_sync(
         CliColor::Auto => ColorChoice::Auto,
         CliColor::Never => ColorChoice::Never,
     };
-    match args.format {
-        CliFormat::Terminal => {
-            let stdout = std::io::stdout();
-            let is_tty = stdout.is_terminal();
-            let mut out = stdout.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Json => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            print_json(&summary, &plan, &mut out)?;
-        }
-        CliFormat::Jsonl => {
-            let stderr = std::io::stderr();
-            let is_tty = stderr.is_terminal();
-            let mut out = stderr.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Prom => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
-        }
-    }
+    render_report(
+        &summary,
+        &plan,
+        args.format,
+        args.output.as_deref(),
+        color,
+    )?;
 
     let total_errors = summary.errors.total();
     if total_errors > 0 {
@@ -946,101 +405,68 @@ fn run_mio_sync(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mio dispatch — async wrapper (called from the async run() path when
-// both mio-h1 and a runtime are compiled in)
-// ---------------------------------------------------------------------------
+/// Render the final report to stdout, stderr (for JSONL), or a
+/// user-supplied file (`-o FILE`). Centralised so the bench path and
+/// `zerobench run` path share one implementation.
+///
+/// When `output` is `Some`, every format writes to that file — the
+/// file isn't a TTY so `is_tty` is forced to false (users can still
+/// force colors with `--color always`).
+fn render_report(
+    summary: &Summary,
+    plan: &zerobench_core::plan::Plan,
+    format: CliFormat,
+    output: Option<&Path>,
+    color: ColorChoice,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = output {
+        let mut file = open_output_file(path)?;
+        write_report(summary, plan, format, color, false, &mut file)?;
+        return Ok(());
+    }
 
-#[cfg(all(feature = "mio-h1", any(feature = "runtime-compio", feature = "runtime-tokio")))]
-async fn run_mio(
-    args: &CliArgs,
-    mut plan: zerobench_core::plan::Plan,
-    target: zerobench_core::transport::Target,
-    opts: &zerobench_core::transport::TransportOpts,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    plan.threads = args.threads;
-    let num_threads = args.threads.max(1);
-
-    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
-
-    // Build TLS config when targeting https://.
-    let tls_config = if target.tls {
-        let alpn: &[&[u8]] = if use_h2 { &[b"h2"] } else { &[b"http/1.1"] };
-        Some(zerobench_http::mio_tls::build_tls_config(opts, alpn))
-    } else {
-        None
-    };
-
-    let stats = if use_h2 {
-        #[cfg(feature = "mio-h2")]
-        {
-            zerobench_http::mio_h2::run_mio_h2_threaded(
-                &target,
-                &plan,
-                num_threads,
-                args.connections,
-                plan.duration,
-                args.rate,
-                tls_config,
-            )
-        }
-        #[cfg(not(feature = "mio-h2"))]
-        {
-            return Err("--http-version h2 with --mio requires the mio-h2 feature. \
-                         Rebuild with --features mio-h2.".into());
-        }
-    } else {
-        zerobench_http::mio_h1::run_mio_threaded(
-            &target,
-            &plan,
-            num_threads,
-            args.connections,
-            plan.duration,
-            args.rate,
-            tls_config,
-        )
-    };
-
-    let summary = Summary::merge(stats, plan.duration);
-
-    let color = match args.color {
-        CliColor::Always => ColorChoice::Always,
-        CliColor::Auto => ColorChoice::Auto,
-        CliColor::Never => ColorChoice::Never,
-    };
-    match args.format {
-        CliFormat::Terminal => {
-            let stdout = std::io::stdout();
-            let is_tty = stdout.is_terminal();
-            let mut out = stdout.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Json => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            print_json(&summary, &plan, &mut out)?;
-        }
+    match format {
         CliFormat::Jsonl => {
             let stderr = std::io::stderr();
             let is_tty = stderr.is_terminal();
             let mut out = stderr.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+            write_report(summary, plan, format, color, is_tty, &mut out)?;
+        }
+        _ => {
+            let stdout = std::io::stdout();
+            let is_tty = stdout.is_terminal();
+            let mut out = stdout.lock();
+            write_report(summary, plan, format, color, is_tty, &mut out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a single `Summary` → `Write` render for the given format.
+///
+/// Generic over `W: Write` because `print_terminal` / `print_json` /
+/// `print_prometheus` in `zerobench-core` take `impl Write` bounds
+/// (`Sized`) — a `&mut dyn Write` trait object wouldn't satisfy them.
+fn write_report<W: Write>(
+    summary: &Summary,
+    plan: &zerobench_core::plan::Plan,
+    format: CliFormat,
+    color: ColorChoice,
+    is_tty: bool,
+    out: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        CliFormat::Terminal | CliFormat::Jsonl => {
+            print_terminal(summary, plan, color, is_tty, out)?;
+        }
+        CliFormat::Json => {
+            print_json(summary, plan, out)?;
         }
         CliFormat::Prom => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
+            zerobench_core::print_prometheus(summary, plan, out)?;
         }
     }
-
-    let total_errors = summary.errors.total();
-    if total_errors > 0 {
-        Ok(ExitCode::from(1))
-    } else if summary.requests == 0 {
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,59 +480,40 @@ async fn run_mio(
 /// stats blocks, but the live-snapshot / TUI integration is a later
 /// polish pass).
 #[cfg(feature = "sse")]
-async fn run_sse(
+fn run_sse_sync(
     args: &CliArgs,
-    plan: &zerobench_core::plan::Plan,
-    target: &zerobench_core::transport::Target,
-    opts: &zerobench_core::transport::TransportOpts,
-) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
-    use std::sync::Arc;
-    use zerobench_core::plan::Step;
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let (plan, target, opts) = plan_from_cli::build(args)?;
 
-    // Pull the single RequestPlan out of the single-scenario plan. The
-    // CLI always produces exactly one scenario with one Request step in
-    // SSE mode; fall back to a defensive error if that invariant is
-    // ever violated (e.g. `--requests DIR` with weighted scenarios
-    // reaches here in a future refactor).
-    let req = plan
-        .scenarios
-        .first()
-        .and_then(|s| s.steps.first())
-        .and_then(|s| match s {
-            Step::Request(r) => Some(r.clone()),
-            _ => None,
-        })
-        .ok_or("--sse requires exactly one scenario with one Request step")?;
-    let req = Arc::new(req);
+    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
+    if use_h2 {
+        return Err("--sse does not support HTTP/2".into());
+    }
 
-    let stop = StopSignal::after(plan.duration);
+    let tls_config = if target.tls {
+        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+    } else {
+        None
+    };
+
     let t_start = std::time::Instant::now();
-
-    let stats = zerobench_sse::run_sse_saturate(
-        target.clone(),
-        opts.clone(),
-        req,
+    let stats = zerobench_sse::run_sse_threaded(
+        &target,
+        &opts,
+        &plan,
         args.connections,
-        stop,
-    )
-    .await;
+        plan.duration,
+        tls_config,
+    );
     let duration = t_start.elapsed();
     let summary = zerobench_sse::SseSummary::merge(stats, duration);
 
-    // Render the SSE report. A bespoke small block — the standard
-    // terminal reporter is built for per-request latency and doesn't
-    // surface chunks/s, inter-chunk gaps, etc.
     render_sse_summary(&summary, args)?;
 
-    // Exit code: non-zero only on catastrophic failure — no streams
-    // started at all. Per-iteration connect errors (e.g. when the
-    // server throttles reconnects) are routine for SSE benchmarks
-    // that open fresh connections per iteration, so we don't fail on
-    // `errors_connect > 0`; the user sees the count in the report.
     if summary.streams == 0 {
-        Ok(std::process::ExitCode::from(1))
+        Ok(ExitCode::from(1))
     } else {
-        Ok(std::process::ExitCode::SUCCESS)
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -1173,9 +580,9 @@ fn render_sse_summary(
 
 /// Compact ns → human formatting (`1.23ms` / `456µs` / `789ns`).
 ///
-/// Narrow helper for the SSE report; the main terminal reporter has
-/// its own formatter but that one's tied to HDR percentile queries.
-#[cfg(feature = "sse")]
+/// Used by the SSE and WS reports; the main terminal reporter has
+/// its own formatter that's tied to HDR percentile queries.
+#[cfg(any(feature = "sse", feature = "ws"))]
 fn format_ns(ns: u64) -> String {
     if ns >= 1_000_000_000 {
         format!("{:.2}s", ns as f64 / 1_000_000_000.0)
@@ -1200,32 +607,38 @@ fn format_ns(ns: u64) -> String {
 /// long-lived bidi connection doesn't fit the single-shot Response
 /// model (see comments on `zerobench_ws::lib`).
 #[cfg(feature = "ws")]
-async fn run_ws(
+fn run_ws_sync(
     args: &CliArgs,
-) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
-    let (plan, _opts) = plan_from_cli::build_ws_plan(args)?;
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let (plan, opts) = plan_from_cli::build_ws_plan(args)?;
+
+    let tls_config = if plan.target.tls {
+        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+    } else {
+        None
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_timer = stop.clone();
+    let duration = args.duration;
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        stop_timer.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 
     let t_start = std::time::Instant::now();
-    let stop = StopSignal::after(args.duration);
-
-    let stats = zerobench_ws::run_ws_saturate(plan, args.connections, stop, None).await;
-    let duration = t_start.elapsed();
-    let summary = zerobench_ws::WsSummary::merge(stats, duration);
+    let stats = zerobench_ws::run_ws_threaded(plan, args.connections, stop, None, tls_config);
+    let elapsed = t_start.elapsed();
+    let summary = zerobench_ws::WsSummary::merge(stats, elapsed);
 
     render_ws_summary(&summary)?;
 
-    // Exit code policy mirrors SSE: 0 for a clean run, 1 if no
-    // connection ever started (catastrophic) OR if every connection
-    // errored on handshake. Per-connection IO errors are informational
-    // for a bench tool.
     if summary.handshake.is_empty() {
-        Ok(std::process::ExitCode::from(1))
+        Ok(ExitCode::from(1))
     } else if summary.messages_recvd == 0 {
-        // We handshook but nothing flowed — server accepted and
-        // dropped. Signal non-zero so CI pipelines notice.
-        Ok(std::process::ExitCode::from(1))
+        Ok(ExitCode::from(1))
     } else {
-        Ok(std::process::ExitCode::SUCCESS)
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -1254,20 +667,20 @@ fn render_ws_summary(
         writeln!(
             out,
             "  handshake     p50={}  p99={}  max={}",
-            format_ns_ws(s.handshake.value_at_percentile(50.0)),
-            format_ns_ws(s.handshake.value_at_percentile(99.0)),
-            format_ns_ws(s.handshake.max()),
+            format_ns(s.handshake.value_at_percentile(50.0)),
+            format_ns(s.handshake.value_at_percentile(99.0)),
+            format_ns(s.handshake.max()),
         )?;
     }
     if !s.rtt.is_empty() {
         writeln!(
             out,
             "  rtt           p50={}  p90={}  p99={}  p99.9={}  max={}",
-            format_ns_ws(s.rtt.value_at_percentile(50.0)),
-            format_ns_ws(s.rtt.value_at_percentile(90.0)),
-            format_ns_ws(s.rtt.value_at_percentile(99.0)),
-            format_ns_ws(s.rtt.value_at_percentile(99.9)),
-            format_ns_ws(s.rtt.max()),
+            format_ns(s.rtt.value_at_percentile(50.0)),
+            format_ns(s.rtt.value_at_percentile(90.0)),
+            format_ns(s.rtt.value_at_percentile(99.0)),
+            format_ns(s.rtt.value_at_percentile(99.9)),
+            format_ns(s.rtt.max()),
         )?;
     }
     writeln!(
@@ -1291,55 +704,206 @@ fn render_ws_summary(
     Ok(())
 }
 
-#[cfg(feature = "ws")]
-fn format_ns_ws(ns: u64) -> String {
-    if ns >= 1_000_000_000 {
-        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
-    } else if ns >= 1_000_000 {
-        format!("{:.2}ms", ns as f64 / 1_000_000.0)
-    } else if ns >= 1_000 {
-        format!("{:.0}µs", ns as f64 / 1_000.0)
-    } else {
-        format!("{ns}ns")
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Rhai script dispatch
 // ---------------------------------------------------------------------------
 
 /// Load a `.rhai` scenario script, apply any CLI overrides, stand up the
-/// HTTP transport, dispatch the run, and render the report.
+/// transport(s), dispatch the run, and render the report.
 ///
 /// The Rhai engine lives only inside `load_script` — this function sees
 /// a pure Rust [`Plan`] and never pulls in the interpreter again. CLI
 /// overrides (`--duration`, `--rate`) mutate the Plan in-place after
 /// load; `--connections` / TLS / timeouts shape the transport opts.
+///
+/// # Tier-1 dispatch
+///
+/// The plan may contain a mix of HTTP, SSE, and WS scenarios. Each
+/// backend runs in its own thread group — the three event loops stay
+/// separate under the hood. After all backends finish, per-worker
+/// `TaskStats` are merged into a single unified `Summary` with
+/// protocol-specific extras (SSE/WS histograms, byte counters)
+/// preserved per scenario.
 #[cfg(feature = "script")]
-async fn run_script(
+/// Dispatch a plan across the HTTP / SSE / WS backends in parallel and
+/// merge their per-worker stats into one summary. Shared by the serial
+/// (one scenario per call) and `--parallel` (all scenarios in one call)
+/// execution modes of `run_script_sync`.
+#[cfg(feature = "script")]
+fn dispatch_multi_protocol_plan(
+    plan: &zerobench_core::plan::Plan,
+    target: &zerobench_core::transport::Target,
+    opts: &zerobench_core::transport::TransportOpts,
+    connections: usize,
+    num_threads: usize,
+    target_rps: Option<f64>,
+) -> Result<Summary, Box<dyn std::error::Error>> {
+    use zerobench_core::plan::Protocol;
+    use zerobench_core::stats::TaskStats;
+
+    let has_http = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Http);
+    let has_sse = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Sse);
+    let has_ws = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Ws);
+
+    let tls_config_http = if target.tls && has_http {
+        Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+    } else {
+        None
+    };
+
+    let http_handle = if has_http {
+        let plan_c = plan.clone();
+        let target_c = target.clone();
+        let opts_c = opts.clone();
+        let tls = tls_config_http.clone();
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_http::mio_h1::run_mio_threaded(
+                &target_c, &opts_c, &plan_c, num_threads, connections, dur, target_rps,
+                tls, None, None,
+            )
+        }))
+    } else {
+        None
+    };
+
+    #[cfg(feature = "sse")]
+    let sse_handle = if has_sse {
+        let plan_c = plan.clone();
+        let target_c = target.clone();
+        let opts_c = opts.clone();
+        let tls = if target.tls {
+            Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+        } else {
+            None
+        };
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_sse::run_sse_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, connections, dur, tls, None,
+            )
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "sse"))]
+    let sse_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
+        if has_sse {
+            return Err(
+                "plan contains SSE scenarios but this build lacks the `sse` feature".into(),
+            );
+        }
+        None
+    };
+
+    #[cfg(feature = "ws")]
+    let ws_handle = if has_ws {
+        let plan_c = plan.clone();
+        let opts_c = opts.clone();
+        let tls = if target.tls {
+            Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+        } else {
+            None
+        };
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, connections, dur, tls, None)
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "ws"))]
+    let ws_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
+        if has_ws {
+            return Err(
+                "plan contains WS scenarios but this build lacks the `ws` feature".into(),
+            );
+        }
+        None
+    };
+
+    let mut all_stats: Vec<TaskStats> = Vec::new();
+    if let Some(h) = http_handle {
+        all_stats.extend(h.join().map_err(|_| "HTTP backend thread panicked")?);
+    }
+    if let Some(h) = sse_handle {
+        all_stats.extend(h.join().map_err(|_| "SSE backend thread panicked")?);
+    }
+    if let Some(h) = ws_handle {
+        all_stats.extend(h.join().map_err(|_| "WS backend thread panicked")?);
+    }
+
+    Ok(Summary::merge(all_stats, plan.duration))
+}
+
+#[cfg(feature = "script")]
+fn run_script_sync(
     args: cli_args::RunArgs,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    use zerobench_core::plan::RateProfile;
+    use zerobench_core::plan::{Protocol, RateProfile, Step};
+    use zerobench_core::stats::TaskStats;
+    use zerobench_core::template::Template;
     use zerobench_core::transport::TransportOpts;
 
     let zerobench_rhai::LoadedScript {
         mut plan,
         target,
-        http_version,
+        http_version: _,
     } = zerobench_rhai::load_script(&args.script)?;
 
-    // CLI override: duration wins over the script's `duration(...)`.
     if let Some(d) = args.duration {
         plan.duration = d;
     }
-    // CLI override: rate replaces every scenario's rate profile with
-    // `Constant(rate * weight)`. Weight information from the script is
-    // already folded into each scenario's rate via finalize, so we just
-    // replace the profile with a uniform split.
     if let Some(r) = args.rate {
         let n = plan.scenarios.len() as f64;
         for s in &mut plan.scenarios {
             s.rate = RateProfile::Constant(r / n);
+        }
+    } else if args.saturate {
+        // Override every scenario to saturate mode so the same Rhai
+        // file can be re-run for tail-latency measurements without
+        // editing the script.
+        for s in &mut plan.scenarios {
+            s.rate = RateProfile::Saturate {
+                max_concurrency: args.connections,
+            };
+        }
+    }
+
+    // S1.7 — apply --basic-auth / --bearer to every request in the
+    // plan. Explicit `Authorization:` headers set by the script win
+    // (with a warning), matching the bench-path behaviour.
+    if args.basic_auth.is_some() || args.bearer.is_some() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let value = if let Some(up) = &args.basic_auth {
+            format!("Basic {}", B64.encode(up.as_bytes()))
+        } else {
+            format!("Bearer {}", args.bearer.as_deref().unwrap_or(""))
+        };
+        let name_tpl = Template::compile("Authorization", &mut plan.vars)?;
+        let value_tpl = Template::compile(&value, &mut plan.vars)?;
+        for scenario in &mut plan.scenarios {
+            for step in &mut scenario.steps {
+                if let Step::Request(req) = step {
+                    let already = req.headers.iter().any(|(n, _)| {
+                        // Template doesn't expose the literal — we
+                        // compare part count/raw via Debug as a best
+                        // effort. Scripts that set Authorization end
+                        // up with at least one header named as such.
+                        let dbg = format!("{n:?}").to_lowercase();
+                        dbg.contains("authorization")
+                    });
+                    if already {
+                        eprintln!(
+                            "warning: script already sets Authorization header — --basic-auth / --bearer ignored for one or more scenarios",
+                        );
+                        continue;
+                    }
+                    req.headers.push((name_tpl.clone(), value_tpl.clone()));
+                }
+            }
         }
     }
 
@@ -1349,78 +913,221 @@ async fn run_script(
         max_conns: args.connections,
         tcp_nodelay: true,
         insecure_tls: args.insecure,
-        http_version,
+        ..TransportOpts::default()
     };
-
-    // Decide open-loop vs. saturate based on the first scenario's rate
-    // profile. Mixed profiles across scenarios are legal but we only
-    // have one dispatcher flavor to pick; `run_open_loop` handles
-    // `Constant` / `Ramp` / `Stepped`, `run_saturate` handles
-    // `Saturate { ... }`. If the first is Saturate we saturate, else
-    // we open-loop.
-    let open_loop = !matches!(plan.scenarios[0].rate, RateProfile::Saturate { .. });
 
     plan.threads = args.threads;
-
-    let stats = if args.threads > 1 {
-        let plan = std::sync::Arc::new(plan.clone());
-        let target = std::sync::Arc::new(target);
-        let opts = std::sync::Arc::new(opts);
-        let stop = StopSignal::after_wall(plan.duration);
-        if open_loop {
-            run_open_loop_threaded::<HttpTransport>(
-                plan, target, opts, args.threads, args.connections, stop, None,
-            )
-        } else {
-            run_saturate_threaded::<HttpTransport>(
-                plan, target, opts, args.threads, args.connections, stop, None,
-            )
-        }
-    } else {
-        let client = <HttpTransport as Transport>::build_client(&target, &opts).await?;
-        let stop = StopSignal::after(plan.duration);
-        if open_loop {
-            run_open_loop::<HttpTransport>(&plan, client, args.connections, stop, None).await
-        } else {
-            run_saturate::<HttpTransport>(&plan, client, args.connections, stop, None).await
-        }
-    };
-
-    let summary = Summary::merge(stats, plan.duration);
+    let num_threads = args.threads.max(1);
 
     let color = match args.color {
         CliColor::Always => ColorChoice::Always,
         CliColor::Auto => ColorChoice::Auto,
         CliColor::Never => ColorChoice::Never,
     };
-    match args.format {
-        CliFormat::Terminal => {
-            let stdout = std::io::stdout();
-            let is_tty = stdout.is_terminal();
-            let mut out = stdout.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
+
+    // Serial mode (default): run each scenario in isolation with the
+    // full `-c N` connection pool against its own endpoint. Gives you
+    // each scenario's ceiling without cross-scenario contention —
+    // matches the wrk/Gatling convention.
+    //
+    // Parallel mode (`--parallel`): interleave all scenarios through a
+    // shared pool. Models a realistic mixed-traffic client fleet.
+    let target_rps_val = if args.saturate { None } else { args.rate };
+
+    if !args.parallel && plan.scenarios.len() > 1 {
+        let scenarios = plan.scenarios.clone();
+        let mut any_errors = false;
+        let mut any_requests = false;
+        for (i, sc) in scenarios.iter().enumerate() {
+            let mut sub_plan = plan.clone();
+            sub_plan.scenarios = vec![sc.clone()];
+            println!(
+                "\n─── scenario {}/{}: {} ({:?}) ───",
+                i + 1,
+                scenarios.len(),
+                sc.name,
+                sc.protocol(),
+            );
+            let summary = dispatch_multi_protocol_plan(
+                &sub_plan,
+                &target,
+                &opts,
+                args.connections,
+                num_threads,
+                target_rps_val,
+            )?;
+            render_report(
+                &summary,
+                &sub_plan,
+                args.format,
+                args.output.as_deref(),
+                color,
+            )?;
+            if summary.errors.total() > 0 {
+                any_errors = true;
+            }
+            if summary.requests > 0 {
+                any_requests = true;
+            }
         }
-        CliFormat::Json => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            print_json(&summary, &plan, &mut out)?;
-        }
-        CliFormat::Jsonl => {
-            // Jsonl in run-script mode doesn't stream per-second yet —
-            // we emit the terminal summary to stderr to match the
-            // default path's contract.
-            let stderr = std::io::stderr();
-            let is_tty = stderr.is_terminal();
-            let mut out = stderr.lock();
-            print_terminal(&summary, &plan, color, is_tty, &mut out)?;
-        }
-        CliFormat::Prom => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            zerobench_core::print_prometheus(&summary, &plan, &mut out)?;
-        }
+        return Ok(if any_errors || !any_requests {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
     }
 
+    // Single scenario OR --parallel → single dispatch covering all.
+    let has_http = plan
+        .scenarios
+        .iter()
+        .any(|s| s.protocol() == Protocol::Http);
+    let has_sse = plan
+        .scenarios
+        .iter()
+        .any(|s| s.protocol() == Protocol::Sse);
+    let has_ws = plan
+        .scenarios
+        .iter()
+        .any(|s| s.protocol() == Protocol::Ws);
+
+    // `--saturate` trumps any rate in the script or CLI. Otherwise, if
+    // the user passed --rate, use it. Otherwise, leave None and let the
+    // dispatcher pick up the per-scenario RateProfile.
+    let target_rps = target_rps_val;
+
+    // Each backend gets its own copy of the plan — they're all
+    // read-only views and `Plan` is cheap to clone (reference-counted
+    // buffers + a few smallvecs).
+    let tls_config_http = if target.tls && has_http {
+        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+    } else {
+        None
+    };
+
+    // Spawn the HTTP backend when any HTTP scenario exists.
+    let http_handle = if has_http {
+        let plan_c = plan.clone();
+        let target_c = target.clone();
+        let opts_c = opts.clone();
+        let tls = tls_config_http.clone();
+        let conns = args.connections;
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_http::mio_h1::run_mio_threaded(
+                &target_c,
+                &opts_c,
+                &plan_c,
+                num_threads,
+                conns,
+                dur,
+                target_rps,
+                tls,
+                None,
+                None,
+            )
+        }))
+    } else {
+        None
+    };
+
+    // SSE backend — one worker per `-c` connection, each running a
+    // stream at a time. SSE scenarios always use HTTP/1.1; TLS follows
+    // the shared target.
+    #[cfg(feature = "sse")]
+    let sse_handle = if has_sse {
+        let plan_c = plan.clone();
+        let target_c = target.clone();
+        let opts_c = opts.clone();
+        let tls = if target.tls {
+            Some(zerobench_http::mio_tls::build_tls_config(
+                &opts,
+                &[b"http/1.1"],
+            ))
+        } else {
+            None
+        };
+        let conns = args.connections;
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_sse::run_sse_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, conns, dur, tls, None,
+            )
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "sse"))]
+    let sse_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
+        if has_sse {
+            return Err(
+                "plan contains SSE scenarios but this build lacks the `sse` feature".into(),
+            );
+        }
+        None
+    };
+
+    // WS backend — one worker per `-c` connection, each opening a new
+    // connection per round-trip. Kept consistent with the SSE model so
+    // `-c` has the same meaning for both.
+    #[cfg(feature = "ws")]
+    let ws_handle = if has_ws {
+        let plan_c = plan.clone();
+        let opts_c = opts.clone();
+        let tls = if target.tls {
+            Some(zerobench_http::mio_tls::build_tls_config(
+                &opts,
+                &[b"http/1.1"],
+            ))
+        } else {
+            None
+        };
+        let conns = args.connections;
+        let dur = plan.duration;
+        Some(std::thread::spawn(move || {
+            zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, conns, dur, tls, None)
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "ws"))]
+    let ws_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
+        if has_ws {
+            return Err(
+                "plan contains WS scenarios but this build lacks the `ws` feature".into(),
+            );
+        }
+        None
+    };
+
+    // Wait for every backend and merge their per-worker stats into
+    // one aggregate `Vec<TaskStats>`. Each backend returns its own
+    // list of TaskStats (one per worker); we treat them as a flat
+    // collection — the final Summary::merge sums everything.
+    let mut all_stats: Vec<TaskStats> = Vec::new();
+    if let Some(h) = http_handle {
+        all_stats.extend(h.join().map_err(|_| "HTTP backend thread panicked")?);
+    }
+    if let Some(h) = sse_handle {
+        all_stats.extend(h.join().map_err(|_| "SSE backend thread panicked")?);
+    }
+    if let Some(h) = ws_handle {
+        all_stats.extend(h.join().map_err(|_| "WS backend thread panicked")?);
+    }
+
+    let summary = Summary::merge(all_stats, plan.duration);
+
+    render_report(
+        &summary,
+        &plan,
+        args.format,
+        args.output.as_deref(),
+        color,
+    )?;
+
+    // Exit-code policy: any errors (connect/read/write/timeout/...) or
+    // zero operations completed → exit 1. Matches the single-protocol
+    // CLI path.
     if summary.errors.total() > 0 || summary.requests == 0 {
         Ok(ExitCode::from(1))
     } else {

@@ -37,12 +37,25 @@
 //! the request loop starts. The `--insecure` flag disables certificate
 //! verification (self-signed, expired, hostname mismatch).
 //!
-//! # Other limitations
+//! # Per-request template expansion
 //!
-//! - **No per-request template expansion**: request bytes are pre-built once
-//!   at startup. `{{uuid}}` gets one UUID for the entire run. This is the
-//!   same trade-off `wrk` makes — fixed wire bytes for maximum throughput.
-//! - **Single scenario only**: uses `plan.scenarios[0].steps[0]`.
+//! Each request expands `{{uuid}}`, `{{counter}}`, `{{rand_*}}` etc.
+//! freshly via `ScenarioContext` and `build_raw_request`. Templates are
+//! expanded into each connection's `write_buf` before every send.
+//!
+//! # Multi-scenario
+//!
+//! Each iteration picks a random scenario from `plan.scenarios` (uniform
+//! random), executes its first Request step. `scenario_id` is passed to
+//! `stats.record()` and `stats.record_error()`.
+//!
+//! # Response assertions and extraction
+//!
+//! After parsing response headers, checks `RequestPlan.checks` (StatusEq,
+//! StatusIn, LatencyUnder). Failed assertions increment
+//! `ErrorKind::AssertionFailed`. Extractions (`Extract::Header`,
+//! `Extract::StatusCode`) populate `ScenarioContext.vars` for subsequent
+//! template expansions.
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -50,23 +63,154 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
+use rand::Rng;
 use rustls::ClientConfig;
 
-use zerobench_core::plan::{Plan, Step};
+use zerobench_core::LiveSnapshot;
+use zerobench_core::plan::{Assertion, Extract, Plan, Protocol, RequestPlan, Step};
+use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
-use zerobench_core::transport::Target;
+use zerobench_core::transport::{Target, TransportOpts};
 
 use super::mio_tls::{MioStream, MioTlsStream};
-use super::raw_h1_common::{find_connection_close, find_content_length_raw};
+use super::raw_h1_common::{build_raw_request, find_connection_close, find_content_length_raw};
+
+// ---------------------------------------------------------------------------
+// Connect helpers — split resolve / connect so we can re-resolve on failure
+// ---------------------------------------------------------------------------
+
+/// Attempt a single non-blocking TCP connect to `addr`. Returns whatever
+/// `TcpStream::connect` returned, unwrapped at the caller.
+#[inline]
+fn connect_once(addr: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect(addr)
+}
+
+/// Connect to `target`, re-resolving once on transient failure.
+///
+/// Rationale: rolling deployments flip DNS mid-run. The first resolution
+/// from the worker may be stale by the time we attempt the connect, and a
+/// single ECONNREFUSED / EHOSTUNREACH is much more likely to clear after
+/// another DNS lookup than after a blind retry to the same dead address.
+///
+/// We deliberately only re-resolve **once** — retrying further would hide
+/// genuine server-down failures and delay error reporting.
+fn connect_with_retry(
+    target: &Target,
+    opts: &TransportOpts,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let addr = target.resolve(opts)?;
+    match connect_once(addr) {
+        Ok(s) => Ok((s, addr)),
+        Err(e) if matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable | io::ErrorKind::TimedOut
+        ) => {
+            // One re-resolve + retry. If the second attempt fails, bubble
+            // the original error kind up — callers classify it as Connect.
+            let fresh = target.resolve(opts)?;
+            connect_once(fresh).map(|s| (s, fresh))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread connection distribution
+// ---------------------------------------------------------------------------
+
+/// Distribute `total` connections across `threads` workers so that the
+/// *exact* total is preserved — the first `total % threads` workers get
+/// one extra connection, the rest take the floor.
+///
+/// This is the fix for the `-c N -t T` bug where `div_ceil` could
+/// over-allocate by up to `threads - 1` connections when `total` didn't
+/// divide evenly.
+///
+/// `threads` is clamped to `max(1, min(threads, total))` before distribution
+/// — spinning up threads that own zero connections is pure overhead.
+/// When `total == 0`, returns an empty vector.
+fn distribute_conns(total: usize, threads: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let threads = threads.max(1).min(total);
+    let base = total / threads;
+    let remainder = total % threads;
+    let mut out = Vec::with_capacity(threads);
+    for i in 0..threads {
+        out.push(if i < remainder { base + 1 } else { base });
+    }
+    debug_assert_eq!(out.iter().sum::<usize>(), total);
+    out
+}
 
 /// Find the end of HTTP headers (`\r\n\r\n`). Returns the byte offset
 /// just past the terminator. Uses `memchr::memmem` (SIMD-accelerated
-/// via AVX2/SSE4.2 — ~10× faster than `windows(4).position()`).
+/// via AVX2/SSE4.2 — ~10x faster than `windows(4).position()`).
 #[inline]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     memchr::memmem::find(buf, b"\r\n\r\n").map(|p| p + 4)
+}
+
+// ---------------------------------------------------------------------------
+// Scenario selection helper — resolves the first Request step
+// ---------------------------------------------------------------------------
+
+/// Resolved scenario selection: which scenario to execute, and a
+/// reference to its first `RequestPlan`.
+struct SelectedScenario<'a> {
+    scenario_id: u16,
+    request_plan: &'a RequestPlan,
+}
+
+/// Pick a scenario from the given list of HTTP scenario indices.
+///
+/// `http_indices` contains only the indices into `plan.scenarios` of
+/// scenarios whose protocol is [`Protocol::Http`] — SSE/WS scenarios
+/// are handled by other backends. When only one HTTP scenario exists,
+/// returns it without an RNG call.
+fn pick_scenario<'a>(
+    plan: &'a Plan,
+    http_indices: &[usize],
+    ctx: &mut ScenarioContext,
+) -> SelectedScenario<'a> {
+    let pick = if http_indices.len() <= 1 {
+        http_indices[0]
+    } else {
+        http_indices[ctx.rng.gen_range(0..http_indices.len())]
+    };
+    let scenario = &plan.scenarios[pick];
+    let request_plan = scenario
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Request(r) => Some(r),
+            _ => None,
+        })
+        .expect("HTTP scenario must have at least one Request step");
+    SelectedScenario {
+        scenario_id: pick as u16,
+        request_plan,
+    }
+}
+
+/// Collect indices of HTTP scenarios from `plan`.
+///
+/// Scenarios whose protocol is SSE or WS are filtered out — those are
+/// served by other backends. Returns indices (not references) so the
+/// worker can still treat `scenario_id` as an index into
+/// `plan.scenarios` without renumbering.
+fn http_scenario_indices(plan: &Plan) -> Vec<usize> {
+    plan.scenarios
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| (s.protocol() == Protocol::Http).then_some(i))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +240,14 @@ struct Conn {
     ttfb: Duration,
     /// HTTP status code from the response headers.
     status: u16,
+    /// Which scenario this connection is currently executing.
+    scenario_id: u16,
+    /// Captured response header values needed by `Extract::Header`.
+    /// Populated during `check_headers`; consumed after response completes.
+    /// Key = lowercased header name bytes, Value = header value bytes.
+    extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Skip header capture + extraction in the static fast path.
+    skip_header_capture: bool,
 }
 
 #[derive(Debug)]
@@ -129,6 +281,9 @@ impl Conn {
             intended_start: now,
             ttfb: Duration::ZERO,
             status: 0,
+            scenario_id: 0,
+            extracted_headers: Vec::new(),
+            skip_header_capture: false,
         }
     }
 
@@ -137,6 +292,9 @@ impl Conn {
     /// `intended_start` is the scheduled time for this request. In saturate
     /// mode, pass `Instant::now()`. In open-loop mode, pass the token
     /// timestamp so latency is measured CO-free.
+    ///
+    /// Static fast path — copies pre-built bytes without template expansion.
+    /// Used when the plan is fully static (no `{{...}}` parts).
     fn prepare_request(&mut self, request_bytes: &[u8], intended_start: Instant) {
         self.write_buf.clear();
         self.write_buf.extend_from_slice(request_bytes);
@@ -146,6 +304,34 @@ impl Conn {
         self.t0 = Instant::now();
         self.ttfb = Duration::ZERO;
         self.status = 0;
+        self.scenario_id = 0;
+        self.extracted_headers.clear();
+        self.state = ConnState::Writing;
+    }
+
+    /// Build request from a template, expanding dynamic parts via
+    /// `ScenarioContext`, and transition to Writing.
+    ///
+    /// `intended_start` is the scheduled time for this request.
+    fn prepare_request_from_template(
+        &mut self,
+        plan: &RequestPlan,
+        ctx: &mut ScenarioContext,
+        target: &Target,
+        intended_start: Instant,
+        scenario_id: u16,
+    ) {
+        self.write_buf.clear();
+        build_raw_request(plan, ctx, target, &mut self.write_buf)
+            .expect("failed to build request bytes");
+        self.write_offset = 0;
+        self.read_buf.clear();
+        self.intended_start = intended_start;
+        self.t0 = Instant::now();
+        self.ttfb = Duration::ZERO;
+        self.status = 0;
+        self.scenario_id = scenario_id;
+        self.extracted_headers.clear();
         self.state = ConnState::Writing;
     }
 
@@ -210,9 +396,9 @@ impl Conn {
     /// The SIMD `find_header_end` via memchr finds the `\r\n\r\n` terminator;
     /// httparse then parses the status line + headers with full validation.
     ///
-    /// Benchmarked: only 1.3% slower than a minimal hand-rolled parser, but
-    /// validates every header byte, catches malformed responses, and is 40
-    /// fewer lines of custom code to maintain.
+    /// Also captures header values needed by `Extract::Header` into
+    /// `self.extracted_headers` so they survive the `read_buf` being
+    /// cleared on the next request.
     fn check_headers(&mut self, now: Instant) -> io::Result<Option<(u16, Duration, Duration)>> {
         let buf = &self.read_buf;
 
@@ -229,6 +415,20 @@ impl Conn {
                 let content_length = find_content_length_raw(resp.headers);
                 let ttfb = now.duration_since(self.t0);
                 let keep_alive = !find_connection_close(resp.headers);
+
+                // Capture response headers for extraction (skip in static fast path).
+                if !self.skip_header_capture {
+                    self.extracted_headers.clear();
+                    for h in resp.headers.iter() {
+                        if h.name.is_empty() {
+                            break;
+                        }
+                        let name_lower: Vec<u8> =
+                            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
+                        self.extracted_headers
+                            .push((name_lower, h.value.to_vec()));
+                    }
+                }
 
                 let body_received = buf.len() - hdr_len;
                 if body_received >= content_length {
@@ -262,6 +462,71 @@ impl Conn {
 }
 
 // ---------------------------------------------------------------------------
+// Response post-processing (assertions + extraction)
+// ---------------------------------------------------------------------------
+
+/// Apply response assertions from the `RequestPlan`. Returns the number
+/// of failed assertions.
+fn check_assertions(plan: &RequestPlan, status: u16, total_latency: Duration) -> u32 {
+    let mut failures = 0u32;
+    for check in &plan.checks {
+        let pass = match check {
+            Assertion::StatusEq(code) => status == *code,
+            Assertion::StatusIn(codes) => codes.iter().any(|c| *c == status),
+            Assertion::LatencyUnder(d) => total_latency < *d,
+        };
+        if !pass {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// Apply response extractions into the `ScenarioContext`.
+///
+/// `Extract::Header` matches against the captured `extracted_headers`
+/// (lowercased names). `Extract::StatusCode` writes the status as ASCII
+/// decimal.
+fn apply_extractions(
+    plan: &RequestPlan,
+    status: u16,
+    extracted_headers: &[(Vec<u8>, Vec<u8>)],
+    ctx: &mut ScenarioContext,
+) {
+    for extract in &plan.extract {
+        match extract {
+            Extract::Header { name, into } => {
+                let target_name = name.as_str().as_bytes();
+                let found = extracted_headers
+                    .iter()
+                    .find(|(k, _)| k.as_slice() == target_name);
+                if let Some((_, value)) = found {
+                    ctx.set_var(*into, Bytes::copy_from_slice(value));
+                } else {
+                    ctx.clear_var(*into);
+                }
+            }
+            Extract::StatusCode { into } => {
+                // ASCII decimal — zero-alloc (5-byte stack buffer).
+                let mut buf = [0u8; 5];
+                let mut n = status as u32;
+                if n == 0 {
+                    ctx.set_var(*into, Bytes::from_static(b"0"));
+                    continue;
+                }
+                let mut i = buf.len();
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                }
+                ctx.set_var(*into, Bytes::copy_from_slice(&buf[i..]));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-thread worker
 // ---------------------------------------------------------------------------
 
@@ -284,18 +549,95 @@ impl Conn {
 /// When all connections are busy and tokens pile up, the surplus is counted
 /// as `keepup` errors — requests that *would* have been sent but couldn't.
 pub fn run_mio_worker(
+    plan: &Plan,
     target: &Target,
-    request_bytes: &[u8],
+    opts: &TransportOpts,
     num_conns: usize,
     stop: &AtomicBool,
-    num_scenarios: usize,
     target_rps: Option<f64>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<&LiveSnapshot>,
 ) -> TaskStats {
-    let addr: SocketAddr = target.addr().parse().expect("valid socket address");
     let mut poll = Poll::new().expect("mio::Poll::new");
     let mut events = Events::with_capacity(1024);
+    let num_scenarios = plan.scenarios.len();
     let mut stats = TaskStats::new(num_scenarios);
+
+    // Filter out SSE/WS scenarios — those are served by other backends.
+    // A multi-protocol plan may have zero HTTP scenarios (pure-SSE /
+    // pure-WS scripts); in that case this worker exits immediately
+    // without opening any sockets.
+    let http_indices = http_scenario_indices(plan);
+    if http_indices.is_empty() {
+        return stats;
+    }
+
+    // Per-worker ScenarioContext for template expansion + extraction.
+    let mut ctx = ScenarioContext::new(plan.vars.len(), zerobench_core::rng::from_entropy());
+
+    // Helper: record error to both TaskStats and LiveSnapshot (if present).
+    #[inline(always)]
+    fn err(
+        stats: &mut TaskStats,
+        live: Option<&LiveSnapshot>,
+        scenario_id: u16,
+        kind: ErrorKind,
+    ) {
+        stats.record_error(scenario_id, kind);
+        if let Some(l) = live {
+            l.record_error(kind);
+            l.record_scenario_error(scenario_id, kind);
+        }
+    }
+
+    // --- Static fast-path detection ---
+    // When every scenario is a single static request with no extractions
+    // or assertions, pre-build the wire bytes once and skip per-request
+    // template expansion entirely. This recovers the ~1.7M req/s peak
+    // that the old pre-built-bytes approach achieved.
+    //
+    // After Tier-1 unification, "only one HTTP scenario" (instead of
+    // "only one scenario total") is the relevant precondition — a
+    // mixed-protocol plan with 1 HTTP + N other-protocol scenarios is
+    // still a static fast-path candidate.
+    let single_scenario = http_indices.len() == 1;
+    let first_req_plan = plan.scenarios[http_indices[0]]
+        .steps
+        .iter()
+        .find_map(|s| match s { Step::Request(r) => Some(r), _ => None })
+        .expect("HTTP scenario must have at least one Request step");
+    let use_static = single_scenario
+        && first_req_plan.is_static()
+        && first_req_plan.extract.is_empty()
+        && first_req_plan.checks.is_empty();
+
+    let static_bytes: Option<Vec<u8>> = if use_static {
+        let mut buf = Vec::with_capacity(512);
+        build_raw_request(first_req_plan, &mut ctx, target, &mut buf)
+            .expect("failed to build static request bytes");
+        Some(buf)
+    } else {
+        None
+    };
+
+    // Scenario ID for the static fast-path — the single HTTP scenario's
+    // index in `plan.scenarios`. Not always 0 when SSE/WS scenarios are
+    // declared first.
+    let static_scenario_id: u16 = http_indices[0] as u16;
+
+    // Macro-like helper to dispatch the right prepare_request call.
+    // When static bytes are available, use the fast memcpy path.
+    // Otherwise expand templates per-request.
+    macro_rules! prepare_conn {
+        ($conn:expr, $intended:expr, $plan:expr, $ctx:expr, $target:expr, $sid:expr) => {
+            if let Some(ref bytes) = static_bytes {
+                $conn.prepare_request(bytes, $intended);
+                $conn.scenario_id = static_scenario_id;
+            } else {
+                $conn.prepare_request_from_template($plan, $ctx, $target, $intended, $sid);
+            }
+        };
+    }
 
     let open_loop = target_rps.is_some();
     let token_interval = target_rps.map(|rps| Duration::from_secs_f64(1.0 / rps));
@@ -306,17 +648,19 @@ pub fn run_mio_worker(
 
     let sni_name = target.sni_name().to_string();
 
-    // Open connections and register with mio.
+    // Open connections and register with mio. `connect_with_retry` may
+    // re-resolve once on transient failures (ECONNREFUSED, etc.) so
+    // rolling-deploy DNS flips don't kill the first batch of connects.
     let mut connections: Vec<Conn> = Vec::with_capacity(num_conns);
     for i in 0..num_conns {
-        let mut tcp = match TcpStream::connect(addr) {
-            Ok(s) => s,
+        let mut tcp = match connect_with_retry(target, opts) {
+            Ok((s, _)) => s,
             Err(_) => {
-                stats.record_error(0, ErrorKind::Connect);
+                err(&mut stats, live, 0, ErrorKind::Connect);
                 continue;
             }
         };
-        tcp.set_nodelay(true).ok();
+        tcp.set_nodelay(opts.tcp_nodelay).ok();
 
         // Register the raw TCP stream with mio first (needed for both
         // plain and TLS paths — mio watches the socket fd, not the
@@ -333,13 +677,13 @@ pub fn run_mio_worker(
             let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), &sni_name) {
                 Ok(s) => s,
                 Err(_) => {
-                    stats.record_error(0, ErrorKind::Connect);
+                    err(&mut stats, live, 0, ErrorKind::Connect);
                     continue;
                 }
             };
             // Drive the TLS handshake to completion using mio poll events.
             if let Err(_) = tls_stream.complete_handshake(&mut poll, Token(i)) {
-                stats.record_error(0, ErrorKind::Connect);
+                err(&mut stats, live, 0, ErrorKind::Connect);
                 continue;
             }
             // Re-register after handshake: mio uses edge-triggered epoll
@@ -357,9 +701,19 @@ pub fn run_mio_worker(
             MioStream::Plain(tcp)
         };
 
-        let conn = Conn::new(stream);
+        let mut conn = Conn::new(stream);
+        conn.skip_header_capture = use_static;
         connections.push(conn);
     }
+
+    // Cache the currently active RequestPlan per connection. For the
+    // initial send (saturate mode), we need to pick a scenario right away.
+    // We store references via indices into plan.scenarios rather than
+    // pointers, so we can look them up for post-response processing.
+
+    // Per-connection scenario index tracker — maps conn index to the index
+    // into plan.scenarios that was last assigned to it.
+    let mut conn_scenario_idx: Vec<usize> = vec![0; connections.len()];
 
     if open_loop {
         // All connections start idle; tokens will assign them work.
@@ -369,14 +723,16 @@ pub fn run_mio_worker(
     } else {
         // Saturate mode: start all connections immediately.
         let now = Instant::now();
-        for conn in &mut connections {
-            conn.prepare_request(request_bytes, now);
+        for (i, conn) in connections.iter_mut().enumerate() {
+            let sel = pick_scenario(plan, &http_indices, &mut ctx);
+            conn_scenario_idx[i] = sel.scenario_id as usize;
+            prepare_conn!(conn, now, sel.request_plan, &mut ctx, target, sel.scenario_id);
         }
     }
 
     // Pending token queue — tokens wait here briefly for a connection
     // to become idle instead of being immediately dropped as keepup.
-    // Bounded at 2× connection count to prevent unbounded growth.
+    // Bounded at 2x connection count to prevent unbounded growth.
     let mut pending_tokens: std::collections::VecDeque<Instant> =
         std::collections::VecDeque::with_capacity(num_conns * 2);
     let max_pending = num_conns * 2;
@@ -392,7 +748,7 @@ pub fn run_mio_worker(
             // Cap the queue — excess tokens are keepup drops.
             while pending_tokens.len() > max_pending {
                 pending_tokens.pop_front();
-                stats.record_error(0, ErrorKind::Keepup);
+                err(&mut stats, live, 0, ErrorKind::Keepup);
             }
         }
 
@@ -401,14 +757,16 @@ pub fn run_mio_worker(
             while let Some(&intended) = pending_tokens.front() {
                 if let Some(conn_idx) = idle_conns.pop() {
                     pending_tokens.pop_front();
+                    let sel = pick_scenario(plan, &http_indices, &mut ctx);
+                    conn_scenario_idx[conn_idx] = sel.scenario_id as usize;
                     let conn = &mut connections[conn_idx];
-                    conn.prepare_request(request_bytes, intended);
+                    prepare_conn!(conn, intended, sel.request_plan, &mut ctx, target, sel.scenario_id);
                     match conn.try_write() {
                         Ok(true) => conn.state = ConnState::ReadingHeaders,
                         Ok(false) => {}
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            stats.record_error(0, ErrorKind::Write);
+                            err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
                         }
                     }
                 } else {
@@ -437,7 +795,7 @@ pub fn run_mio_worker(
 
         // Cache Instant::now() once per poll batch — shared across all
         // events in this iteration. Saves ~50% of clock_gettime calls
-        // (was 14.8% of CPU). Sub-µs precision loss between events in
+        // (was 14.8% of CPU). Sub-us precision loss between events in
         // the same batch is acceptable for a benchmark tool.
         let batch_now = Instant::now();
 
@@ -462,12 +820,14 @@ pub fn run_mio_worker(
                         Ok(false) => {} // would-block
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            stats.record_error(0, ErrorKind::Write);
+                            err(&mut stats, live, conn.scenario_id, ErrorKind::Write);
                         }
                     },
                     ConnState::Idle if !open_loop => {
                         // Saturate: start next request immediately.
-                        conn.prepare_request(request_bytes, Instant::now());
+                        let sel = pick_scenario(plan, &http_indices, &mut ctx);
+                        conn_scenario_idx[idx] = sel.scenario_id as usize;
+                        prepare_conn!(conn, Instant::now(), sel.request_plan, &mut ctx, target, sel.scenario_id);
                         match conn.try_write() {
                             Ok(true) => {
                                 conn.state = ConnState::ReadingHeaders;
@@ -475,7 +835,7 @@ pub fn run_mio_worker(
                             Ok(false) => {}
                             Err(_) => {
                                 conn.state = ConnState::Dead;
-                                stats.record_error(0, ErrorKind::Write);
+                                err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
                             }
                         }
                     }
@@ -494,12 +854,55 @@ pub fn run_mio_worker(
                 )
             {
                 match conn.try_read(batch_now) {
-                    Ok(Some((_status, ttfb, _total))) => {
+                    Ok(Some((status, ttfb, _total))) => {
+                        let scenario_id = conn.scenario_id;
                         let bytes_sent = conn.write_buf.len() as u64;
                         let bytes_recv = conn.read_buf.len() as u64;
                         // CO-free latency: measured from intended_start.
                         let co_free_latency = batch_now.duration_since(conn.intended_start);
-                        stats.record(0, co_free_latency, ttfb, bytes_sent, bytes_recv);
+
+                        // --- Status-class error tracking ---
+                        if (400..500).contains(&status) {
+                            err(&mut stats, live, scenario_id, ErrorKind::Status4xx);
+                        } else if (500..600).contains(&status) {
+                            err(&mut stats, live, scenario_id, ErrorKind::Status5xx);
+                        }
+
+                        // --- Record stats ---
+                        stats.record(scenario_id, co_free_latency, ttfb, bytes_sent, bytes_recv);
+                        if let Some(live) = live {
+                            let lat_ns = co_free_latency.as_nanos() as u64;
+                            live.record(lat_ns, bytes_sent, bytes_recv);
+                            live.record_scenario(scenario_id, lat_ns, bytes_sent, bytes_recv);
+                        }
+
+                        // --- Apply extractions + assertions (skip in static fast path) ---
+                        if !use_static {
+                            let scen_idx = conn_scenario_idx[idx];
+                            let request_plan = plan.scenarios[scen_idx]
+                                .steps
+                                .iter()
+                                .find_map(|s| match s {
+                                    Step::Request(r) => Some(r),
+                                    _ => None,
+                                })
+                                .expect("scenario must have a Request step");
+
+                            apply_extractions(
+                                request_plan,
+                                status,
+                                &conn.extracted_headers,
+                                &mut ctx,
+                            );
+
+                            let assertion_failures =
+                                check_assertions(request_plan, status, co_free_latency);
+                            for _ in 0..assertion_failures {
+                                err(&mut stats, live, scenario_id, ErrorKind::AssertionFailed);
+                            }
+
+                            ctx.clear_all();
+                        }
 
                         if matches!(conn.state, ConnState::Idle) {
                             if open_loop {
@@ -508,7 +911,9 @@ pub fn run_mio_worker(
                                 idle_conns.push(idx);
                             } else {
                                 // Saturate: pipeline next request immediately.
-                                conn.prepare_request(request_bytes, batch_now);
+                                let sel = pick_scenario(plan, &http_indices, &mut ctx);
+                                conn_scenario_idx[idx] = sel.scenario_id as usize;
+                                prepare_conn!(conn, batch_now, sel.request_plan, &mut ctx, target, sel.scenario_id);
                                 match conn.try_write() {
                                     Ok(true) => {
                                         conn.state = ConnState::ReadingHeaders;
@@ -516,7 +921,12 @@ pub fn run_mio_worker(
                                     Ok(false) => {}
                                     Err(_) => {
                                         conn.state = ConnState::Dead;
-                                        stats.record_error(0, ErrorKind::Write);
+                                        err(
+                                            &mut stats,
+                                            live,
+                                            sel.scenario_id,
+                                            ErrorKind::Write,
+                                        );
                                     }
                                 }
                             }
@@ -524,8 +934,9 @@ pub fn run_mio_worker(
                     }
                     Ok(None) => {} // incomplete — keep reading
                     Err(_) => {
+                        let scenario_id = conn.scenario_id;
                         conn.state = ConnState::Dead;
-                        stats.record_error(0, ErrorKind::Read);
+                        err(&mut stats, live, scenario_id, ErrorKind::Read);
                     }
                 }
             }
@@ -539,14 +950,16 @@ pub fn run_mio_worker(
             while let Some(&intended) = pending_tokens.front() {
                 if let Some(conn_idx) = idle_conns.pop() {
                     pending_tokens.pop_front();
+                    let sel = pick_scenario(plan, &http_indices, &mut ctx);
+                    conn_scenario_idx[conn_idx] = sel.scenario_id as usize;
                     let conn = &mut connections[conn_idx];
-                    conn.prepare_request(request_bytes, intended);
+                    prepare_conn!(conn, intended, sel.request_plan, &mut ctx, target, sel.scenario_id);
                     match conn.try_write() {
                         Ok(true) => conn.state = ConnState::ReadingHeaders,
                         Ok(false) => {}
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            stats.record_error(0, ErrorKind::Write);
+                            err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
                         }
                     }
                 } else {
@@ -563,52 +976,77 @@ pub fn run_mio_worker(
 // Multi-threaded driver
 // ---------------------------------------------------------------------------
 
-/// Spawn `num_threads` OS threads, each with its own mio event loop and an
-/// even share of `total_conns`. Blocks until `duration` elapses, then
-/// joins all threads and returns their stats.
+/// Spawn up to `num_threads` OS threads, each with its own mio event loop,
+/// sharing `total_conns` such that the *exact* requested total is honoured.
+/// Blocks until `duration` elapses, then joins all threads and returns
+/// their stats.
 ///
 /// `target_rps`: `None` for saturate (closed-loop), `Some(rps)` for
 /// open-loop constant-rate mode. The total rate is split evenly across
-/// threads (each thread gets `rps / num_threads`).
+/// the *actual* number of active threads — which is clamped to
+/// `min(num_threads, total_conns)` so we don't spawn workers that own
+/// zero connections.
+///
+/// Fixes the `-c N -t T` bug where `div_ceil(total_conns, num_threads) *
+/// num_threads` over-allocated by up to `num_threads - 1` connections
+/// when `total_conns` didn't divide evenly.
 pub fn run_mio_threaded(
     target: &Target,
+    opts: &TransportOpts,
     plan: &Plan,
     num_threads: usize,
     total_conns: usize,
     duration: Duration,
     target_rps: Option<f64>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<LiveSnapshot>>,
+    stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
-    let request_bytes = build_static_request(plan, target);
-    let stop = Arc::new(AtomicBool::new(false));
-    let conns_per_thread = total_conns.div_ceil(num_threads);
-    let per_thread_rps = target_rps.map(|rps| rps / num_threads as f64);
-
-    // Timer thread — signals stop after `duration`.
-    let stop_timer = stop.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(duration);
-        stop_timer.store(true, Ordering::Relaxed);
+    // When an external stop flag is provided (e.g. from the TUI),
+    // use it directly — the caller manages the timer. Otherwise
+    // create our own timer thread.
+    let stop = stop_flag.unwrap_or_else(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let timer = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            timer.store(true, Ordering::Relaxed);
+        });
+        flag
     });
 
+    // Exact distribution: first `total % threads` threads get one more
+    // connection, the rest get the floor. Clamps to `total` so we never
+    // launch more threads than connections.
+    let per_thread_conns = distribute_conns(total_conns, num_threads);
+    let active_threads = per_thread_conns.len();
+    let per_thread_rps = if active_threads == 0 {
+        None
+    } else {
+        target_rps.map(|rps| rps / active_threads as f64)
+    };
+
     // Spawn worker threads.
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
+    let handles: Vec<_> = per_thread_conns
+        .into_iter()
+        .map(|conns| {
             let target = target.clone();
-            let request_bytes = request_bytes.clone();
+            let opts = opts.clone();
+            let plan = plan.clone();
             let stop = stop.clone();
-            let num_scenarios = plan.scenarios.len();
             let tls_config = tls_config.clone();
+            let live = live.clone();
 
             std::thread::spawn(move || {
                 run_mio_worker(
+                    &plan,
                     &target,
-                    &request_bytes,
-                    conns_per_thread,
+                    &opts,
+                    conns,
                     &stop,
-                    num_scenarios,
                     per_thread_rps,
                     tls_config,
+                    live.as_deref(),
                 )
             })
         })
@@ -618,34 +1056,6 @@ pub fn run_mio_threaded(
         .into_iter()
         .map(|h| h.join().expect("mio worker thread panicked"))
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Request builder — expand once at startup
-// ---------------------------------------------------------------------------
-
-/// Pre-build the HTTP/1.1 request wire bytes from the first scenario's
-/// first step. Templates are expanded once (not per-request).
-fn build_static_request(plan: &Plan, target: &Target) -> Vec<u8> {
-    use zerobench_core::rng;
-    use zerobench_core::scenario_context::ScenarioContext;
-
-    let step = plan
-        .scenarios
-        .first()
-        .and_then(|s| s.steps.first())
-        .expect("plan must have at least one scenario with one step");
-
-    let request_plan = match step {
-        Step::Request(r) => r,
-        _ => panic!("mio mode requires the first step to be a Request"),
-    };
-
-    let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-    let mut buf = Vec::with_capacity(512);
-    super::raw_h1_common::build_raw_request(request_plan, &mut ctx, target, &mut buf)
-        .expect("failed to build request bytes");
-    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -710,5 +1120,179 @@ mod tests {
 
         let empty_headers = b"HTTP/1.1 200 OK\r\n\r\n";
         assert_eq!(find_header_end(empty_headers), Some(empty_headers.len()));
+    }
+
+    #[test]
+    fn check_assertions_status_eq_pass() {
+        let plan = RequestPlan {
+            method: http::Method::GET,
+            url: zerobench_core::template::Template::literal("/"),
+            headers: Default::default(),
+            body: None,
+            extract: Vec::new(),
+            checks: vec![Assertion::StatusEq(200)],
+            expect_streaming: false,
+        };
+        assert_eq!(check_assertions(&plan, 200, Duration::from_millis(1)), 0);
+        assert_eq!(check_assertions(&plan, 404, Duration::from_millis(1)), 1);
+    }
+
+    #[test]
+    fn check_assertions_latency_under() {
+        let plan = RequestPlan {
+            method: http::Method::GET,
+            url: zerobench_core::template::Template::literal("/"),
+            headers: Default::default(),
+            body: None,
+            extract: Vec::new(),
+            checks: vec![Assertion::LatencyUnder(Duration::from_millis(100))],
+            expect_streaming: false,
+        };
+        assert_eq!(check_assertions(&plan, 200, Duration::from_millis(50)), 0);
+        assert_eq!(check_assertions(&plan, 200, Duration::from_millis(200)), 1);
+    }
+
+    #[test]
+    fn apply_extractions_status_code() {
+        let mut ctx = ScenarioContext::new(1, zerobench_core::rng::from_seed(1));
+        let plan = RequestPlan {
+            method: http::Method::GET,
+            url: zerobench_core::template::Template::literal("/"),
+            headers: Default::default(),
+            body: None,
+            extract: vec![Extract::StatusCode {
+                into: zerobench_core::var::VarSlot(0),
+            }],
+            checks: Vec::new(),
+            expect_streaming: false,
+        };
+        apply_extractions(&plan, 418, &[], &mut ctx);
+        assert_eq!(
+            ctx.get_var(zerobench_core::var::VarSlot(0))
+                .map(|b| b.as_ref()),
+            Some(b"418".as_ref()),
+        );
+    }
+
+    #[test]
+    fn apply_extractions_header() {
+        let mut ctx = ScenarioContext::new(1, zerobench_core::rng::from_seed(1));
+        let plan = RequestPlan {
+            method: http::Method::GET,
+            url: zerobench_core::template::Template::literal("/"),
+            headers: Default::default(),
+            body: None,
+            extract: vec![Extract::Header {
+                name: http::HeaderName::from_static("x-req-id"),
+                into: zerobench_core::var::VarSlot(0),
+            }],
+            checks: Vec::new(),
+            expect_streaming: false,
+        };
+        let captured = vec![(b"x-req-id".to_vec(), b"abc123".to_vec())];
+        apply_extractions(&plan, 200, &captured, &mut ctx);
+        assert_eq!(
+            ctx.get_var(zerobench_core::var::VarSlot(0))
+                .map(|b| b.as_ref()),
+            Some(b"abc123".as_ref()),
+        );
+    }
+
+    #[test]
+    fn apply_extractions_header_missing_clears_slot() {
+        let mut ctx = ScenarioContext::new(1, zerobench_core::rng::from_seed(1));
+        // Pre-set the slot.
+        ctx.set_var(
+            zerobench_core::var::VarSlot(0),
+            Bytes::from_static(b"old"),
+        );
+        let plan = RequestPlan {
+            method: http::Method::GET,
+            url: zerobench_core::template::Template::literal("/"),
+            headers: Default::default(),
+            body: None,
+            extract: vec![Extract::Header {
+                name: http::HeaderName::from_static("x-missing"),
+                into: zerobench_core::var::VarSlot(0),
+            }],
+            checks: Vec::new(),
+            expect_streaming: false,
+        };
+        apply_extractions(&plan, 200, &[], &mut ctx);
+        assert!(ctx.get_var(zerobench_core::var::VarSlot(0)).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // distribute_conns — the `-c N -t T` fix
+    //
+    // The buggy behaviour (`div_ceil(total, threads) * threads`) was
+    // silently over-allocating connections when `total % threads != 0`,
+    // e.g. `(20, 32)` would yield `1 * 32 = 32` real connections. We
+    // want exactly `total` every time.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn distribute_small_total_large_threads() {
+        // 20 conns across 32 threads — the old bug produced 32.
+        let per = distribute_conns(20, 32);
+        assert_eq!(per.iter().sum::<usize>(), 20);
+        assert_eq!(per.len(), 20); // threads clamped down to total
+        assert!(per.iter().all(|&n| n == 1));
+    }
+
+    #[test]
+    fn distribute_even() {
+        let per = distribute_conns(100, 4);
+        assert_eq!(per.iter().sum::<usize>(), 100);
+        assert_eq!(per.len(), 4);
+        assert!(per.iter().all(|&n| n == 25));
+    }
+
+    #[test]
+    fn distribute_uneven_puts_remainder_in_first_threads() {
+        let per = distribute_conns(7, 3);
+        assert_eq!(per.iter().sum::<usize>(), 7);
+        assert_eq!(per.len(), 3);
+        // 7 = 3 + 2 + 2 (remainder goes first)
+        assert_eq!(per[0], 3);
+        assert_eq!(per[1], 2);
+        assert_eq!(per[2], 2);
+    }
+
+    #[test]
+    fn distribute_one_conn_many_threads() {
+        let per = distribute_conns(1, 8);
+        assert_eq!(per.iter().sum::<usize>(), 1);
+        assert_eq!(per.len(), 1);
+    }
+
+    #[test]
+    fn distribute_zero_total() {
+        let per = distribute_conns(0, 4);
+        assert!(per.is_empty());
+        assert_eq!(per.iter().sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn distribute_zero_threads_is_defensive() {
+        // Pathological input — clamp to at least 1 thread if any conns
+        // were requested. Matches `num_threads = num_threads.max(1)` in
+        // the top-level driver.
+        let per = distribute_conns(5, 0);
+        assert_eq!(per.iter().sum::<usize>(), 5);
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0], 5);
+    }
+
+    #[test]
+    fn distribute_many_pairs_exact_total() {
+        for (total, threads) in [(20, 32), (100, 4), (7, 3), (1, 8), (0, 4), (1000, 17)] {
+            let per = distribute_conns(total, threads);
+            assert_eq!(
+                per.iter().sum::<usize>(),
+                total,
+                "({total}, {threads}) distribution lost count"
+            );
+        }
     }
 }

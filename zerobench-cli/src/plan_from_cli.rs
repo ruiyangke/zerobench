@@ -63,10 +63,19 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
     // we force HTTP/1: v0.0.1's streaming path is only wired through
     // `Http1Pool::exchange_streaming`, and HTTP/2 multiplexing would
     // conflate chunk timing across concurrent streams anyway.
-    let http_version = match args.http_version {
-        CliHttpVersion::Auto => HttpVersionPref::Auto,
-        CliHttpVersion::H1 => HttpVersionPref::Http1,
-        CliHttpVersion::H2 => HttpVersionPref::Http2,
+    //
+    // `--http2-prior-knowledge` is an alias for `--http-version h2` —
+    // discoverable via a curl-familiar flag name. Our mio_h2 always uses
+    // prior knowledge on plain HTTP, so the two are indistinguishable
+    // at the wire level.
+    let http_version = if args.http2_prior_knowledge {
+        HttpVersionPref::Http2
+    } else {
+        match args.http_version {
+            CliHttpVersion::Auto => HttpVersionPref::Auto,
+            CliHttpVersion::H1 => HttpVersionPref::Http1,
+            CliHttpVersion::H2 => HttpVersionPref::Http2,
+        }
     };
     #[cfg(feature = "sse")]
     let http_version = if args.sse {
@@ -82,6 +91,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
         tcp_nodelay: true,
         insecure_tls: args.insecure,
         http_version,
+        resolve_overrides: args.resolve.clone(),
     };
 
     if let Some(path) = &args.request_file {
@@ -106,39 +116,78 @@ fn build_from_url(
 ) -> Result<(Plan, Target, TransportOpts), BuildError> {
     let target = Target::parse(url)?;
 
-    // HTTP method — infer POST if the user passed a body but no -X.
-    let method_raw = if args.body.is_some() || args.body_file.is_some() {
-        if args.method.eq_ignore_ascii_case("GET") {
-            // The default was never overridden; imply POST.
-            "POST".to_string()
-        } else {
-            args.method.clone()
-        }
-    } else {
-        args.method.clone()
+    // Resolve --method. Explicit `-X` wins. When `-X` was omitted and a
+    // body source was provided, auto-promote GET → POST so the common
+    // `zerobench --json '{}' URL` shortcut does the right thing.
+    let has_body_hint = args.body.is_some()
+        || args.body_file.is_some()
+        || args.json.is_some()
+        || args.form.is_some();
+    let method_raw = match &args.method {
+        Some(m) => m.clone(),
+        None if has_body_hint => "POST".to_string(),
+        None => "GET".to_string(),
     };
     let method = method_raw
         .parse::<Method>()
         .map_err(|_| BuildError::InvalidMethod(method_raw.clone()))?;
 
+    // S2.22 — warn on explicit `-X GET` combined with a body.
+    if has_body_hint
+        && method == Method::GET
+        && args.method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("GET"))
+    {
+        eprintln!(
+            "warning: GET request with body — technically valid but most servers ignore it",
+        );
+    }
+
     // Build the registry + URL template.
     let mut vars = VarRegistry::new();
     let url_tpl = Template::compile(url, &mut vars)?;
 
-    // Headers — both sides through the template engine.
+    // Headers — both sides through the template engine. Auth headers
+    // derived from --basic-auth / --bearer are appended after the
+    // user's -H list, but only if the user didn't already pass
+    // `-H Authorization: ...`. When they conflict, explicit -H wins
+    // with a stderr warning (S1.7).
+    let user_has_auth_header = args
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("Authorization"));
+
     let mut headers: SmallVec<[(Template, Template); 8]> = SmallVec::new();
     for (name, value) in &args.headers {
         let name_tpl = Template::compile(name, &mut vars)?;
         let value_tpl = Template::compile(value, &mut vars)?;
         headers.push((name_tpl, value_tpl));
     }
+    push_auth_header(args, user_has_auth_header, &mut vars, &mut headers)?;
 
-    // Body — inline string wins over file.
+    // Body — precedence: inline --body > --body-file > --json > --form.
+    // clap's `conflicts_with` ensures at most one of these is set, so
+    // the order here only matters for defensive code review.
     let body = if let Some(inline) = &args.body {
         Some(BodySource::Template(Template::compile(inline, &mut vars)?))
     } else if let Some(path) = &args.body_file {
         let bytes = fs::read(path)?;
         Some(BodySource::Static(bytes::Bytes::from(bytes)))
+    } else if let Some(json) = &args.json {
+        push_content_type(
+            "application/json",
+            &args.headers,
+            &mut vars,
+            &mut headers,
+        )?;
+        Some(BodySource::Template(Template::compile(json, &mut vars)?))
+    } else if let Some(form) = &args.form {
+        push_content_type(
+            "application/x-www-form-urlencoded",
+            &args.headers,
+            &mut vars,
+            &mut headers,
+        )?;
+        Some(BodySource::Template(Template::compile(form, &mut vars)?))
     } else {
         None
     };
@@ -162,15 +211,72 @@ fn build_from_url(
         steps: vec![Step::Request(request)],
     };
 
+    // NOTE (S1.6): `plan.warmup` is plumbed from the CLI but the mio
+    // dispatch layer in zerobench-http doesn't honour it yet — it
+    // starts measuring on first request. TODO: wire through.
     let plan = Plan {
         scenarios: vec![scenario],
         vars,
         duration: args.duration,
-        warmup: None,
+        warmup: args.warmup,
         threads: 1,
     };
 
     Ok((plan, target, opts.clone()))
+}
+
+/// Append an Authorization header for --basic-auth / --bearer, or warn
+/// and skip when the user already supplied one via -H.
+fn push_auth_header(
+    args: &CliArgs,
+    user_has_auth_header: bool,
+    vars: &mut VarRegistry,
+    headers: &mut SmallVec<[(Template, Template); 8]>,
+) -> Result<(), BuildError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let auth_value = if let Some(user_pass) = &args.basic_auth {
+        Some(format!("Basic {}", B64.encode(user_pass.as_bytes())))
+    } else if let Some(token) = &args.bearer {
+        Some(format!("Bearer {token}"))
+    } else {
+        None
+    };
+
+    let Some(value) = auth_value else { return Ok(()) };
+    if user_has_auth_header {
+        eprintln!(
+            "warning: -H 'Authorization: ...' overrides --basic-auth / --bearer",
+        );
+        return Ok(());
+    }
+    headers.push((
+        Template::compile("Authorization", vars)?,
+        Template::compile(&value, vars)?,
+    ));
+    Ok(())
+}
+
+/// Append `Content-Type: <ct>` unless the user already set one via -H.
+/// Used by --json and --form body paths.
+fn push_content_type(
+    ct: &str,
+    user_headers: &[(String, String)],
+    vars: &mut VarRegistry,
+    headers: &mut SmallVec<[(Template, Template); 8]>,
+) -> Result<(), BuildError> {
+    let already = user_headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("Content-Type"));
+    if already {
+        return Ok(());
+    }
+    headers.push((
+        Template::compile("Content-Type", vars)?,
+        Template::compile(ct, vars)?,
+    ));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +325,7 @@ fn build_from_request_file(
         scenarios: vec![scenario],
         vars,
         duration: args.duration,
-        warmup: None,
+        warmup: args.warmup,
         threads: 1,
     };
 
@@ -321,7 +427,7 @@ fn build_from_request_dir(
         scenarios,
         vars,
         duration: args.duration,
-        warmup: None,
+        warmup: args.warmup,
         threads: 1,
     };
     Ok((plan, target, opts.clone()))
@@ -399,6 +505,7 @@ pub fn build_ws_plan(
         tcp_nodelay: true,
         insecure_tls: args.insecure,
         http_version: HttpVersionPref::Http1,
+        resolve_overrides: args.resolve.clone(),
     };
 
     let plan = zerobench_ws::WsPlan {
@@ -667,6 +774,142 @@ mod tests {
         ]);
         let (_plan, _target, opts) = build(&args).unwrap();
         assert_eq!(opts.http_version, HttpVersionPref::Http2);
+    }
+
+    #[test]
+    fn build_http2_prior_knowledge_flag_implies_h2() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--http2-prior-knowledge",
+            "http://h:1/",
+        ]);
+        let (_plan, _target, opts) = build(&args).unwrap();
+        assert_eq!(opts.http_version, HttpVersionPref::Http2);
+    }
+
+    #[test]
+    fn build_warmup_is_plumbed_through_to_plan() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--warmup",
+            "7s",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        assert_eq!(plan.warmup, Some(std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn build_warmup_absent_yields_none() {
+        let args = parse(&["zerobench", "--saturate", "http://h:1/"]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        assert!(plan.warmup.is_none());
+    }
+
+    #[test]
+    fn build_resolve_overrides_forwarded_to_transport_opts() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--resolve",
+            "example.com:443:10.0.0.5",
+            "http://example.com/",
+        ]);
+        let (_plan, _target, opts) = build(&args).unwrap();
+        assert_eq!(opts.resolve_overrides.len(), 1);
+        assert_eq!(opts.resolve_overrides[0].0, "example.com");
+        assert_eq!(opts.resolve_overrides[0].1, 443);
+        assert_eq!(opts.resolve_overrides[0].2, "10.0.0.5");
+    }
+
+    #[test]
+    fn build_basic_auth_adds_header() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--basic-auth",
+            "alice:pw",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        let step = &plan.scenarios[0].steps[0];
+        let Step::Request(req) = step else { panic!("expected Request") };
+        // Expect one header named `Authorization`.
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn build_bearer_adds_header() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--bearer",
+            "token123",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        let Step::Request(req) = &plan.scenarios[0].steps[0] else {
+            panic!("expected Request")
+        };
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn build_explicit_auth_header_wins_over_basic_auth() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--basic-auth",
+            "alice:pw",
+            "-H",
+            "Authorization: CustomScheme 42",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        let Step::Request(req) = &plan.scenarios[0].steps[0] else {
+            panic!("expected Request")
+        };
+        // Only one Authorization header — the explicit -H, not two.
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn build_json_body_adds_content_type_and_implies_post() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--json",
+            "{\"k\":1}",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        let Step::Request(req) = &plan.scenarios[0].steps[0] else {
+            panic!("expected Request")
+        };
+        assert_eq!(req.method, http::Method::POST);
+        // Content-Type header added.
+        assert_eq!(req.headers.len(), 1);
+        assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn build_form_body_adds_content_type_and_implies_post() {
+        let args = parse(&[
+            "zerobench",
+            "--saturate",
+            "--form",
+            "a=1&b=2",
+            "http://h:1/",
+        ]);
+        let (plan, _target, _opts) = build(&args).unwrap();
+        let Step::Request(req) = &plan.scenarios[0].steps[0] else {
+            panic!("expected Request")
+        };
+        assert_eq!(req.method, http::Method::POST);
+        assert_eq!(req.headers.len(), 1);
+        assert!(req.body.is_some());
     }
 
     #[test]

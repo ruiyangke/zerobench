@@ -1,26 +1,22 @@
-//! A single client-side WebSocket connection.
+//! A single client-side WebSocket connection (mio/synchronous).
 //!
-//! Wraps a plain TCP socket (plus the recv-buffer and the per-connection
-//! mask RNG). The connection layer sits above the frame codec and below
-//! the benchmark loop:
+//! Wraps a [`MioStream`] (plain TCP or TLS) plus the recv-buffer and
+//! the per-connection mask RNG. The connection layer sits above the
+//! frame codec and below the benchmark loop:
 //!
 //! ```text
-//!     run_ws_saturate
+//!     run_ws_threaded
 //!       └── WsConnection ← this module
 //!             └── frame  ← zerobench_ws::frame
-//!                 └── TcpStream
+//!                 └── MioStream (plain or TLS)
 //! ```
 //!
 //! # TLS / wss://
 //!
 //! `wss://` runs the same handshake + frame codec on top of a
-//! `compio_tls::TlsStream<TcpStream>` instead of a plain `TcpStream`.
-//! The layered design falls out of [`WsStream`] being a blanket trait
-//! for anything that is `AsyncRead + AsyncWrite + Unpin + 'static`:
-//! `WsConnection<TcpStream>` and `WsConnection<TlsStream<TcpStream>>`
-//! coexist without any per-variant code below the connect path.
-//! We deliberately do **not** advertise ALPN here — the WebSocket
-//! Upgrade handshake lives above TLS, so ALPN has no role.
+//! `MioTlsStream` wrapped inside `MioStream::Tls`. The `MioStream`
+//! enum implements `Read + Write`, so the connection code is agnostic
+//! to the transport variant.
 //!
 //! # Control-frame handling
 //!
@@ -30,20 +26,20 @@
 //! concatenated transparently — the caller sees one completed
 //! Text/Binary per message, never a `Continuation`.
 
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
-use compio::buf::BufResult;
-use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-// AsyncWrite's `flush` is an inherent method, but callers need to
-// invoke it explicitly after write_all on TLS streams (plain TCP
-// ignores it as a no-op).
-use compio::net::TcpStream;
-use compio_tls::TlsStream;
+use mio::net::TcpStream;
+use mio::{Events, Interest, Poll, Token};
+use rustls::ClientConfig;
 
 use zerobench_core::rng::BenchRng;
-use zerobench_core::tls::tls_client_config;
 use zerobench_core::transport::{Target, TransportOpts};
+
+use zerobench_http::mio_tls::{MioStream, MioTlsStream};
 
 use crate::frame::{self, FrameHeader, Opcode};
 use crate::handshake::{self, find_headers_end, HandshakeError};
@@ -87,34 +83,25 @@ pub enum WsError {
 }
 
 // ---------------------------------------------------------------------------
-// A trait abstracting the underlying transport so TLS can be dropped in
-// later. Declared pub(crate) because the public API only exposes the
-// concrete TcpStream variant for now.
-// ---------------------------------------------------------------------------
-
-/// Marker trait for WS-capable byte streams. `TcpStream` satisfies it
-/// for `ws://`; `TlsStream<TcpStream>` satisfies it for `wss://`.
-pub trait WsStream: AsyncRead + AsyncWrite + Unpin + 'static {}
-impl WsStream for TcpStream {}
-impl WsStream for TlsStream<TcpStream> {}
-
-// ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 
 /// A single established WebSocket connection.
 ///
 /// Lifecycle:
-/// 1. [`WsConnection::handshake`] — TCP + RFC 6455 §4 Upgrade.
-/// 2. Repeated [`WsConnection::send`] / [`WsConnection::recv`].
+/// 1. [`WsConnection::connect`] — TCP + optional TLS + RFC 6455 §4 Upgrade.
+/// 2. Repeated [`WsConnection::send_text`] / [`WsConnection::recv`].
 /// 3. Optional [`WsConnection::close`] before drop.
 ///
-/// `send` always emits FIN=1 frames — we don't fragment outbound
+/// `send_text` always emits FIN=1 frames — we don't fragment outbound
 /// messages. `recv` transparently handles Ping/Pong and reassembles
 /// Continuation fragments before handing a completed
 /// [`DataFrame`] up to the caller.
-pub struct WsConnection<S: WsStream> {
-    stream: S,
+pub struct WsConnection {
+    stream: MioStream,
+    poll: Poll,
+    events: Events,
+    token: Token,
     recv_buf: BytesMut,
     mask_rng: BenchRng,
     /// Running accumulator for fragmented inbound messages.
@@ -160,213 +147,80 @@ impl DataFrame {
     }
 }
 
-impl WsConnection<TcpStream> {
-    /// Open a plain-TCP `ws://` connection and perform the RFC 6455 §4
-    /// Upgrade handshake.
+impl WsConnection {
+    /// Unified connect: picks plain TCP or TLS based on `target.tls`,
+    /// performs the TCP connect + optional TLS handshake + WS Upgrade.
     ///
-    /// Returns a ready-to-use connection on success. Partial reads of
-    /// the response are handled — we keep pulling from the socket until
-    /// a `\r\n\r\n` terminator is found (capped at 16 KiB to prevent
-    /// resource exhaustion from a malicious server).
-    ///
-    /// TLS targets are rejected here — the caller should route `wss://`
-    /// through [`WsConnection::connect`] which dispatches to the TLS
-    /// path. Kept for backward compatibility with existing tests; new
-    /// call sites should prefer the unified [`connect`] wrapper below.
-    pub async fn connect_tcp(
+    /// Returns a ready-to-use connection on success.
+    pub fn connect(
         target: &Target,
         opts: &TransportOpts,
         path: &str,
         extra_headers: &[(String, String)],
         mut mask_rng: BenchRng,
+        tls_config: Option<&Arc<ClientConfig>>,
     ) -> Result<Self, WsError> {
-        if target.tls {
-            return Err(WsError::Tls(
-                "wss:// target passed to connect_tcp; use WsConnection::connect for TLS support".into(),
-            ));
-        }
+        // `Target::resolve` now honours `opts.resolve_overrides` and
+        // `target.addr_family` — the override path skips DNS entirely,
+        // the family preference breaks resolver-order ties on dual-stack
+        // hosts like `localhost`.
+        let addr: SocketAddr = target.resolve(opts).map_err(WsError::Io)?;
 
-        let addr = target.addr();
-        let stream = compio::time::timeout(opts.connect_timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| WsError::Io(io::Error::new(io::ErrorKind::TimedOut, format!("{addr}: connect timeout"))))?
-            .map_err(|e| {
-                WsError::Io(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("{addr}: {e}"),
-                ))
-            })?;
-        // Best-effort NODELAY; same as the HTTP transport. A failure
-        // here doesn't justify aborting.
-        let _ = stream.set_nodelay(true);
+        let mut poll = Poll::new().map_err(WsError::Io)?;
+        let mut events = Events::with_capacity(64);
+        let token = Token(0);
 
-        Self::handshake_over(stream, target, path, extra_headers, &mut mask_rng).await
-    }
-}
-
-impl WsConnection<TlsStream<TcpStream>> {
-    /// Open a TLS-wrapped `wss://` connection and perform the Upgrade
-    /// handshake on top of it.
-    ///
-    /// Uses [`zerobench_core::tls::tls_client_config`] for the rustls
-    /// config. We deliberately don't advertise ALPN — the WebSocket
-    /// Upgrade lives *above* TLS, so there's no protocol for ALPN to
-    /// pick between.
-    pub async fn connect_tls(
-        target: &Target,
-        opts: &TransportOpts,
-        path: &str,
-        extra_headers: &[(String, String)],
-        mut mask_rng: BenchRng,
-    ) -> Result<Self, WsError> {
-        if !target.tls {
-            // Called from a unified wrapper that's already verified
-            // this — belt-and-braces.
-            return Err(WsError::Tls(
-                "ws:// target passed to connect_tls; use connect_tcp for plain".into(),
-            ));
-        }
-
-        let addr = target.addr();
-        let tcp = compio::time::timeout(opts.connect_timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| WsError::Io(io::Error::new(io::ErrorKind::TimedOut, format!("{addr}: connect timeout"))))?
-            .map_err(|e| {
-                WsError::Io(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("{addr}: {e}"),
-                ))
-            })?;
+        // --- TCP connect (non-blocking via mio) ---
+        let mut tcp = TcpStream::connect(addr).map_err(|e| {
+            WsError::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("{addr}: {e}"),
+            ))
+        })?;
         let _ = tcp.set_nodelay(true);
 
-        // Empty ALPN list — WebSocket handshake is entirely over TLS
-        // record layer, no ALPN negotiation to make.
-        let cfg = tls_client_config(opts, &[]);
-        let connector = compio_tls::TlsConnector::from(cfg);
-        let server_name = target.sni_name().to_string();
-        let tls = compio::time::timeout(opts.connect_timeout, connector.connect(&server_name, tcp))
-            .await
-            .map_err(|_| WsError::Tls(format!("{addr}: tls handshake timeout")))?
-            .map_err(|e| WsError::Tls(format!("handshake: {e}")))?;
+        poll.registry()
+            .register(&mut tcp, token, Interest::READABLE | Interest::WRITABLE)
+            .map_err(WsError::Io)?;
 
-        Self::handshake_over(tls, target, path, extra_headers, &mut mask_rng).await
-    }
-}
-
-/// Unified `ws://` + `wss://` connection.
-///
-/// A single enum so the runner can hold "a WebSocket connection"
-/// without propagating a stream-type generic through every function.
-/// Method calls dispatch through the enum with a runtime match; the
-/// two variants don't share a vtable because the inner types differ
-/// enough (TLS stream is boxed for size parity) that an enum is clearer
-/// than a trait object.
-pub enum AnyWsConnection {
-    /// Plain `ws://` — TCP directly.
-    Plain(WsConnection<TcpStream>),
-    /// `wss://` — TLS over TCP.
-    Tls(WsConnection<TlsStream<TcpStream>>),
-}
-
-impl AnyWsConnection {
-    /// Dispatch `send_text`.
-    pub async fn send_text(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        match self {
-            AnyWsConnection::Plain(c) => c.send_text(payload).await,
-            AnyWsConnection::Tls(c) => c.send_text(payload).await,
-        }
-    }
-
-    /// Dispatch `send_binary`.
-    pub async fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        match self {
-            AnyWsConnection::Plain(c) => c.send_binary(payload).await,
-            AnyWsConnection::Tls(c) => c.send_binary(payload).await,
-        }
-    }
-
-    /// Dispatch `recv`.
-    pub async fn recv(&mut self) -> Result<DataFrame, WsError> {
-        match self {
-            AnyWsConnection::Plain(c) => c.recv().await,
-            AnyWsConnection::Tls(c) => c.recv().await,
-        }
-    }
-
-    /// Dispatch `close`.
-    pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), WsError> {
-        match self {
-            AnyWsConnection::Plain(c) => c.close(code, reason).await,
-            AnyWsConnection::Tls(c) => c.close(code, reason).await,
-        }
-    }
-}
-
-impl WsConnection<TcpStream> {
-    /// Unified connect that picks plain or TLS based on `target.tls`.
-    ///
-    /// This is the entry point the runner uses. Existing callers that
-    /// still go through [`WsConnection::connect_tcp`] (tests, v1 compat)
-    /// keep working — the inherent method lives on `WsConnection<TcpStream>`
-    /// and still returns a concrete type.
-    pub async fn connect(
-        target: &Target,
-        opts: &TransportOpts,
-        path: &str,
-        extra_headers: &[(String, String)],
-        mask_rng: BenchRng,
-    ) -> Result<AnyWsConnection, WsError> {
-        if target.tls {
-            let c = WsConnection::<TlsStream<TcpStream>>::connect_tls(
-                target,
-                opts,
-                path,
-                extra_headers,
-                mask_rng,
-            )
-            .await?;
-            Ok(AnyWsConnection::Tls(c))
+        // --- Optional TLS handshake ---
+        //
+        // For TLS targets, `MioTlsStream::complete_handshake` handles
+        // both waiting for TCP connect to complete (Phase 1) and driving
+        // the TLS state machine (Phase 2). We skip `wait_for_tcp_connect`
+        // to avoid consuming the mio edge event that Phase 1 needs.
+        //
+        // For plain TCP, we wait for the connect event ourselves before
+        // writing the WS upgrade request.
+        let mut stream = if target.tls {
+            let config = tls_config.ok_or_else(|| {
+                WsError::Tls("wss:// target but no TLS config provided".into())
+            })?;
+            let sni = target.sni_name().to_string();
+            let mut tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
+                .map_err(|e| WsError::Tls(format!("tls init: {e}")))?;
+            tls.complete_handshake(&mut poll, token)
+                .map_err(|e| WsError::Tls(format!("tls handshake: {e}")))?;
+            poll.registry()
+                .reregister(tls.tcp_stream_mut(), token, Interest::READABLE | Interest::WRITABLE)
+                .map_err(WsError::Io)?;
+            MioStream::Tls(tls)
         } else {
-            let c = WsConnection::<TcpStream>::connect_tcp(
-                target,
-                opts,
-                path,
-                extra_headers,
-                mask_rng,
-            )
-            .await?;
-            Ok(AnyWsConnection::Plain(c))
-        }
-    }
-}
+            wait_for_tcp_connect(&mut poll, &mut events, token, &tcp, opts.connect_timeout)?;
+            MioStream::Plain(tcp)
+        };
 
-impl<S: WsStream> WsConnection<S> {
-    /// Perform the handshake on a pre-opened stream.
-    ///
-    /// Extracted so a future TLS variant can call it after the TLS
-    /// handshake succeeds. The `mask_rng` parameter seeds the
-    /// per-connection mask CSPRNG and is also used for the
-    /// Sec-WebSocket-Key nonce.
-    pub async fn handshake_over(
-        mut stream: S,
-        target: &Target,
-        path: &str,
-        extra_headers: &[(String, String)],
-        mask_rng: &mut BenchRng,
-    ) -> Result<Self, WsError> {
-        let (key_b64, _key_bytes) = handshake::generate_key(mask_rng);
+        // --- WS Upgrade handshake ---
+        let (key_b64, _key_bytes) = handshake::generate_key(&mut mask_rng);
         let req = handshake::build_request(target, path, &key_b64, extra_headers);
-        stream.write_all(req).await.0?;
-        // Flush is critical on TLS streams — compio-tls buffers
-        // plaintext through rustls' record layer and only empties the
-        // buffer on an explicit flush. Plain TCP treats this as a
-        // no-op, so the call is cheap on the hot path.
-        stream.flush().await?;
 
-        // Pull the response header section. Cap at 16 KiB so a misbehaving
-        // server can't pin us on endless reads.
-        const MAX_HEADER_BYTES: usize = 16 * 1024;
+        // Write request bytes
+        write_all_mio(&mut stream, &req, &mut poll, &mut events, token)?;
+        stream.flush_tls();
+
+        // Read response headers
         let mut raw = Vec::<u8>::with_capacity(1024);
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
 
         let headers_end_pos = loop {
             if let Some(end) = find_headers_end(&raw) {
@@ -375,19 +229,10 @@ impl<S: WsStream> WsConnection<S> {
             if raw.len() >= MAX_HEADER_BYTES {
                 return Err(WsError::Handshake(HandshakeError::HeadersTooBig));
             }
-            let buf = Vec::with_capacity(1024);
-            let BufResult(res, returned) = stream.read(buf).await;
-            let n = res?;
-            if n == 0 {
-                return Err(WsError::Handshake(HandshakeError::UnparseableResponse(
-                    "server closed before sending handshake response".into(),
-                )));
-            }
-            raw.extend_from_slice(&returned[..n]);
+            read_some_mio(&mut stream, &mut raw, &mut poll, &mut events)?;
         };
 
-        // Parse with httparse — it's zero-copy and already a workspace
-        // dep. `max_header_count=64` is well above what real servers send.
+        // Parse with httparse
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut resp = httparse::Response::new(&mut headers);
         let parse_result = resp
@@ -397,19 +242,16 @@ impl<S: WsStream> WsConnection<S> {
         match parse_result {
             httparse::Status::Complete(_) => {}
             httparse::Status::Partial => {
-                // Shouldn't happen — find_headers_end already saw \r\n\r\n.
                 return Err(WsError::Handshake(HandshakeError::UnparseableResponse(
                     "httparse: partial after \\r\\n\\r\\n seen".into(),
                 )));
             }
         }
         let status = resp.code.unwrap_or(0);
-
         handshake::validate_response(status, resp.headers, &key_b64)?;
 
-        // Anything after the `\r\n\r\n` is the start of the WebSocket
-        // frame stream — servers sometimes send the 101 and immediately
-        // push their first frame in the same TCP chunk.
+        // Anything after the \r\n\r\n is the start of the WebSocket
+        // frame stream.
         let mut recv_buf = BytesMut::with_capacity(4096);
         if raw.len() > headers_end_pos {
             recv_buf.extend_from_slice(&raw[headers_end_pos..]);
@@ -417,87 +259,77 @@ impl<S: WsStream> WsConnection<S> {
 
         Ok(Self {
             stream,
+            poll,
+            events,
+            token,
             recv_buf,
-            mask_rng: mask_rng.clone(),
+            mask_rng,
             fragment: None,
             close_sent: false,
         })
     }
 
     /// Send a Text frame.
-    pub async fn send_text(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        self.send_frame(Opcode::Text, payload).await
+    pub fn send_text(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.send_frame(Opcode::Text, payload)
     }
 
     /// Send a Binary frame.
-    pub async fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        self.send_frame(Opcode::Binary, payload).await
+    pub fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.send_frame(Opcode::Binary, payload)
     }
 
-    /// Send a masked frame of the given opcode. Callers should pass
-    /// `Text`, `Binary`, `Ping`, or `Pong`. Close frames should go
-    /// through [`WsConnection::close`].
-    async fn send_frame(&mut self, opcode: Opcode, payload: &[u8]) -> Result<(), WsError> {
+    /// Send a masked frame of the given opcode.
+    fn send_frame(&mut self, opcode: Opcode, payload: &[u8]) -> Result<(), WsError> {
         let mask = generate_mask(&mut self.mask_rng);
-        // Build into a fresh Vec so `write_all`'s buffer-ownership
-        // contract (compio takes the buffer by value) is satisfied.
         let mut buf = Vec::with_capacity(14 + payload.len());
         frame::encode_frame(opcode, payload, mask, &mut buf);
-        self.stream.write_all(buf).await.0?;
-        // Flush for TLS streams — see the handshake path's comment.
-        // Plain TCP's flush is a no-op, so the cost is negligible.
-        self.stream.flush().await?;
+        write_all_mio(&mut self.stream, &buf, &mut self.poll, &mut self.events, self.token)?;
+        self.stream.flush_tls();
         Ok(())
     }
 
-    /// Send a Pong frame with the given payload. Used to reply to a
-    /// server Ping per RFC 6455 §5.5.2.
-    async fn send_pong(&mut self, payload: &[u8]) -> Result<(), WsError> {
-        self.send_frame(Opcode::Pong, payload).await
+    /// Send a Pong frame with the given payload.
+    fn send_pong(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.send_frame(Opcode::Pong, payload)
     }
 
     /// Wait for the next data message.
     ///
     /// Handles control frames transparently:
-    /// - `Ping` → auto-reply with `Pong` and keep reading.
-    /// - `Pong` → ignored (we don't issue keepalive pings).
-    /// - `Close` → reply with close (if we haven't already) and
+    /// - `Ping` -> auto-reply with `Pong` and keep reading.
+    /// - `Pong` -> ignored (we don't issue keepalive pings).
+    /// - `Close` -> reply with close (if we haven't already) and
     ///   return [`WsError::Closed`] so the caller's loop exits.
     ///
     /// Reassembles fragmented messages (RFC 6455 §5.4) into a single
     /// `DataFrame` before returning.
-    pub async fn recv(&mut self) -> Result<DataFrame, WsError> {
+    pub fn recv(&mut self) -> Result<DataFrame, WsError> {
         loop {
             // Try to decode the next frame from what's already buffered.
             let hdr_result = frame::decode_frame(&self.recv_buf);
             match hdr_result {
                 Ok(hdr) => {
                     let frame_bytes = self.recv_buf.split_to(hdr.total_len);
-                    match self.handle_frame(hdr, frame_bytes.freeze()).await? {
+                    match self.handle_frame(hdr, frame_bytes.freeze())? {
                         Some(f) => return Ok(f),
                         None => continue,
                     }
                 }
                 Err(frame::WsError::NeedMore { needed }) => {
-                    self.fill_recv_buf(needed).await?;
+                    self.fill_recv_buf(needed)?;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
 
-    /// Dispatch a single decoded frame. Returns `Some(DataFrame)` when
-    /// the caller should get a message back (possibly after accumulating
-    /// fragments), `None` when the recv loop should spin again (e.g.
-    /// after auto-replying to a Ping).
-    async fn handle_frame(
+    /// Dispatch a single decoded frame.
+    fn handle_frame(
         &mut self,
         hdr: FrameHeader,
         frame_bytes: bytes::Bytes,
     ) -> Result<Option<DataFrame>, WsError> {
-        // Qualified call — `Bytes::slice` returns `Bytes`, but
-        // `compio::buf::IoBuf::slice` (a blanket impl covers `Bytes`)
-        // shadows the method name, so we use `Buf`'s inherent form.
         let payload = bytes::Bytes::slice(
             &frame_bytes,
             hdr.payload_start..hdr.payload_start + hdr.payload_len,
@@ -511,14 +343,12 @@ impl<S: WsStream> WsConnection<S> {
                     )));
                 }
                 if hdr.fin {
-                    // Single complete message, no fragmentation.
                     return Ok(Some(match hdr.opcode {
                         Opcode::Text => DataFrame::Text(payload),
                         Opcode::Binary => DataFrame::Binary(payload),
                         _ => unreachable!(),
                     }));
                 }
-                // Start a fragmented message.
                 self.fragment = Some((hdr.opcode, payload.to_vec()));
                 Ok(None)
             }
@@ -547,28 +377,26 @@ impl<S: WsStream> WsConnection<S> {
                 Ok(None)
             }
             Opcode::Ping => {
-                // Per §5.5.2: reply with Pong carrying identical payload.
-                self.send_pong(&payload).await?;
+                self.send_pong(&payload)?;
                 Ok(None)
             }
             Opcode::Pong => {
-                // Unsolicited pong — ignore. We don't issue pings so
-                // there's no request to match up.
                 Ok(None)
             }
             Opcode::Close => {
                 let (code, reason) = frame::parse_close_payload(&payload);
-                // RFC 6455 §5.5.1: "Upon receipt of such a frame, the
-                // other peer sends a Close frame in response, if it
-                // hasn't already sent one."
                 if !self.close_sent {
-                    // Best-effort echo. Ignore errors: the socket may
-                    // already be half-closed.
                     let mut buf = Vec::with_capacity(8);
                     let mask = generate_mask(&mut self.mask_rng);
                     frame::encode_close(code, "", mask, &mut buf);
-                    let _ = self.stream.write_all(buf).await.0;
-                    let _ = self.stream.flush().await;
+                    let _ = write_all_mio(
+                        &mut self.stream,
+                        &buf,
+                        &mut self.poll,
+                        &mut self.events,
+                        self.token,
+                    );
+                    self.stream.flush_tls();
                     self.close_sent = true;
                 }
                 Err(WsError::Closed { code, reason })
@@ -577,38 +405,21 @@ impl<S: WsStream> WsConnection<S> {
     }
 
     /// Read at least `min_new` bytes into `recv_buf`.
-    ///
-    /// Compio's `AsyncRead::read` takes buffer ownership, so we allocate
-    /// a fresh Vec per read and copy into our persistent BytesMut. A
-    /// BytesMut re-use would require compio's `IoBufMut` to work with
-    /// an owned view of the tail — possible but not worth the plumbing
-    /// for what's typically a single read per message on loopback.
-    async fn fill_recv_buf(&mut self, min_new: usize) -> Result<(), WsError> {
-        let want = min_new.max(4096);
+    fn fill_recv_buf(&mut self, min_new: usize) -> Result<(), WsError> {
         let before = self.recv_buf.len();
         while self.recv_buf.len() - before < min_new.max(1) {
-            let buf = Vec::with_capacity(want);
-            let BufResult(res, returned) = self.stream.read(buf).await;
-            let n = res?;
-            if n == 0 {
-                return Err(WsError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed before frame completed",
-                )));
-            }
-            self.recv_buf.extend_from_slice(&returned[..n]);
+            read_some_bytes_into(
+                &mut self.stream,
+                &mut self.recv_buf,
+                &mut self.poll,
+                &mut self.events,
+            )?;
         }
         Ok(())
     }
 
     /// Send a Close frame with the given code and reason.
-    ///
-    /// Best-effort: if the socket write fails (e.g. the server closed
-    /// already), the error is swallowed and the connection should just
-    /// be dropped. We still set `close_sent` so callers that invoke
-    /// [`Self::close`] after having seen a server Close don't emit a
-    /// second Close frame.
-    pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), WsError> {
+    pub fn close(&mut self, code: u16, reason: &str) -> Result<(), WsError> {
         if self.close_sent {
             return Ok(());
         }
@@ -616,22 +427,147 @@ impl<S: WsStream> WsConnection<S> {
         let mask = generate_mask(&mut self.mask_rng);
         frame::encode_close(code, reason, mask, &mut buf);
         self.close_sent = true;
-        self.stream.write_all(buf).await.0?;
-        let _ = self.stream.flush().await;
+        write_all_mio(&mut self.stream, &buf, &mut self.poll, &mut self.events, self.token)?;
+        self.stream.flush_tls();
         Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mio IO helpers
+// ---------------------------------------------------------------------------
+
+/// Wait for the TCP connect to complete (mio connect is non-blocking).
+fn wait_for_tcp_connect(
+    poll: &mut Poll,
+    events: &mut Events,
+    token: Token,
+    tcp: &TcpStream,
+    timeout: Duration,
+) -> Result<(), WsError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(WsError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TCP connect timeout",
+            )));
+        }
+        let _ = poll.poll(events, Some(remaining.min(Duration::from_millis(100))));
+        for event in events.iter() {
+            if event.token() == token {
+                if event.is_error() {
+                    if let Some(e) = tcp.take_error()? {
+                        return Err(WsError::Io(e));
+                    }
+                    return Err(WsError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "connect error",
+                    )));
+                }
+                if event.is_writable() || event.is_readable() {
+                    // Verify the connection actually succeeded.
+                    match tcp.peer_addr() {
+                        Ok(_) => return Ok(()),
+                        Err(ref e) if e.kind() == io::ErrorKind::NotConnected => continue,
+                        Err(e) => return Err(WsError::Io(e)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write all bytes to the stream, handling WouldBlock via mio poll.
+fn write_all_mio(
+    stream: &mut MioStream,
+    data: &[u8],
+    poll: &mut Poll,
+    events: &mut Events,
+    _token: Token,
+) -> Result<(), WsError> {
+    let mut written = 0;
+    while written < data.len() {
+        match stream.write(&data[written..]) {
+            Ok(0) => {
+                return Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write returned 0",
+                )));
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let _ = poll.poll(events, Some(Duration::from_millis(100)));
+                stream.flush_tls();
+            }
+            Err(e) => return Err(WsError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Read some bytes from the stream into a Vec (for handshake headers).
+/// At least one non-zero read must succeed; returns error on EOF.
+fn read_some_mio(
+    stream: &mut MioStream,
+    buf: &mut Vec<u8>,
+    poll: &mut Poll,
+    events: &mut Events,
+) -> Result<(), WsError> {
+    let mut tmp = [0u8; 4096];
+    loop {
+        stream.flush_tls();
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                return Err(WsError::Handshake(HandshakeError::UnparseableResponse(
+                    "server closed before sending handshake response".into(),
+                )));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                return Ok(());
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let _ = poll.poll(events, Some(Duration::from_millis(100)));
+                stream.flush_tls();
+            }
+            Err(e) => return Err(WsError::Io(e)),
+        }
+    }
+}
+
+/// Read some bytes from the stream into a BytesMut (for frame data).
+fn read_some_bytes_into(
+    stream: &mut MioStream,
+    buf: &mut BytesMut,
+    poll: &mut Poll,
+    events: &mut Events,
+) -> Result<(), WsError> {
+    let mut tmp = [0u8; 4096];
+    loop {
+        stream.flush_tls();
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                return Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed before frame completed",
+                )));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                return Ok(());
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let _ = poll.poll(events, Some(Duration::from_millis(100)));
+                stream.flush_tls();
+            }
+            Err(e) => return Err(WsError::Io(e)),
+        }
+    }
+}
+
 /// Generate a 4-byte mask from the per-connection CSPRNG.
-///
-/// Uses `BenchRng::fill_bytes` (Xoshiro256++ seeded from OS entropy —
-/// see `zerobench_core::rng`). RFC 6455 §10.3 requires the mask be
-/// "chosen from the set of allowed 32-bit values at random", which
-/// Xoshiro meets with enormous margin for the cache-poisoning threat
-/// model: even a narrow-period PRNG would suffice as long as it's not
-/// predictable to an attacker; we use a CSPRNG-equivalent
-/// [`BenchRng::from_entropy`] seed so predicting the mask requires
-/// reading the worker's memory.
 fn generate_mask(rng: &mut BenchRng) -> [u8; 4] {
     use rand::RngCore;
     let mut m = [0u8; 4];
@@ -651,9 +587,6 @@ mod tests {
     fn mask_is_4_bytes_from_rng() {
         let mut rng = zerobench_core::rng::from_seed(12345);
         let m = generate_mask(&mut rng);
-        // Deterministic for a seeded Xoshiro — verify we actually wrote
-        // 4 bytes and that they're not all zero (near-impossible for
-        // any reasonable seed).
         assert!(m.iter().any(|&b| b != 0));
     }
 

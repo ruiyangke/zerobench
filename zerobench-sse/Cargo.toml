@@ -1,6 +1,6 @@
 [package]
 name = "zerobench-sse"
-description = "Server-Sent Events transport for zerobench"
+description = "Server-Sent Events transport for zerobench — mio/epoll, zero async"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,22 +9,18 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-zerobench-core = { workspace = true, features = ["runtime-compio"] }
-zerobench-http = { workspace = true, features = ["runtime-compio", "h1"] }
-compio = { workspace = true }
-futures-util = { workspace = true }
-bytes = { workspace = true }
-hyper = { workspace = true, features = ["client", "http1"] }
-http = { workspace = true }
-http-body-util = { workspace = true }
+zerobench-core = { workspace = true, default-features = false }
+zerobench-http = { workspace = true, default-features = false, features = ["mio-h1"] }
 hdrhistogram = { workspace = true }
-cyper-core = { workspace = true }
+mio = { workspace = true }
+rustls = { workspace = true }
+httparse = { workspace = true }
+memchr = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-hyper = { workspace = true, features = ["client", "http1", "server"] }
-compio-tls = { workspace = true }
-rustls = { workspace = true }
 rcgen = { workspace = true }
+smallvec = { workspace = true }
 
 [lints]
 workspace = true

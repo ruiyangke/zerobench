@@ -162,11 +162,18 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
         }
     }
 
-    // Peek at the first request URL BEFORE finalize — finalize takes
+    // Peek at the first wire-step URL BEFORE finalize — finalize takes
     // the state out of the builder. We parse it into a Target first so
     // TemplatedHost errors surface even when the URL contains templates
     // that would otherwise error during Template::compile (e.g.
     // `{{env:UNSET}}`).
+    //
+    // `first_request_url` returns the URL of the first Request, SSE, or
+    // WS step — all three backends need a connection target derived from
+    // somewhere in the plan. The CLI's HTTP dispatch path still reaches
+    // for this when the plan has an HTTP scenario; pure-SSE / pure-WS
+    // plans still produce a well-formed Target (Target::parse accepts
+    // ws:// and wss:// as scheme prefixes).
     let first_url_opt = root.first_request_url();
     let target_opt = match &first_url_opt {
         Some(u) => Some(parse_target_strict(u)?),
@@ -178,11 +185,15 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     let target = target_opt.expect("target parsed when first_url_opt was Some");
     // `_first_url` is discarded — it was only needed for target parsing.
     let _ = first_url;
-    // Sanity-check: at least one real Request step survived compilation.
-    debug_assert!(plan
-        .scenarios
-        .iter()
-        .any(|s| s.steps.iter().any(|st| matches!(st, Step::Request(_)))));
+    // Sanity-check: at least one wire step (Request/SSE/WS) survived
+    // compilation. Protocol-agnostic because multi-protocol plans are
+    // now first-class citizens.
+    debug_assert!(plan.scenarios.iter().any(|s| s.steps.iter().any(|st| {
+        matches!(
+            st,
+            Step::Request(_) | Step::SseStream(_) | Step::WsRound(_)
+        )
+    })));
 
     Ok(LoadedScript {
         plan,

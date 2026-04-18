@@ -68,22 +68,53 @@ pub enum Status {
 
 /// Decide the header pill colour from live state inputs.
 ///
-/// - Any error counter growing > 0 → Red.
-/// - Saturate (no target): Green when no errors.
-/// - Rate-targeted: compare actual vs target.
+/// Error handling is rate-based, not binary:
+///
+/// - Zero requests + any errors → Red. This is the "connection failed
+///   at startup" case — the user needs instant feedback when nothing
+///   works. A single 404 on an otherwise-healthy run wouldn't hit this
+///   branch because `total_requests > 0`.
+/// - error_rate ≥ 5% → Red (critical failure rate).
+/// - error_rate ≥ 1% → Yellow (elevated but tolerable), unless the
+///   saturate/target logic already says Red.
+/// - error_rate < 1% → defer to saturate/target logic. One in a
+///   million 404s should not turn the pill red.
+///
+/// The denominator is `total_requests + total_errors` so a run where
+/// *every* attempt errors reports 100% error rate rather than an
+/// undefined division.
 ///
 /// `actual_pct` is the actual/target ratio in percent (0..=200, as
 /// returned by [`crate::state::DashboardState::actual_vs_target_pct`]).
 pub fn compute_status(
     actual_pct: Option<f64>,
-    errors_present: bool,
+    total_requests: u64,
+    total_errors: u64,
 ) -> Status {
-    if errors_present {
+    // Connection-failed-at-startup: all errors, zero requests. Users
+    // need instant red feedback when literally nothing is working.
+    if total_requests == 0 && total_errors > 0 {
         return Status::Red;
     }
-    match actual_pct {
-        // Saturate — no target bound: if we got this far without
-        // errors, the run is healthy.
+
+    // Rate-based escalation. Denominator includes both buckets so a
+    // run where every attempt errors reports 100%.
+    let denom = total_requests.saturating_add(total_errors);
+    let error_rate = if denom == 0 {
+        0.0
+    } else {
+        total_errors as f64 / denom as f64
+    };
+
+    if error_rate >= 0.05 {
+        return Status::Red;
+    }
+
+    // Compute the rate/target-based status; error_rate < 1% defers
+    // entirely to this, ≥ 1% bumps Green → Yellow.
+    let base = match actual_pct {
+        // Saturate — no target bound: healthy when the error rate
+        // stays below the red threshold.
         None => Status::Green,
         Some(pct) => {
             // Spec: green [95, 105], yellow [80, 95) ∪ (105, 120],
@@ -96,6 +127,12 @@ pub fn compute_status(
                 Status::Red
             }
         }
+    };
+
+    if error_rate >= 0.01 && matches!(base, Status::Green) {
+        Status::Yellow
+    } else {
+        base
     }
 }
 
@@ -303,12 +340,67 @@ mod tests {
 
     #[test]
     fn compute_status_maps_to_palette() {
-        assert_eq!(compute_status(None, false), Status::Green);
-        assert_eq!(compute_status(None, true), Status::Red);
-        assert_eq!(compute_status(Some(100.0), false), Status::Green);
-        assert_eq!(compute_status(Some(85.0), false), Status::Yellow);
-        assert_eq!(compute_status(Some(50.0), false), Status::Red);
-        assert_eq!(compute_status(Some(110.0), false), Status::Yellow);
-        assert_eq!(compute_status(Some(150.0), false), Status::Red);
+        // No traffic yet, no errors — Green (benign warm-up).
+        assert_eq!(compute_status(None, 0, 0), Status::Green);
+        // Rate-targeted runs still use the actual/target bands when
+        // error rate is negligible.
+        assert_eq!(compute_status(Some(100.0), 10_000, 0), Status::Green);
+        assert_eq!(compute_status(Some(85.0), 10_000, 0), Status::Yellow);
+        assert_eq!(compute_status(Some(50.0), 10_000, 0), Status::Red);
+        assert_eq!(compute_status(Some(110.0), 10_000, 0), Status::Yellow);
+        assert_eq!(compute_status(Some(150.0), 10_000, 0), Status::Red);
+    }
+
+    #[test]
+    fn compute_status_rate_thresholds() {
+        // 0.0005% error rate — well below 1%, stays Green.
+        assert_eq!(
+            compute_status(None, 1_000_000, 5),
+            Status::Green
+        );
+        // 2% error rate — between 1% and 5%, bumps Green → Yellow.
+        assert_eq!(
+            compute_status(None, 1_000_000, 20_000),
+            Status::Yellow
+        );
+        // 10% error rate — above 5%, forced Red regardless of target.
+        assert_eq!(
+            compute_status(None, 1_000_000, 100_000),
+            Status::Red
+        );
+        // Zero requests + any errors = connection failed at startup.
+        assert_eq!(compute_status(None, 0, 10), Status::Red);
+        // Zero errors, any request count — Green (no error signal).
+        assert_eq!(compute_status(None, 100, 0), Status::Green);
+    }
+
+    #[test]
+    fn compute_status_yellow_band_does_not_downgrade_to_green() {
+        // 2% error rate is elevated, but the target-band logic says
+        // Yellow already — it should stay Yellow, not get forced back
+        // to Green.
+        assert_eq!(
+            compute_status(Some(85.0), 1_000_000, 20_000),
+            Status::Yellow
+        );
+        // 2% error rate + Red target band stays Red.
+        assert_eq!(
+            compute_status(Some(50.0), 1_000_000, 20_000),
+            Status::Red
+        );
+    }
+
+    #[test]
+    fn compute_status_boundary_values() {
+        // Exactly 1% — just at the Yellow threshold.
+        assert_eq!(
+            compute_status(None, 99_000, 1_000),
+            Status::Yellow
+        );
+        // Exactly 5% — just at the Red threshold.
+        assert_eq!(
+            compute_status(None, 95_000, 5_000),
+            Status::Red
+        );
     }
 }

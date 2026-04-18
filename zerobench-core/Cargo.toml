@@ -1,6 +1,6 @@
 [package]
 name = "zerobench-core"
-description = "Core plan model, transport trait, dispatcher, and recorder for zerobench"
+description = "Core plan model, stats, templates, and reporter for zerobench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,19 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = []  # no runtime by default — mio path needs only pure-data types
-runtime-compio = ["dep:compio"]
-runtime-tokio = ["dep:tokio"]
+default = []
 
 [dependencies]
-# Runtime — compio (default)
-compio = { workspace = true, optional = true }
-
-# Runtime — tokio (opt-in)
-tokio = { workspace = true, optional = true }
-
-futures-util = { workspace = true }
-flume = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 hdrhistogram = { workspace = true }

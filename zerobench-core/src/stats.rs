@@ -125,12 +125,112 @@ pub enum ErrorKind {
 pub struct ScenarioStats {
     /// Index into `Plan::scenarios`.
     pub scenario_id: u16,
-    /// Completed requests attributed to this scenario.
+    /// Completed requests/operations attributed to this scenario.
+    ///
+    /// The unit depends on the scenario's [`Protocol`](crate::plan::Protocol):
+    /// - HTTP: completed request/response pairs
+    /// - SSE: completed streams (not each chunk — use `sse.chunks` for that)
+    /// - WS: completed message round-trips
     pub requests: u64,
     /// Latency histogram in nanoseconds.
+    ///
+    /// Per protocol:
+    /// - HTTP: end-to-end request → response latency
+    /// - SSE: full stream duration (open → close)
+    /// - WS: per-message round-trip time
     pub latency: Histogram<u64>,
     /// Errors attributed to this scenario.
     pub errors: ErrorCounters,
+    /// SSE-specific counters and histograms, `Some` iff this scenario's
+    /// protocol is [`Protocol::Sse`](crate::plan::Protocol::Sse).
+    pub sse: Option<SseExtras>,
+    /// WebSocket-specific counters and histograms, `Some` iff this
+    /// scenario's protocol is [`Protocol::Ws`](crate::plan::Protocol::Ws).
+    pub ws: Option<WsExtras>,
+}
+
+/// SSE-specific per-scenario metrics that don't fit the generic
+/// request/latency layout.
+#[derive(Debug, Clone)]
+pub struct SseExtras {
+    /// Time-to-first-byte for the SSE response — from request-write
+    /// completion to the first response byte.
+    pub ttfb: Histogram<u64>,
+    /// Inter-chunk gap between successive data events within a stream.
+    pub chunk_gap: Histogram<u64>,
+    /// Total number of data events received across all streams.
+    pub chunks: u64,
+    /// Streams that saw either a `[DONE]` terminator or a clean server
+    /// close. Cheaper than `requests` when you want to exclude streams
+    /// that errored mid-flight.
+    pub streams_completed: u64,
+    /// Payload bytes received on SSE streams (post-chunked-decoding).
+    pub bytes_received: u64,
+}
+
+impl Default for SseExtras {
+    fn default() -> Self {
+        Self {
+            ttfb: new_hist(),
+            chunk_gap: new_hist(),
+            chunks: 0,
+            streams_completed: 0,
+            bytes_received: 0,
+        }
+    }
+}
+
+impl SseExtras {
+    /// Merge `other` into `self`. Histograms add; counters sum.
+    pub fn merge(&mut self, other: &Self) {
+        let _ = self.ttfb.add(&other.ttfb);
+        let _ = self.chunk_gap.add(&other.chunk_gap);
+        self.chunks += other.chunks;
+        self.streams_completed += other.streams_completed;
+        self.bytes_received += other.bytes_received;
+    }
+}
+
+/// WebSocket-specific per-scenario metrics.
+#[derive(Debug, Clone)]
+pub struct WsExtras {
+    /// Handshake time — TCP connect to 101 Switching Protocols.
+    pub handshake: Histogram<u64>,
+    /// Per-message round-trip time.
+    pub rtt: Histogram<u64>,
+    /// Text/Binary frames sent from this client.
+    pub messages_sent: u64,
+    /// Text/Binary frames received from the server.
+    pub messages_recv: u64,
+    /// Payload bytes sent (excluding frame headers).
+    pub bytes_sent: u64,
+    /// Payload bytes received.
+    pub bytes_recv: u64,
+}
+
+impl Default for WsExtras {
+    fn default() -> Self {
+        Self {
+            handshake: new_hist(),
+            rtt: new_hist(),
+            messages_sent: 0,
+            messages_recv: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+        }
+    }
+}
+
+impl WsExtras {
+    /// Merge `other` into `self`. Histograms add; counters sum.
+    pub fn merge(&mut self, other: &Self) {
+        let _ = self.handshake.add(&other.handshake);
+        let _ = self.rtt.add(&other.rtt);
+        self.messages_sent += other.messages_sent;
+        self.messages_recv += other.messages_recv;
+        self.bytes_sent += other.bytes_sent;
+        self.bytes_recv += other.bytes_recv;
+    }
 }
 
 impl ScenarioStats {
@@ -141,7 +241,23 @@ impl ScenarioStats {
             requests: 0,
             latency: new_hist(),
             errors: ErrorCounters::default(),
+            sse: None,
+            ws: None,
         }
+    }
+
+    /// Ensure this scenario has SSE extras, creating defaults on demand.
+    ///
+    /// Called by the SSE backend on first event it attributes to this
+    /// scenario. Lets us keep the `Option<_>` hygiene — bytes-only /
+    /// HTTP scenarios get `None` and don't allocate histograms.
+    pub fn sse_mut(&mut self) -> &mut SseExtras {
+        self.sse.get_or_insert_with(SseExtras::default)
+    }
+
+    /// Ensure this scenario has WS extras, creating defaults on demand.
+    pub fn ws_mut(&mut self) -> &mut WsExtras {
+        self.ws.get_or_insert_with(WsExtras::default)
     }
 
     /// Add `other` into `self`. Both must share the same `scenario_id`;
@@ -154,6 +270,12 @@ impl ScenarioStats {
         // cannot fail; convert a theoretical failure into "skip sample".
         let _ = self.latency.add(&other.latency);
         self.errors.merge(&other.errors);
+        if let Some(o) = &other.sse {
+            self.sse_mut().merge(o);
+        }
+        if let Some(o) = &other.ws {
+            self.ws_mut().merge(o);
+        }
     }
 }
 
@@ -236,6 +358,24 @@ impl TaskStats {
         self.errors.incr(kind);
         if let Some(s) = self.per_scenario.get_mut(scenario_id as usize) {
             s.errors.incr(kind);
+        }
+    }
+
+    /// Merge `other` into `self`. The two must share the same
+    /// `per_scenario.len()` — i.e. they come from runs that built
+    /// `TaskStats::new` with the same scenario count. Used by the CLI
+    /// dispatcher to combine per-backend stats into one task.
+    pub fn merge(&mut self, other: &Self) {
+        let _ = self.latency.add(&other.latency);
+        let _ = self.ttfb.add(&other.ttfb);
+        self.requests += other.requests;
+        self.bytes_sent += other.bytes_sent;
+        self.bytes_recv += other.bytes_recv;
+        self.errors.merge(&other.errors);
+        for (i, sc) in other.per_scenario.iter().enumerate() {
+            if let Some(dst) = self.per_scenario.get_mut(i) {
+                dst.merge(sc);
+            }
         }
     }
 }
@@ -390,5 +530,109 @@ mod tests {
         e.timeout = 2;
         e.status_4xx = 3;
         assert_eq!(e.total(), 6);
+    }
+
+    // -----------------------------------------------------------------
+    // SSE/WS extras
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn scenario_stats_default_has_no_extras() {
+        let s = ScenarioStats::new(0);
+        assert!(s.sse.is_none());
+        assert!(s.ws.is_none());
+    }
+
+    #[test]
+    fn sse_extras_merge_sums_counters_and_histograms() {
+        let mut a = SseExtras::default();
+        a.chunks = 10;
+        a.streams_completed = 1;
+        a.bytes_received = 100;
+        let _ = a.ttfb.record(1_000);
+        let _ = a.chunk_gap.record(500);
+
+        let mut b = SseExtras::default();
+        b.chunks = 5;
+        b.streams_completed = 2;
+        b.bytes_received = 50;
+        let _ = b.ttfb.record(2_000);
+
+        a.merge(&b);
+        assert_eq!(a.chunks, 15);
+        assert_eq!(a.streams_completed, 3);
+        assert_eq!(a.bytes_received, 150);
+        assert_eq!(a.ttfb.len(), 2);
+        assert_eq!(a.chunk_gap.len(), 1);
+    }
+
+    #[test]
+    fn ws_extras_merge_sums_counters_and_histograms() {
+        let mut a = WsExtras::default();
+        a.messages_sent = 10;
+        a.messages_recv = 9;
+        a.bytes_sent = 100;
+        a.bytes_recv = 90;
+        let _ = a.handshake.record(5_000_000);
+        let _ = a.rtt.record(500);
+
+        let mut b = WsExtras::default();
+        b.messages_sent = 5;
+        b.messages_recv = 5;
+        b.bytes_sent = 50;
+        b.bytes_recv = 50;
+        let _ = b.rtt.record(1_500);
+
+        a.merge(&b);
+        assert_eq!(a.messages_sent, 15);
+        assert_eq!(a.messages_recv, 14);
+        assert_eq!(a.bytes_sent, 150);
+        assert_eq!(a.bytes_recv, 140);
+        assert_eq!(a.handshake.len(), 1);
+        assert_eq!(a.rtt.len(), 2);
+    }
+
+    #[test]
+    fn scenario_stats_merge_preserves_sse_extras() {
+        let mut a = ScenarioStats::new(0);
+        a.sse_mut().chunks = 10;
+        let _ = a.sse_mut().ttfb.record(1_000);
+
+        let mut b = ScenarioStats::new(0);
+        b.sse_mut().chunks = 5;
+        let _ = b.sse_mut().ttfb.record(2_000);
+
+        a.merge(&b);
+        let sse = a.sse.as_ref().unwrap();
+        assert_eq!(sse.chunks, 15);
+        assert_eq!(sse.ttfb.len(), 2);
+    }
+
+    #[test]
+    fn scenario_stats_merge_preserves_ws_extras() {
+        let mut a = ScenarioStats::new(1);
+        a.ws_mut().messages_sent = 10;
+
+        let mut b = ScenarioStats::new(1);
+        b.ws_mut().messages_sent = 5;
+
+        a.merge(&b);
+        let ws = a.ws.as_ref().unwrap();
+        assert_eq!(ws.messages_sent, 15);
+    }
+
+    #[test]
+    fn task_stats_merge_combines_per_scenario_extras() {
+        let mut a = TaskStats::new(2);
+        a.per_scenario[0].sse_mut().chunks = 3;
+        a.per_scenario[1].ws_mut().messages_sent = 7;
+
+        let mut b = TaskStats::new(2);
+        b.per_scenario[0].sse_mut().chunks = 2;
+        b.per_scenario[1].ws_mut().messages_sent = 3;
+
+        a.merge(&b);
+        assert_eq!(a.per_scenario[0].sse.as_ref().unwrap().chunks, 5);
+        assert_eq!(a.per_scenario[1].ws.as_ref().unwrap().messages_sent, 10);
     }
 }

@@ -1,21 +1,18 @@
-//! zerobench-ws — RFC 6455 WebSocket transport.
+//! zerobench-ws — RFC 6455 WebSocket transport (mio/epoll, zero async).
 //!
-//! Like [`zerobench_sse`], WebSocket doesn't fit the single-shot
-//! [`Transport`](zerobench_core::Transport) trait: a connection is
-//! long-lived and bidirectional, and the useful metric is per-message
-//! round-trip time rather than per-request latency. So this crate
-//! exposes its own runner — [`run_ws_saturate`] — which the CLI picks
-//! when `--ws` is set.
+//! Synchronous, zero-async WebSocket benchmark runner. Each worker
+//! thread opens a connection, performs the HTTP/1.1 Upgrade handshake,
+//! then loops send->recv until the shared stop flag trips.
 //!
 //! # Architecture
 //!
 //! - [`frame`] — RFC 6455 §5.2 wire-format encoder/decoder.
 //! - [`handshake`] — the HTTP/1.1 §4 Upgrade exchange + Accept-key
 //!   validation.
-//! - [`conn::WsConnection`] — one established connection (stream +
+//! - [`conn::WsConnection`] — one established connection (MioStream +
 //!   recv buffer + per-connection mask CSPRNG).
-//! - [`run_ws_saturate`] — N concurrent worker tasks, each owning one
-//!   connection, looping send→recv until `StopSignal` trips.
+//! - [`run_ws_threaded`] — N OS threads, each owning one connection,
+//!   looping send->recv until the stop signal trips.
 //!
 //! # Fixing the v1 benchmark's bugs
 //!
@@ -25,13 +22,10 @@
 //! 1. **Mask was a Weyl atomic counter, not CSPRNG**. RFC 6455 §10.3
 //!    says "MUST be chosen from the set of allowed 32-bit values at
 //!    random". We use [`BenchRng`](zerobench_core::rng::BenchRng)
-//!    seeded from OS entropy — predictable-only if someone reads the
-//!    worker's memory, which defeats the cache-poisoning threat model
-//!    the mask defends against.
+//!    seeded from OS entropy.
 //! 2. **Round-robin sequential per-connection handling**. v1 rotated
 //!    through N slots in one task, so N connections were serviced
-//!    one-at-a-time. We use task-per-connection (same fix as the
-//!    HTTP/SSE crates).
+//!    one-at-a-time. We use thread-per-connection.
 //! 3. **Byte-by-byte masking XOR**. Kept — for payloads typically
 //!    <1 KiB the 4-byte-at-a-time variant is a micro-optimisation that
 //!    isn't worth the complexity.
@@ -40,45 +34,25 @@ pub mod conn;
 pub mod frame;
 pub mod handshake;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hdrhistogram::Histogram;
+use rand::Rng;
+use rustls::ClientConfig;
 
+use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::live_snapshot::LiveSnapshot;
+use zerobench_core::plan::{Plan, Protocol, Step, WsRoundPlan};
 use zerobench_core::rng::from_entropy;
-use zerobench_core::stop::StopSignal;
-use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_core::scenario_context::ScenarioContext;
+use zerobench_core::stats::{TaskStats, WsExtras};
+use zerobench_core::transport::{Target, TargetError, TransportOpts};
 
-pub use conn::{AnyWsConnection, DataFrame, WsConnection, WsError};
+pub use conn::{DataFrame, WsConnection, WsError};
 pub use frame::{FrameHeader, Opcode};
-
-// ---------------------------------------------------------------------------
-// Histograms
-// ---------------------------------------------------------------------------
-
-/// Histogram bounds — `[1 ns, 60 s]`, 3 sig figs. Matches `SseStats` so
-/// percentile math in the reporter is uniform across protocols.
-const HIST_LO_NS: u64 = 1;
-const HIST_HI_NS: u64 = 60_000_000_000;
-const HIST_SIG: u8 = 3;
-
-fn new_hist() -> Histogram<u64> {
-    Histogram::<u64>::new_with_bounds(HIST_LO_NS, HIST_HI_NS, HIST_SIG)
-        .expect("HDR bounds are valid compile-time constants")
-}
-
-fn duration_to_hist_ns(d: Duration) -> u64 {
-    let ns = d.as_nanos();
-    if ns < HIST_LO_NS as u128 {
-        HIST_LO_NS
-    } else if ns > HIST_HI_NS as u128 {
-        HIST_HI_NS
-    } else {
-        ns as u64
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -95,24 +69,17 @@ pub struct WsStats {
     /// finished writing a frame to when we parsed the corresponding
     /// response frame.
     pub rtt: Histogram<u64>,
-    /// Count of Text/Binary frames we sent. Does not include control
-    /// frames (Ping auto-replies are tracked separately if we ever
-    /// need them).
+    /// Count of Text/Binary frames we sent.
     pub messages_sent: u64,
-    /// Count of Text/Binary frames received. Should normally equal
-    /// `messages_sent` for an echo server; a gap means the server
-    /// dropped messages or closed mid-response.
+    /// Count of Text/Binary frames received.
     pub messages_recvd: u64,
-    /// Total payload bytes sent (excluding frame headers). Matches
-    /// the wire-visible message body, not the on-wire byte count —
-    /// that would add ~6 bytes of header per message.
+    /// Total payload bytes sent (excluding frame headers).
     pub bytes_sent: u64,
-    /// Total payload bytes received. Same convention as `bytes_sent`.
+    /// Total payload bytes received.
     pub bytes_recvd: u64,
     /// TCP connect / DNS failures.
     pub errors_connect: u64,
-    /// Handshake protocol failures (101 not received, Accept mismatch,
-    /// missing Upgrade/Connection header).
+    /// Handshake protocol failures.
     pub errors_upgrade: u64,
     /// Read / write / framing errors mid-session.
     pub errors_io: u64,
@@ -243,27 +210,18 @@ impl WsSummary {
 
 /// Everything the WebSocket runner needs, hoisted out of
 /// [`zerobench_core::plan::Plan`] so we don't stretch the shared types
-/// to accommodate protocol-specific knobs (like "what text payload to
-/// send per iteration").
+/// to accommodate protocol-specific knobs.
 #[derive(Debug, Clone)]
 pub struct WsPlan {
     /// TCP endpoint (host + port + TLS flag).
     pub target: Target,
-    /// HTTP path to request in the Upgrade (e.g. `/echo`). Parsed from
-    /// the `ws://.../` URL by the CLI.
+    /// HTTP path to request in the Upgrade (e.g. `/echo`).
     pub path: String,
-    /// Extra HTTP headers to include in the Upgrade request. From
-    /// `-H` flags on the CLI — e.g. `Origin`, auth cookies.
+    /// Extra HTTP headers to include in the Upgrade request.
     pub headers: Vec<(String, String)>,
-    /// Payload to send on each iteration. Treated as a text-frame
-    /// body; servers that echo return the same bytes. Defaults to
-    /// `b"ping"` in the CLI.
+    /// Payload to send on each iteration.
     pub message: Bytes,
-    /// Transport options — currently the runner only cares about
-    /// `insecure_tls` and `connect_timeout` (the latter only when a TCP
-    /// connect takes a long time; we still apply the OS default socket
-    /// timeout too). Passed through so wss:// targets can borrow the
-    /// same `--insecure` toggle that HTTPS uses.
+    /// Transport options — `insecure_tls`, `connect_timeout`, etc.
     pub opts: TransportOpts,
 }
 
@@ -271,101 +229,7 @@ pub struct WsPlan {
 // Runner
 // ---------------------------------------------------------------------------
 
-/// The benchmark's per-connection loop.
-///
-/// Not much state — the runner's "state" mostly lives in the
-/// [`WsConnection`] it owns and the [`WsStats`] it folds into.
-pub struct WsRunner;
-
-impl WsRunner {
-    /// Run one worker's lifecycle end-to-end: connect, handshake, loop
-    /// send/recv until `stop` trips, optionally close.
-    ///
-    /// Errors never panic. Every failure path is counted in `stats`.
-    async fn run_worker(plan: Arc<WsPlan>, stop: StopSignal, live: Option<Arc<LiveSnapshot>>) -> WsStats {
-        let mut stats = WsStats::new();
-        let rng = from_entropy();
-
-        // --- Connect ----------------------------------------------------
-        //
-        // `WsConnection::connect` picks plain vs TLS from `target.tls`
-        // and returns an `AnyWsConnection` that dispatches both variants
-        // through the same method signatures.
-        let t_connect_start = Instant::now();
-        let conn_result = WsConnection::connect(
-            &plan.target,
-            &plan.opts,
-            &plan.path,
-            &plan.headers,
-            rng,
-        )
-        .await;
-        let mut conn = match conn_result {
-            Ok(c) => {
-                stats.record_handshake(t_connect_start.elapsed());
-                c
-            }
-            Err(e) => {
-                classify_open_error(&e, &mut stats, live.as_deref());
-                return stats;
-            }
-        };
-
-        // --- Benchmark loop --------------------------------------------
-        //
-        // We sample RTT per message: t0 just before send → t1 after
-        // parsing the server's response frame. Control frames (Ping/
-        // Pong/Close) are handled inside `recv` and don't bump the
-        // RTT histogram.
-        while !stop.is_stopped() {
-            let t0 = Instant::now();
-
-            if let Err(e) = conn.send_text(&plan.message).await {
-                classify_io_error(&e, &mut stats, live.as_deref());
-                return stats;
-            }
-            stats.messages_sent += 1;
-            stats.bytes_sent += plan.message.len() as u64;
-
-            let frame = match conn.recv().await {
-                Ok(f) => f,
-                Err(WsError::Closed { code: _, reason: _ }) => {
-                    // Server closed cleanly. Not an error — exit the
-                    // loop and let the (skipped) close-frame branch at
-                    // the bottom finalise cleanly.
-                    return stats;
-                }
-                Err(e) => {
-                    classify_io_error(&e, &mut stats, live.as_deref());
-                    return stats;
-                }
-            };
-
-            let rtt = t0.elapsed();
-            stats.record_rtt(rtt);
-            stats.messages_recvd += 1;
-            stats.bytes_recvd += frame.len() as u64;
-        }
-
-        // --- Close ------------------------------------------------------
-        //
-        // RFC 6455 §5.5.1: code 1000 is "normal closure". We don't care
-        // about the reason byte for a bench tool; leave it empty.
-        if let Err(e) = conn.close(1000, "").await {
-            // A close-send error at the very end is cosmetic — the
-            // server might have already closed the socket. Log it but
-            // don't otherwise propagate.
-            classify_close_error(&e, &mut stats);
-        }
-
-        stats
-    }
-}
-
 /// Classify a handshake/connect error into the right stats counter.
-///
-/// Only reached during connection-open; subsequent IO errors go through
-/// [`classify_io_error`].
 fn classify_open_error(
     e: &WsError,
     stats: &mut WsStats,
@@ -391,17 +255,12 @@ fn classify_open_error(
             }
         }
         WsError::Frame(_) => {
-            // Frame errors during open are vanishingly unlikely (would
-            // require the server to prepend bytes to its 101 response
-            // and fail decoding) but keep the match exhaustive.
             stats.errors_upgrade += 1;
             if let Some(l) = live {
                 l.record_error(zerobench_core::stats::ErrorKind::Connect);
             }
         }
         WsError::Closed { .. } => {
-            // Server closed during handshake — count it as upgrade
-            // failure since no message ever flowed.
             stats.errors_upgrade += 1;
             if let Some(l) = live {
                 l.record_error(zerobench_core::stats::ErrorKind::Connect);
@@ -410,7 +269,7 @@ fn classify_open_error(
     }
 }
 
-/// Classify a mid-session error. All non-clean-close errors land here.
+/// Classify a mid-session error.
 fn classify_io_error(_e: &WsError, stats: &mut WsStats, live: Option<&LiveSnapshot>) {
     stats.errors_io += 1;
     if let Some(l) = live {
@@ -418,52 +277,384 @@ fn classify_io_error(_e: &WsError, stats: &mut WsStats, live: Option<&LiveSnapsh
     }
 }
 
-/// Close-path error — a failure to *send* the close frame at shutdown.
+/// Close-path error.
 fn classify_close_error(_e: &WsError, stats: &mut WsStats) {
     stats.errors_close += 1;
 }
 
-/// Run a WebSocket benchmark by saturating `max_tasks` concurrent
-/// connections.
+/// Run one worker's lifecycle end-to-end: connect, handshake, loop
+/// send/recv until `stop` trips, optionally close.
+fn run_worker(
+    plan: &WsPlan,
+    stop: &AtomicBool,
+    live: Option<&Arc<LiveSnapshot>>,
+    tls_config: Option<&Arc<ClientConfig>>,
+) -> WsStats {
+    let mut stats = WsStats::new();
+    let rng = from_entropy();
+
+    // --- Connect + Handshake ---
+    let t_connect_start = Instant::now();
+    let conn_result = WsConnection::connect(
+        &plan.target,
+        &plan.opts,
+        &plan.path,
+        &plan.headers,
+        rng,
+        tls_config,
+    );
+    let mut conn = match conn_result {
+        Ok(c) => {
+            stats.record_handshake(t_connect_start.elapsed());
+            c
+        }
+        Err(e) => {
+            classify_open_error(&e, &mut stats, live.map(|a| a.as_ref()));
+            return stats;
+        }
+    };
+
+    // --- Benchmark loop ---
+    while !stop.load(Ordering::Relaxed) {
+        let t0 = Instant::now();
+
+        if let Err(e) = conn.send_text(&plan.message) {
+            classify_io_error(&e, &mut stats, live.map(|a| a.as_ref()));
+            return stats;
+        }
+        stats.messages_sent += 1;
+        stats.bytes_sent += plan.message.len() as u64;
+
+        let frame = match conn.recv() {
+            Ok(f) => f,
+            Err(WsError::Closed { code: _, reason: _ }) => {
+                return stats;
+            }
+            Err(e) => {
+                classify_io_error(&e, &mut stats, live.map(|a| a.as_ref()));
+                return stats;
+            }
+        };
+
+        let rtt = t0.elapsed();
+        stats.record_rtt(rtt);
+        stats.messages_recvd += 1;
+        stats.bytes_recvd += frame.len() as u64;
+    }
+
+    // --- Close ---
+    if let Err(e) = conn.close(1000, "") {
+        classify_close_error(&e, &mut stats);
+    }
+
+    stats
+}
+
+/// Run a WebSocket benchmark with `num_workers` OS threads, each
+/// owning one [`WsConnection`] and looping send->recv until `stop`
+/// trips.
 ///
-/// Each task owns one [`WsConnection`] and loops send→recv until
-/// `stop` trips. Per-worker stats are collected at end-of-run and
-/// returned for the caller to merge via [`WsSummary::merge`].
+/// Per-worker stats are collected at end-of-run and returned for the
+/// caller to merge via [`WsSummary::merge`].
 ///
 /// `live`, when `Some`, receives per-message RTT samples so the TUI
-/// and JSONL streamers update in real time. Same integration style as
-/// the HTTP/SSE runners.
-pub async fn run_ws_saturate(
+/// and JSONL streamers update in real time.
+pub fn run_ws_threaded(
     plan: WsPlan,
-    max_tasks: usize,
-    stop: StopSignal,
+    num_workers: usize,
+    stop: Arc<AtomicBool>,
     live: Option<Arc<LiveSnapshot>>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> Vec<WsStats> {
-    if max_tasks == 0 {
+    if num_workers == 0 {
         return Vec::new();
     }
 
     let plan = Arc::new(plan);
-    let mut handles = Vec::with_capacity(max_tasks);
 
-    for _ in 0..max_tasks {
-        let plan = plan.clone();
-        let stop = stop.clone();
-        let live = live.clone();
-        let handle = compio::runtime::spawn(async move {
-            WsRunner::run_worker(plan, stop, live).await
-        });
-        handles.push(handle);
+    let handles: Vec<_> = (0..num_workers)
+        .map(|_| {
+            let plan = plan.clone();
+            let stop = stop.clone();
+            let live = live.clone();
+            let tls_config = tls_config.clone();
+
+            std::thread::spawn(move || {
+                run_worker(&plan, &stop, live.as_ref(), tls_config.as_ref())
+            })
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .map(|h| h.join().expect("WS worker panicked"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Multi-scenario (Plan-driven) runner
+// ---------------------------------------------------------------------------
+
+/// Precomputed per-scenario WS plan: the `scenario_id` the caller needs
+/// for stats attribution, plus the same shape as [`WsPlan`] minus the
+/// shared target/opts.
+struct WsScenarioRun {
+    scenario_id: u16,
+    target: Target,
+    path: String,
+    headers: Vec<(String, String)>,
+    message: Bytes,
+}
+
+/// Extract host/port/path from a URL string and build a [`Target`].
+fn parse_ws_url(url: &str) -> Result<(Target, String), TargetError> {
+    // Find the authority end — first `/`, `?`, or `#` after `://`.
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let authority_end = url[after_scheme..]
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .map(|i| after_scheme + i)
+        .unwrap_or(url.len());
+    let authority = &url[..authority_end];
+    let target = Target::parse(authority)?;
+
+    let path = match url[authority_end..].find('#') {
+        Some(i) => url[authority_end..][..i].to_string(),
+        None => url[authority_end..].to_string(),
+    };
+    let path = if path.is_empty() { "/".to_string() } else { path };
+    Ok((target, path))
+}
+
+/// Run one WS-scenario worker — per iteration, picks a random WS
+/// scenario, opens a connection, sends one message, receives one,
+/// records per-scenario stats, then closes.
+///
+/// A new connection is opened per round-trip (mirrors the one-shot
+/// semantics of `Step::WsRound`: each iteration is one round). To
+/// benchmark long-lived connections with many rounds, use the
+/// single-plan `run_ws_threaded` path.
+fn run_ws_worker_multi(
+    scenarios: &[WsScenarioRun],
+    opts: &TransportOpts,
+    num_scenarios: usize,
+    stop: &AtomicBool,
+    tls_config: Option<Arc<ClientConfig>>,
+) -> TaskStats {
+    let mut task = TaskStats::new(num_scenarios);
+    if scenarios.is_empty() {
+        return task;
     }
+    let mut rng = zerobench_core::rng::from_entropy();
 
-    let mut out = Vec::with_capacity(max_tasks);
-    for h in handles {
-        match h.await {
-            Ok(s) => out.push(s),
-            Err(_panic) => out.push(WsStats::new()),
+    while !stop.load(Ordering::Relaxed) {
+        let idx = if scenarios.len() == 1 {
+            0
+        } else {
+            rng.gen_range(0..scenarios.len())
+        };
+        let run = &scenarios[idx];
+        let sid = run.scenario_id as usize;
+        let mask_rng = from_entropy();
+
+        let t_open = Instant::now();
+        let conn = WsConnection::connect(
+            &run.target,
+            opts,
+            &run.path,
+            &run.headers,
+            mask_rng,
+            tls_config.as_ref(),
+        );
+        let mut conn = match conn {
+            Ok(c) => {
+                let hs = t_open.elapsed();
+                if let Some(sc) = task.per_scenario.get_mut(sid) {
+                    let _ = sc.ws_mut().handshake.record(duration_to_hist_ns(hs));
+                }
+                c
+            }
+            Err(_) => {
+                if let Some(sc) = task.per_scenario.get_mut(sid) {
+                    sc.errors.incr(zerobench_core::ErrorKind::Connect);
+                    task.errors.incr(zerobench_core::ErrorKind::Connect);
+                }
+                continue;
+            }
+        };
+
+        // One round: send one message, await one reply. The round is
+        // the Tier-1 "operation"; multi-round conversations aren't
+        // expressible in `Step::WsRound` yet (Tier 2).
+        let t_rt = Instant::now();
+        if conn.send_text(&run.message).is_err() {
+            if let Some(sc) = task.per_scenario.get_mut(sid) {
+                sc.errors.incr(zerobench_core::ErrorKind::Write);
+                task.errors.incr(zerobench_core::ErrorKind::Write);
+            }
+            let _ = conn.close(1000, "");
+            continue;
         }
+        let frame = match conn.recv() {
+            Ok(f) => f,
+            Err(_) => {
+                if let Some(sc) = task.per_scenario.get_mut(sid) {
+                    sc.errors.incr(zerobench_core::ErrorKind::Read);
+                    task.errors.incr(zerobench_core::ErrorKind::Read);
+                }
+                let _ = conn.close(1000, "");
+                continue;
+            }
+        };
+        let rtt = t_rt.elapsed();
+
+        // Update task + scenario stats for the completed round.
+        let bytes_sent = run.message.len() as u64;
+        let bytes_recv = frame.len() as u64;
+        task.record(run.scenario_id, rtt, Duration::ZERO, bytes_sent, bytes_recv);
+        if let Some(sc) = task.per_scenario.get_mut(sid) {
+            let extras = sc.ws_mut();
+            let _ = extras.rtt.record(duration_to_hist_ns(rtt));
+            extras.messages_sent += 1;
+            extras.messages_recv += 1;
+            extras.bytes_sent += bytes_sent;
+            extras.bytes_recv += bytes_recv;
+        }
+
+        // Close politely — errors here don't count against the round
+        // we just completed.
+        let _ = conn.close(1000, "");
     }
-    out
+
+    task
+}
+
+/// Drive all WS scenarios declared in a multi-protocol `Plan` — the
+/// surface the Tier-1 unified CLI dispatcher calls when a plan has
+/// one or more `Step::WsRound` scenarios.
+///
+/// Returns per-worker [`TaskStats`] with `ws` extras populated per
+/// scenario_id.
+pub fn run_ws_from_plan_threaded(
+    opts: &TransportOpts,
+    plan: &Plan,
+    num_workers: usize,
+    duration: Duration,
+    tls_config: Option<Arc<ClientConfig>>,
+    stop_flag: Option<Arc<AtomicBool>>,
+) -> Vec<TaskStats> {
+    let num_scenarios = plan.scenarios.len();
+
+    // Collect the static per-scenario runs. We compile each
+    // `WsRoundPlan` template in-place — the Rhai DSL produces
+    // templated URLs/headers/messages that need per-scenario
+    // expansion. For Tier 1 we expand once against an empty context,
+    // matching the existing `--ws` CLI shortcut (templates are
+    // declarative; dynamic values would require per-iteration expand
+    // which is Tier 2).
+    let scenarios: Vec<WsScenarioRun> = plan
+        .scenarios
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sc)| {
+            if sc.protocol() != Protocol::Ws {
+                return None;
+            }
+            sc.steps.iter().find_map(|step| match step {
+                Step::WsRound(w) => Some(compile_ws_scenario(plan, i as u16, w)),
+                _ => None,
+            })
+        })
+        .collect();
+
+    if scenarios.is_empty() {
+        return (0..num_workers)
+            .map(|_| TaskStats::new(num_scenarios))
+            .collect();
+    }
+
+    let stop = stop_flag.unwrap_or_else(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let timer = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            timer.store(true, Ordering::Relaxed);
+        });
+        flag
+    });
+
+    let handles: Vec<_> = (0..num_workers)
+        .map(|_| {
+            let scenarios = scenarios
+                .iter()
+                .map(|s| WsScenarioRun {
+                    scenario_id: s.scenario_id,
+                    target: s.target.clone(),
+                    path: s.path.clone(),
+                    headers: s.headers.clone(),
+                    message: s.message.clone(),
+                })
+                .collect::<Vec<_>>();
+            let opts = opts.clone();
+            let stop = stop.clone();
+            let tls_config = tls_config.clone();
+            std::thread::spawn(move || {
+                run_ws_worker_multi(&scenarios, &opts, num_scenarios, &stop, tls_config)
+            })
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .map(|h| h.join().expect("WS worker panicked"))
+        .collect()
+}
+
+/// Compile one `WsRoundPlan` into a runnable `WsScenarioRun`.
+///
+/// Templates are expanded once against a fresh `ScenarioContext` seeded
+/// from entropy; values that depend on per-iteration randomness
+/// (`{{uuid}}`, `{{counter}}`) resolve to their first sampled value.
+/// Per-round re-expansion is a Tier-2 feature; for Tier 1 it's
+/// sufficient that literal URLs and static message bodies work.
+fn compile_ws_scenario(plan: &Plan, scenario_id: u16, ws: &WsRoundPlan) -> WsScenarioRun {
+    let mut ctx = ScenarioContext::new(plan.vars.len(), zerobench_core::rng::from_entropy());
+
+    // Expand URL -> String -> (Target, path).
+    let mut url_buf = Vec::with_capacity(128);
+    ws.url.expand_into(&mut url_buf, &mut ctx.expand_ctx());
+    let url_str = std::str::from_utf8(&url_buf).unwrap_or("/").to_string();
+    let (target, path) = parse_ws_url(&url_str)
+        .expect("WS scenario URL must parse into a valid Target");
+
+    // Expand each header.
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(ws.headers.len());
+    for (n, v) in &ws.headers {
+        let mut nb = Vec::with_capacity(32);
+        let mut vb = Vec::with_capacity(64);
+        n.expand_into(&mut nb, &mut ctx.expand_ctx());
+        v.expand_into(&mut vb, &mut ctx.expand_ctx());
+        headers.push((
+            std::str::from_utf8(&nb).unwrap_or("").to_string(),
+            std::str::from_utf8(&vb).unwrap_or("").to_string(),
+        ));
+    }
+
+    // Expand the outbound message.
+    let mut mb = Vec::with_capacity(64);
+    ws.message.expand_into(&mut mb, &mut ctx.expand_ctx());
+    let message = Bytes::from(mb);
+
+    // Keep a reference to the extras for the caller — we return the
+    // compiled run, scenario_id retained so stats roll up cleanly.
+    let _ = WsExtras::default(); // no-op; signals field wiring path
+
+    WsScenarioRun {
+        scenario_id,
+        target,
+        path,
+        headers,
+        message,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -525,12 +716,10 @@ mod tests {
 
     #[test]
     fn duration_to_hist_ns_clamps() {
-        // Below lower bound → clamped up
+        use zerobench_core::histogram::{HIST_HI_NS, HIST_LO_NS};
         assert_eq!(duration_to_hist_ns(Duration::from_nanos(0)), HIST_LO_NS);
-        // Above upper bound → clamped down
         let huge = Duration::from_secs(999);
         assert_eq!(duration_to_hist_ns(huge), HIST_HI_NS);
-        // Within bounds → exact
         assert_eq!(
             duration_to_hist_ns(Duration::from_micros(500)),
             500_000,

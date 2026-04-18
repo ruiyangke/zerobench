@@ -130,6 +130,14 @@ impl Template {
         compile_template(src, vars)
     }
 
+    /// `true` if this template contains only literal parts — no
+    /// `{{uuid}}`, `{{counter}}`, `{{rand_*}}`, `{{var:*}}`, etc.
+    /// A fully-static template expands to the same bytes every time,
+    /// so callers can pre-build once and reuse.
+    pub fn is_static(&self) -> bool {
+        self.parts.iter().all(|p| matches!(p, Part::Literal(_)))
+    }
+
     /// Expand the template into `out`.
     ///
     /// The output buffer is appended to; callers reuse the same `Vec<u8>`

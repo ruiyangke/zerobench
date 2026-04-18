@@ -1,6 +1,6 @@
 [package]
 name = "zerobench"
-description = "Fast, correct, modern HTTP benchmarking tool — open-loop, HDR-precise, compio/io_uring-native"
+description = "Fast, correct, modern HTTP benchmarking tool — mio/epoll, zero async"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,31 +13,18 @@ name = "zerobench"
 path = "src/main.rs"
 
 [features]
-default = ["mio-h1"]
+default = ["h1"]
+full = ["h1", "h2", "sse", "ws", "tui", "script"]
 
-# Full feature set — all protocols + TUI + scripting
-full = ["h1", "h2", "sse", "ws", "tui", "script", "runtime-compio", "mio-h1", "raw-h1"]
-
-# Protocol features — flow through to zerobench-http
-# h1 (hyper-based) needs compio or tokio
-h1 = ["zerobench-http/h1", "runtime-compio"]
-h2 = ["zerobench-http/h2", "runtime-compio"]
-h3 = ["zerobench-http/h3"]
+# Protocols
+h1 = ["zerobench-http/mio-h1"]
+h2 = ["zerobench-http/mio-h2"]
 # Protocol modes
-ws = ["dep:zerobench-ws", "runtime-compio"]
-sse = ["dep:zerobench-sse", "runtime-compio"]
+ws = ["dep:zerobench-ws", "h1"]
+sse = ["dep:zerobench-sse", "h1"]
 # Front-ends
-tui = ["dep:zerobench-tui", "runtime-compio"]
-script = ["dep:zerobench-rhai", "runtime-compio"]
-# Runtime backends
-runtime-compio = ["dep:compio", "zerobench-core/runtime-compio", "zerobench-http/runtime-compio"]
-runtime-tokio = ["dep:tokio", "zerobench-core/runtime-tokio", "zerobench-http/runtime-tokio"]
-# Raw HTTP/1.1 transport (httparse + compio, no hyper)
-raw-h1 = ["zerobench-http/raw-h1", "runtime-compio"]
-# Mio-based raw H1 (synchronous epoll, no async runtime)
-mio-h1 = ["zerobench-http/mio-h1"]
-# Mio-based H2 (h2 crate, manually polled from mio event loop)
-mio-h2 = ["zerobench-http/mio-h2"]
+tui = ["dep:zerobench-tui"]
+script = ["dep:zerobench-rhai", "h1"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
@@ -47,6 +34,7 @@ zerobench-sse = { workspace = true, optional = true }
 zerobench-rhai = { workspace = true, optional = true }
 zerobench-tui = { workspace = true, optional = true }
 
+base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 mimalloc = { workspace = true }
@@ -56,23 +44,9 @@ smallvec = { workspace = true }
 thiserror = { workspace = true }
 yansi = { workspace = true }
 
-# Runtime — compio (default)
-compio = { workspace = true, optional = true }
-# Runtime — tokio (opt-in)
-tokio = { workspace = true, optional = true }
-
 [dev-dependencies]
-hyper = { workspace = true, features = ["http1", "http2", "server"] }
-http-body-util = { workspace = true }
-bytes = { workspace = true }
-compio = { workspace = true }
-cyper-core = { workspace = true }
-futures-util = { workspace = true }
 httparse = { workspace = true }
-zerobench-ws = { workspace = true }
-compio-tls = { workspace = true }
-rustls = { workspace = true }
-rcgen = { workspace = true }
+sha1 = { workspace = true }
 
 [lints]
 workspace = true

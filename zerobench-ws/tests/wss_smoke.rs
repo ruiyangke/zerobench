@@ -1,35 +1,37 @@
-//! End-to-end TLS smoke test for the WebSocket runner.
+//! End-to-end TLS smoke test for the WebSocket runner (mio, zero async).
 //!
-//! Spins up a rcgen-self-signed `wss://` echo server and runs
-//! `run_ws_saturate` against it with `insecure_tls = true`. Verifies
+//! Spins up a rcgen-self-signed `wss://` echo server using raw
+//! `std::net::TcpListener` + rustls `StreamOwned`, then runs
+//! `run_ws_threaded` against it with `insecure_tls = true`. Verifies
 //! that the handshake + frame exchange work over TLS, and that strict
 //! verification rejects the self-signed cert.
 
 use std::convert::TryInto;
-use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::mpsc::{channel, Sender};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
-use compio::buf::BufResult;
-use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use compio::net::{TcpListener as CompioTcpListener, TcpStream};
-use compio_tls::{TlsAcceptor, TlsStream};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 
-use zerobench_core::stop::StopSignal;
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_http::mio_tls::build_tls_config;
 use zerobench_ws::frame::{encode_frame, Opcode};
 use zerobench_ws::handshake::{compute_accept, find_headers_end};
-use zerobench_ws::{run_ws_saturate, WsPlan, WsSummary};
+use zerobench_ws::{run_ws_threaded, WsPlan, WsSummary};
 
 // ---------------------------------------------------------------------------
-// Echo server — copied from ws_smoke.rs but generic over the IO type so
-// we can hand it a `TlsStream<TcpStream>`.
+// Echo server — TLS-wrapped using rustls::StreamOwned for simplicity.
+//
+// rustls::StreamOwned wraps a blocking TcpStream and handles the TLS
+// state machine transparently on Read/Write. No deadlock risk since
+// the TcpStream is blocking and StreamOwned drives write_tls/read_tls
+// internally.
 // ---------------------------------------------------------------------------
 
 fn extract_ws_key(raw: &[u8]) -> Option<String> {
@@ -57,24 +59,20 @@ fn build_101(accept: &str) -> Vec<u8> {
     s.into_bytes()
 }
 
-async fn read_request<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<usize> {
+fn read_request(stream: &mut impl Read, buf: &mut Vec<u8>) -> std::io::Result<usize> {
     loop {
         if let Some(end) = find_headers_end(buf) {
             return Ok(end);
         }
-        let chunk: Vec<u8> = Vec::with_capacity(1024);
-        let BufResult(res, returned) = stream.read(chunk).await;
-        let n = res?;
+        let mut chunk = [0u8; 1024];
+        let n = stream.read(&mut chunk)?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "client closed before full request",
             ));
         }
-        buf.extend_from_slice(&returned[..n]);
+        buf.extend_from_slice(&chunk[..n]);
         if buf.len() > 16 * 1024 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -84,12 +82,8 @@ async fn read_request<S: AsyncRead + Unpin>(
     }
 }
 
-/// Server-side: read a complete masked client frame and return the
-/// unmasked payload + opcode. Duplicates the ws_smoke implementation
-/// so this test file stays self-contained (the original is a sibling
-/// file, not a public module).
-async fn recv_frame<S: AsyncRead + Unpin>(
-    stream: &mut S,
+fn recv_frame(
+    stream: &mut impl Read,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<(Opcode, Vec<u8>, bool)> {
     loop {
@@ -149,28 +143,26 @@ async fn recv_frame<S: AsyncRead + Unpin>(
                     for (i, b) in payload.iter_mut().enumerate() {
                         *b ^= mask[i % 4];
                     }
-                    // Drain consumed bytes from buf.
                     buf.drain(..frame_end);
                     return Ok((opcode, payload, fin));
                 }
             }
         }
 
-        let chunk: Vec<u8> = Vec::with_capacity(1024);
-        let BufResult(res, returned) = stream.read(chunk).await;
-        let n = res?;
+        let mut chunk = [0u8; 1024];
+        let n = stream.read(&mut chunk)?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "client closed mid-frame",
             ));
         }
-        buf.extend_from_slice(&returned[..n]);
+        buf.extend_from_slice(&chunk[..n]);
     }
 }
 
-async fn send_server_frame<S: AsyncWrite + Unpin>(
-    stream: &mut S,
+fn send_server_frame(
+    stream: &mut impl Write,
     opcode: Opcode,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -188,15 +180,13 @@ async fn send_server_frame<S: AsyncWrite + Unpin>(
     out.extend_from_slice(&masked[..header_total]);
     out[1] &= 0x7f;
     out.extend_from_slice(&masked[header_total + 4..]);
-    stream.write_all(out).await.0?;
-    // TLS writes need an explicit flush; plain TCP treats it as a
-    // no-op. Keep behavioural parity with the client side.
-    stream.flush().await
+    stream.write_all(&out)?;
+    stream.flush()
 }
 
-async fn echo_handler<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+fn echo_handler(mut stream: impl Read + Write) {
     let mut req_buf = Vec::with_capacity(1024);
-    let headers_end = match read_request(&mut stream, &mut req_buf).await {
+    let headers_end = match read_request(&mut stream, &mut req_buf) {
         Ok(pos) => pos,
         Err(_) => return,
     };
@@ -206,13 +196,10 @@ async fn echo_handler<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
     };
     let accept = compute_accept(&key);
     let resp = build_101(&accept);
-    if stream.write_all(resp).await.0.is_err() {
+    if stream.write_all(&resp).is_err() {
         return;
     }
-    // TLS record-layer flush. No-op on plain TCP.
-    if stream.flush().await.is_err() {
-        return;
-    }
+    let _ = stream.flush();
 
     let mut recv_buf: Vec<u8> = Vec::with_capacity(4096);
     if req_buf.len() > headers_end {
@@ -220,23 +207,23 @@ async fn echo_handler<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
     }
 
     loop {
-        let (opcode, payload, _fin) = match recv_frame(&mut stream, &mut recv_buf).await {
+        let (opcode, payload, _fin) = match recv_frame(&mut stream, &mut recv_buf) {
             Ok(f) => f,
             Err(_) => return,
         };
 
         match opcode {
             Opcode::Text | Opcode::Binary => {
-                if send_server_frame(&mut stream, opcode, &payload).await.is_err() {
+                if send_server_frame(&mut stream, opcode, &payload).is_err() {
                     return;
                 }
             }
             Opcode::Ping => {
-                let _ = send_server_frame(&mut stream, Opcode::Pong, &payload).await;
+                let _ = send_server_frame(&mut stream, Opcode::Pong, &payload);
             }
             Opcode::Pong => {}
             Opcode::Close => {
-                let _ = send_server_frame(&mut stream, Opcode::Close, &payload).await;
+                let _ = send_server_frame(&mut stream, Opcode::Close, &payload);
                 return;
             }
             Opcode::Continuation => return,
@@ -258,7 +245,6 @@ fn make_server_config() -> Arc<ServerConfig> {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // No ALPN for WS — the Upgrade happens above TLS.
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
@@ -267,39 +253,46 @@ fn make_server_config() -> Arc<ServerConfig> {
 }
 
 fn spawn_tls_echo_server() -> SocketAddr {
-    let bind = StdTcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = bind.local_addr().unwrap();
-    drop(bind);
-
-    let (ready_tx, ready_rx): (Sender<()>, _) = channel();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
     let config = make_server_config();
 
     thread::spawn(move || {
-        let rt = compio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let listener = CompioTcpListener::bind(addr).await.unwrap();
-            let acceptor = TlsAcceptor::from(config);
-            let _ = ready_tx.send(());
-            loop {
-                let (socket, _peer) = match listener.accept().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let acceptor = acceptor.clone();
-                compio::runtime::spawn(async move {
-                    let tls: TlsStream<TcpStream> = match acceptor.accept(socket).await {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                    echo_handler(tls).await;
-                })
-                .detach();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(tcp) => {
+                    let config = config.clone();
+                    thread::spawn(move || {
+                        // Use rustls::StreamOwned which wraps a blocking
+                        // TcpStream and handles the TLS state machine
+                        // transparently. The handshake happens
+                        // automatically on first read/write.
+                        let server_conn = match rustls::ServerConnection::new(config) {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        let tls_stream = rustls::StreamOwned::new(server_conn, tcp);
+                        echo_handler(tls_stream);
+                    });
+                }
+                Err(_) => break,
             }
-        });
+        }
     });
 
-    ready_rx.recv().expect("tls server never bound");
+    thread::sleep(Duration::from_millis(10));
     addr
+}
+
+/// Create a stop flag that trips after the given duration.
+fn stop_after(d: Duration) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = flag.clone();
+    thread::spawn(move || {
+        thread::sleep(d);
+        f.store(true, Ordering::Relaxed);
+    });
+    flag
 }
 
 // ---------------------------------------------------------------------------
@@ -308,9 +301,6 @@ fn spawn_tls_echo_server() -> SocketAddr {
 
 fn wss_plan(addr: SocketAddr, insecure: bool) -> WsPlan {
     let mut target = Target::parse(&format!("wss://{addr}")).unwrap();
-    // Our self-signed cert only covers `localhost` / `127.0.0.1`; set
-    // SNI explicitly to `localhost` so strict verification (when used)
-    // can at least pass the name match.
     target.sni = Some("localhost".into());
 
     WsPlan {
@@ -326,13 +316,14 @@ fn wss_plan(addr: SocketAddr, insecure: bool) -> WsPlan {
     }
 }
 
-#[compio::test]
-async fn wss_insecure_round_trips() {
+#[test]
+fn wss_insecure_round_trips() {
     let addr = spawn_tls_echo_server();
     let plan = wss_plan(addr, true);
+    let tls_config = Some(build_tls_config(&plan.opts, &[]));
 
-    let stop = StopSignal::after(Duration::from_millis(500));
-    let stats = run_ws_saturate(plan, 1, stop, None).await;
+    let stop = stop_after(Duration::from_millis(500));
+    let stats = run_ws_threaded(plan, 1, stop, None, tls_config);
     let summary = WsSummary::merge(stats, Duration::from_millis(500));
 
     assert!(
@@ -346,19 +337,16 @@ async fn wss_insecure_round_trips() {
     assert_eq!(summary.errors_io, 0);
 }
 
-#[compio::test]
-async fn wss_strict_verification_rejects_self_signed() {
+#[test]
+fn wss_strict_verification_rejects_self_signed() {
     let addr = spawn_tls_echo_server();
     let plan = wss_plan(addr, false);
+    let tls_config = Some(build_tls_config(&plan.opts, &[]));
 
-    let stop = StopSignal::after(Duration::from_millis(500));
-    let stats = run_ws_saturate(plan, 1, stop, None).await;
+    let stop = stop_after(Duration::from_millis(500));
+    let stats = run_ws_threaded(plan, 1, stop, None, tls_config);
     let summary = WsSummary::merge(stats, Duration::from_millis(500));
 
-    // Handshake must fail — no round-trips. The error gets classified
-    // as "connect error" by the runner (TLS failures bubble through
-    // `WsError::Tls`, which `classify_open_error` logs under
-    // `errors_connect`).
     assert_eq!(summary.messages_sent, 0);
     assert_eq!(summary.messages_recvd, 0);
     assert!(

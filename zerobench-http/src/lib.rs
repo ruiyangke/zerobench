@@ -1,83 +1,17 @@
-//! zerobench-http — HTTP/1 / HTTP/2 / HTTP/3 transport.
-//!
-//! Built directly on `hyper` (via `cyper-core`'s compio↔hyper IO bridge),
-//! not on the high-level `cyper` client. Owning the connection lifecycle
-//! lets us pre-open pools, measure TTFB, and count wire bytes exactly.
-//!
-//! # Runtime backends
-//!
-//! - `runtime-compio` (default): compio IO + `cyper-core::HyperStream` bridge.
-//! - `runtime-tokio`: native tokio + hyper (no bridge overhead).
+//! zerobench-http — HTTP/1 and HTTP/2 transports (mio/epoll, zero async).
 
-// When both runtime features are enabled (e.g. due to cargo feature
-// unification), compio takes precedence. The Transport impl dispatches
-// based on which runtime is actually active at the call site.
-
-// --- Compio backend modules ---
-#[cfg(feature = "runtime-compio")]
-pub mod conn;
-#[cfg(feature = "runtime-compio")]
-pub mod counting_stream;
-#[cfg(all(feature = "h1", feature = "runtime-compio"))]
-pub mod h1;
-#[cfg(all(feature = "h2", feature = "runtime-compio"))]
-pub mod h2;
-
-// --- Tokio backend modules ---
-#[cfg(feature = "runtime-tokio")]
-pub mod conn_tokio;
-#[cfg(all(feature = "h1", feature = "runtime-tokio"))]
-pub mod h1_tokio;
-
-// --- Raw H1 backend (opt-in, no hyper) ---
-#[cfg(any(feature = "raw-h1", feature = "mio-h1"))]
-mod raw_h1_common;
-#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
-#[allow(unsafe_code)]
-pub mod raw_h1;
-#[cfg(all(feature = "raw-h1", feature = "runtime-tokio"))]
-pub mod raw_h1_tokio;
+// --- Shared H1 request/response helpers ---
+#[cfg(feature = "mio-h1")]
+pub mod raw_h1_common;
 
 // --- Mio TLS wrapper (shared by mio-h1 and mio-h2) ---
 #[cfg(feature = "mio-h1")]
 pub mod mio_tls;
 
-// --- Mio H1 backend (opt-in, synchronous epoll, no async runtime) ---
+// --- Mio H1 backend (synchronous epoll, no async runtime) ---
 #[cfg(feature = "mio-h1")]
 pub mod mio_h1;
 
-// --- Mio H2 backend (opt-in, h2 crate manually polled from mio) ---
+// --- Mio H2 backend (h2 crate manually polled from mio) ---
 #[cfg(feature = "mio-h2")]
 pub mod mio_h2;
-
-// --- Transport dispatch (works on either backend) ---
-#[cfg(feature = "h1")]
-mod transport_impl;
-
-// --- Re-exports: compio backend ---
-#[cfg(feature = "runtime-compio")]
-pub use conn::{Connected, open};
-#[cfg(feature = "runtime-compio")]
-pub use counting_stream::CountingStream;
-#[cfg(all(feature = "h1", feature = "runtime-compio"))]
-pub use h1::{Http1Pool, StreamingResponse};
-#[cfg(all(feature = "h2", feature = "runtime-compio"))]
-pub use h2::Http2Client;
-
-// --- Re-exports: tokio backend ---
-#[cfg(all(feature = "h1", feature = "runtime-tokio"))]
-pub use h1_tokio::Http1PoolTokio;
-
-// --- Re-exports: raw H1 backend ---
-#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
-pub use raw_h1::{RawH1Handle, RawH1Pool};
-#[cfg(all(feature = "raw-h1", feature = "runtime-tokio"))]
-pub use raw_h1_tokio::{RawH1PoolTokio, RawH1TransportTokio};
-
-// --- Re-exports: transport dispatch ---
-#[cfg(feature = "h1")]
-pub use transport_impl::HttpTransport;
-#[cfg(all(feature = "h1", feature = "runtime-compio"))]
-pub use transport_impl::HttpClient;
-#[cfg(all(feature = "raw-h1", feature = "runtime-compio"))]
-pub use transport_impl::RawH1Transport;

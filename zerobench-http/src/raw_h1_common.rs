@@ -1,4 +1,4 @@
-//! Shared helpers for raw HTTP/1.1 transports (compio and tokio variants).
+//! Shared helpers for raw HTTP/1.1 request building and response parsing.
 //!
 //! Contains request building and response header parsing that is
 //! runtime-agnostic — only synchronous byte manipulation, no I/O.
@@ -19,7 +19,7 @@ use zerobench_core::transport::{Target, TransportError};
 /// the full wire message (request line + headers + body) in a single
 /// pass. No `http::Request` construction, no `HeaderMap`, no
 /// `Full<Bytes>` — just raw bytes.
-pub(crate) fn build_raw_request(
+pub fn build_raw_request(
     plan: &RequestPlan,
     ctx: &mut ScenarioContext,
     target: &Target,
@@ -143,7 +143,7 @@ pub(crate) fn build_raw_request(
 }
 
 /// Find the start index of `needle` in `haystack`.
-pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
@@ -152,14 +152,6 @@ pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 // ---------------------------------------------------------------------------
 // Response header parsing — runtime-agnostic
 // ---------------------------------------------------------------------------
-
-/// Scan for `\r\n\r\n` in the buffer. Returns the byte position just
-/// past the terminator (i.e. the start of the body).
-pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-}
 
 /// Extract the `Content-Length` value from raw httparse headers.
 pub(crate) fn find_content_length_raw(headers: &[httparse::Header<'_>]) -> usize {
@@ -192,19 +184,6 @@ pub(crate) fn find_connection_close(headers: &[httparse::Header<'_>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn find_header_end_finds_crlfcrlf() {
-        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let pos = find_header_end(buf).unwrap();
-        assert_eq!(&buf[pos..], b"hello");
-    }
-
-    #[test]
-    fn find_header_end_returns_none_when_incomplete() {
-        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
-        assert!(find_header_end(buf).is_none());
-    }
 
     #[test]
     fn content_length_extraction() {

@@ -122,20 +122,6 @@ fn mio_worker_records_requests() {
     let addr = spawn_server(server_stop);
 
     let (plan, target) = simple_plan(addr);
-    let request_bytes = {
-        use zerobench_core::rng;
-        use zerobench_core::scenario_context::ScenarioContext;
-
-        let step = plan.scenarios[0].steps.first().unwrap();
-        let rp = match step {
-            Step::Request(r) => r,
-            _ => panic!("expected request step"),
-        };
-        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-        let mut buf = Vec::new();
-        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
-        buf
-    };
 
     // Run for a short burst.
     let worker_stop = Arc::new(AtomicBool::new(false));
@@ -145,14 +131,16 @@ fn mio_worker_records_requests() {
         ws.store(true, Ordering::Relaxed);
     });
 
+    let topts = zerobench_core::transport::TransportOpts::default();
     let stats = zerobench_http::mio_h1::run_mio_worker(
+        &plan,
         &target,
-        &request_bytes,
+        &topts,
         4, // 4 connections
         &worker_stop,
-        plan.scenarios.len(),
         None, // saturate mode
         None, // no TLS
+        None, // no LiveSnapshot
     );
 
     // Stop the server.
@@ -183,14 +171,18 @@ fn mio_threaded_records_requests() {
     let (mut plan, target) = simple_plan(addr);
     plan.duration = Duration::from_secs(1);
 
+    let topts = zerobench_core::transport::TransportOpts::default();
     let all_stats = zerobench_http::mio_h1::run_mio_threaded(
         &target,
+        &topts,
         &plan,
         2,  // 2 threads
         8,  // 8 total connections
         plan.duration,
         None, // saturate mode
         None, // no TLS
+        None, // no LiveSnapshot
+        None, // no external stop
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -233,7 +225,7 @@ fn mio_https_without_server_records_connect_errors() {
     };
     let tls_config = Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]));
     let stats = zerobench_http::mio_h1::run_mio_threaded(
-        &target, &plan, 1, 1, Duration::from_secs(1), None, tls_config,
+        &target, &opts, &plan, 1, 1, Duration::from_secs(1), None, tls_config, None, None,
     );
     // No panic -- that's the key assertion. Stats may have connect errors.
     let total: u64 = stats.iter().map(|s| s.requests).sum();
@@ -249,22 +241,8 @@ fn mio_open_loop_respects_target_rate() {
     let addr = spawn_server(server_stop);
 
     let (plan, target) = simple_plan(addr);
-    let request_bytes = {
-        use zerobench_core::rng;
-        use zerobench_core::scenario_context::ScenarioContext;
 
-        let step = plan.scenarios[0].steps.first().unwrap();
-        let rp = match step {
-            Step::Request(r) => r,
-            _ => panic!("expected request step"),
-        };
-        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-        let mut buf = Vec::new();
-        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
-        buf
-    };
-
-    // Target 1000 req/s for 2 seconds → expect ~2000 requests (±20%).
+    // Target 1000 req/s for 2 seconds -> expect ~2000 requests (+/-20%).
     let target_rps = 1000.0;
     let run_secs = 2;
 
@@ -275,14 +253,16 @@ fn mio_open_loop_respects_target_rate() {
         ws.store(true, Ordering::Relaxed);
     });
 
+    let topts = zerobench_core::transport::TransportOpts::default();
     let stats = zerobench_http::mio_h1::run_mio_worker(
+        &plan,
         &target,
-        &request_bytes,
+        &topts,
         10, // plenty of connections
         &worker_stop,
-        plan.scenarios.len(),
         Some(target_rps),
         None, // no TLS
+        None, // no LiveSnapshot
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -304,20 +284,6 @@ fn mio_open_loop_records_keepup_on_overload() {
     let addr = spawn_server(server_stop);
 
     let (plan, target) = simple_plan(addr);
-    let request_bytes = {
-        use zerobench_core::rng;
-        use zerobench_core::scenario_context::ScenarioContext;
-
-        let step = plan.scenarios[0].steps.first().unwrap();
-        let rp = match step {
-            Step::Request(r) => r,
-            _ => panic!("expected request step"),
-        };
-        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-        let mut buf = Vec::new();
-        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
-        buf
-    };
 
     // Target 1M req/s with only 2 connections against a blocking server.
     // The token scheduler will outpace connection capacity, producing keepup drops.
@@ -328,14 +294,16 @@ fn mio_open_loop_records_keepup_on_overload() {
         ws.store(true, Ordering::Relaxed);
     });
 
+    let topts = zerobench_core::transport::TransportOpts::default();
     let stats = zerobench_http::mio_h1::run_mio_worker(
+        &plan,
         &target,
-        &request_bytes,
-        2, // only 2 connections — bottleneck
+        &topts,
+        2, // only 2 connections -- bottleneck
         &worker_stop,
-        plan.scenarios.len(),
-        Some(1_000_000.0), // 1M req/s — way more than 2 connections can handle
+        Some(1_000_000.0), // 1M req/s -- way more than 2 connections can handle
         None, // no TLS
+        None, // no LiveSnapshot
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -511,22 +479,6 @@ fn mio_h1_tls_with_self_signed_cert() {
     let mut target = Target::parse(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
     target.sni = Some("localhost".into());
 
-    // Build request bytes.
-    let request_bytes = {
-        use zerobench_core::rng;
-        use zerobench_core::scenario_context::ScenarioContext;
-
-        let step = plan.scenarios[0].steps.first().unwrap();
-        let rp = match step {
-            Step::Request(r) => r,
-            _ => panic!("expected request step"),
-        };
-        let mut ctx = ScenarioContext::new(plan.vars.len(), rng::from_entropy());
-        let mut buf = Vec::new();
-        zerobench_http::mio_h1::__test_build_request(rp, &mut ctx, &target, &mut buf);
-        buf
-    };
-
     // Build TLS config with insecure verifier (self-signed cert).
     let opts = zerobench_core::transport::TransportOpts {
         insecure_tls: true,
@@ -542,13 +494,14 @@ fn mio_h1_tls_with_self_signed_cert() {
     });
 
     let stats = zerobench_http::mio_h1::run_mio_worker(
+        &plan,
         &target,
-        &request_bytes,
+        &opts,
         4, // 4 connections
         &worker_stop,
-        plan.scenarios.len(),
         None, // saturate mode
         tls_config,
+        None, // no LiveSnapshot
     );
 
     stop.store(true, Ordering::Relaxed);

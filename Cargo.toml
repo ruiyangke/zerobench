@@ -29,22 +29,14 @@ zerobench-sse  = { path = "zerobench-sse",  version = "0.0.1" }
 zerobench-rhai = { path = "zerobench-rhai", version = "0.0.1" }
 zerobench-tui  = { path = "zerobench-tui",  version = "0.0.1" }
 
-# Async runtime — compio (default)
+# Stub server deps (test infrastructure only)
 compio = { version = "0.18", features = ["io", "net", "runtime", "macros", "time", "tls"] }
 compio-tls = { version = "0.9", features = ["rustls"] }
-futures-util = "0.3"
-
-# Async runtime — tokio (opt-in alternative)
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+socket2 = "0.6"
 
 # HTTP
-hyper = { version = "1.4", features = ["client"] }
 http = "1"
-http-body-util = "0.1"
 httparse = "1"
-cyper-core = "0.8"
 h2 = "0.4"
 
 # Core utils
@@ -82,13 +74,10 @@ uuid = { version = "1", features = ["v4", "v7"] }
 # Terminal colors
 yansi = "1"
 
-# Async channels (for open-loop scheduler/worker coordination)
-flume = { version = "0.12", default-features = false, features = ["async"] }
-
 # Fast integer formatting
 itoa = "1"
 
-# Synchronous epoll event loop (mio-h1 benchmark backend)
+# Synchronous epoll event loop
 mio = { version = "1", features = ["os-poll", "net"] }
 
 # Allocator
@@ -97,16 +86,9 @@ mimalloc = { version = "0.1", default-features = false }
 # Errors
 thiserror = "2"
 
-# System / platform
-libc = "0.2"
-socket2 = "0.6"
-
-# TLS primitives — disable default features so aws-lc-rs isn't pulled
-# alongside ring (rustls 0.23's default turns on both, which then trips
-# `get_default_or_install_from_crate_features` at runtime).
+# TLS
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 webpki-roots = "0.26"
-# Test-time self-signed cert generation (TLS smoke tests)
 rcgen = "0.13"
 
 # Config file parsing
@@ -124,7 +106,7 @@ strip = "debuginfo"
 
 [profile.bench]
 inherits = "release"
-debug = true         # keep frame pointers + symbols for profilers
+debug = true
 
 [workspace.lints.rust]
 unsafe_code = "deny"
