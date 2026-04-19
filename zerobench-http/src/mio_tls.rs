@@ -187,9 +187,16 @@ impl MioTlsStream {
         }
     }
 
+    /// `true` if the rustls state machine has not yet finished the
+    /// handshake. Use in a multiplexing loop to decide when to
+    /// transition out of the handshake state.
+    pub fn is_handshaking(&self) -> bool {
+        self.tls.is_handshaking()
+    }
+
     /// Perform pending TLS reads/writes on the underlying TCP stream.
     /// Call this whenever mio reports the socket is readable or writable.
-    pub(crate) fn do_tls_io(&mut self) -> io::Result<()> {
+    pub fn do_tls_io(&mut self) -> io::Result<()> {
         // Write pending TLS data to TCP
         if self.tls.wants_write() {
             match self.tls.write_tls(&mut self.tcp) {
@@ -318,6 +325,26 @@ impl MioStream {
     pub fn flush_tls(&mut self) {
         if let Self::Tls(s) = self {
             let _ = s.do_tls_io();
+        }
+    }
+
+    /// Drive one round of TLS I/O against the underlying TCP socket.
+    /// Plain streams return `Ok(())` unconditionally. Use in a
+    /// multiplexing event loop where multiple TLS connections share
+    /// one Poll and need to drive handshakes incrementally.
+    pub fn drive_tls_io(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Tls(s) => s.do_tls_io(),
+        }
+    }
+
+    /// `true` if this is a TLS stream and its handshake is still in
+    /// progress. Plain streams always return `false`.
+    pub fn is_handshaking(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Tls(s) => s.is_handshaking(),
         }
     }
 }

@@ -8,28 +8,31 @@
 //! Answers the production question: "how many concurrent subscribers
 //! can the server sustain at what event rate and chunk-gap p99?"
 //!
-//! # Synchronous I/O
+//! # I/O model
 //!
-//! Uses plain `std::net::TcpStream` + `rustls::StreamOwned`
-//! (one OS thread per subscriber) for implementation clarity. This
-//! scales comfortably up to a few thousand subscribers. For 10k+
-//! subscribers (production chat / notification workloads), a future
-//! revision will move to a mio event loop multiplexing all
-//! subscribers in a single thread. The public API stays identical.
+//! Per-scenario: one OS thread owns one [`mio::Poll`] multiplexing
+//! all `N` subscribers. Each subscriber is a token-indexed state
+//! machine (`ConnectingTcp → TlsHandshaking → WritingRequest →
+//! ReadingHeaders → ReadingBody`). Plain and TLS subscribers share
+//! the same loop via [`MioStream`]. No blocking `std::net` anywhere
+//! on the client side.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use mio::net::TcpStream as MioTcp;
+use mio::{Events, Interest, Poll, Token};
 use rustls::ClientConfig;
 
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS};
 use zerobench_core::plan::{Plan, Protocol, SseHoldPlan, Step};
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_http::mio_tls::{MioStream, MioTlsStream};
 
 use crate::line_parser::{SseEvent, SseLineParser};
 
@@ -73,177 +76,274 @@ impl HoldStats {
 }
 
 // ---------------------------------------------------------------------------
-// Per-subscriber worker
+// Per-subscriber state machine
 // ---------------------------------------------------------------------------
 
-/// Run a single subscriber for at most `deadline` wall-clock time (or
-/// until `stop` fires). Blocking I/O; one OS thread per subscriber.
+/// One subscriber multiplexed on the scenario's shared [`Poll`].
 ///
-/// On return the stats struct carries everything the dispatcher needs
-/// to merge into the scenario's [`SseExtras`].
-fn run_one_hold(
-    target: &Target,
-    opts: &TransportOpts,
-    request_bytes: &[u8],
-    deadline: Instant,
-    stop: &AtomicBool,
-    tls_config: Option<&Arc<ClientConfig>>,
-) -> HoldStats {
-    let mut stats = HoldStats::new();
-
-    // Resolve + connect. On any failure we bail early with the
-    // connect-error counter; the dispatcher will see a zero-event
-    // subscriber and roll it up.
-    let addr: SocketAddr = match target.resolve(opts) {
-        Ok(a) => a,
-        Err(_) => {
-            stats.errors_connect += 1;
-            return stats;
-        }
-    };
-
-    let mut tcp = match TcpStream::connect_timeout(&addr, opts.connect_timeout) {
-        Ok(s) => s,
-        Err(_) => {
-            stats.errors_connect += 1;
-            return stats;
-        }
-    };
-    let _ = tcp.set_nodelay(true);
-    // Short read timeout lets us check `stop` + `deadline` often.
-    let _ = tcp.set_read_timeout(Some(Duration::from_millis(100)));
-    let _ = tcp.set_write_timeout(Some(opts.request_timeout));
-
-    if let Err(_e) = tcp.write_all(request_bytes) {
-        stats.errors_connect += 1;
-        let _ = tcp.shutdown(Shutdown::Both);
-        return stats;
-    }
-
-    let t_sent = Instant::now();
-
-    // TLS: for Phase 6a we only support plain http:// (no TLS). TLS
-    // support lands alongside the mio migration in Phase 6b — the
-    // blocking path would need a sync rustls wrapper that's tangential
-    // to the semantics change. Callers passing `Some(tls_config)` for
-    // an http:// target quietly ignore it; https:// targets with no
-    // TLS config error at connect.
-    let _ = tls_config; // unused for now; see comment above
-
-    read_body_hold(&mut tcp, deadline, stop, t_sent, &mut stats);
-
-    let _ = tcp.shutdown(Shutdown::Both);
-    stats
+/// The `state` field advances monotonically from `ConnectingTcp`
+/// through `ReadingBody`; `Dead` is terminal. The driver inspects
+/// mio event readiness and the current state to decide what I/O to
+/// perform, then updates state accordingly.
+struct Subscriber {
+    stream: MioStream,
+    state: SubState,
+    /// Progress through the request bytes during `WritingRequest`.
+    write_pos: usize,
+    /// Accumulator for HTTP response bytes received before the
+    /// `\r\n\r\n` header terminator is seen.
+    pre_body: Vec<u8>,
+    decoder: ChunkDecoder,
+    parser: SseLineParser,
+    stats: HoldStats,
+    /// Set when the full request has flushed to the wire — used as
+    /// the TTFB baseline.
+    t_request_sent: Option<Instant>,
+    first_byte_at: Option<Instant>,
+    last_event_at: Option<Instant>,
 }
 
-/// Drain the HTTP/1.1 chunked SSE body, feeding events into the
-/// caller's stats until `deadline`, `stop`, or EOF.
-fn read_body_hold(
-    stream: &mut TcpStream,
-    deadline: Instant,
-    stop: &AtomicBool,
-    t_sent: Instant,
-    stats: &mut HoldStats,
-) {
-    let mut buf = [0u8; 8192];
-    let mut first_byte: Option<Instant> = None;
-    let mut header_terminated = false;
-    let mut pre_body: Vec<u8> = Vec::new();
-    let mut parser = SseLineParser::default();
-    let mut decoder = ChunkDecoder::new();
-    let mut decoded: Vec<u8> = Vec::with_capacity(8192);
-    let mut last_event_at: Option<Instant> = None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubState {
+    ConnectingTcp,
+    TlsHandshaking,
+    WritingRequest,
+    ReadingHeaders,
+    ReadingBody,
+    Dead,
+}
 
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(0) => return, // EOF
-            Ok(n) => {
-                let now = Instant::now();
-                if first_byte.is_none() {
-                    first_byte = Some(now);
-                    stats.ttfb = Some(now.saturating_duration_since(t_sent));
-                }
-                stats.bytes_received = stats.bytes_received.saturating_add(n as u64);
+/// Result of driving a subscriber through one mio event.
+enum DriveOutcome {
+    /// Subscriber still active — keep polling it.
+    Alive,
+    /// Subscriber terminated (connect error, read error, EOF). The
+    /// caller marks it dead and drops it from the live count.
+    Dead,
+}
 
-                // Parse past the HTTP headers, then feed the rest into
-                // the chunk-encoded decoder and then the SSE line
-                // parser.
-                let slice = &buf[..n];
-                let start = if header_terminated {
-                    0
-                } else {
-                    pre_body.extend_from_slice(slice);
-                    if let Some(hdr_end) = find_header_end(&pre_body) {
-                        header_terminated = true;
-                        // Feed the body tail, if any, through the
-                        // chunked decoder.
-                        let body_start_in_pre = hdr_end;
-                        // We must seek back within `slice` to the byte
-                        // index corresponding to `body_start_in_pre`
-                        // in `pre_body`. `pre_body` grew by `n` this
-                        // iteration, so:
-                        let grown_before = pre_body.len() - n;
-                        let body_start_in_slice =
-                            body_start_in_pre.saturating_sub(grown_before);
-                        body_start_in_slice
-                    } else {
-                        // Still in header; wait for more bytes.
-                        continue;
+/// Attempt TCP connect + TLS wrap (if required) + register with
+/// `poll`. Returns a subscriber in `ConnectingTcp` state ready to be
+/// driven by events, or an error to count as a connect failure.
+fn create_subscriber(
+    addr: SocketAddr,
+    target: &Target,
+    tls_config: Option<&Arc<ClientConfig>>,
+    token: Token,
+    registry: &mio::Registry,
+) -> io::Result<Subscriber> {
+    let tcp = MioTcp::connect(addr)?;
+    let _ = tcp.set_nodelay(true);
+
+    let stream = if target.tls {
+        let config = tls_config.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "https:// target but no TLS config provided",
+            )
+        })?;
+        let sni = target.sni_name().to_string();
+        let tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)?;
+        MioStream::Tls(tls)
+    } else {
+        MioStream::Plain(tcp)
+    };
+
+    Ok(Subscriber {
+        stream,
+        state: SubState::ConnectingTcp,
+        write_pos: 0,
+        pre_body: Vec::new(),
+        decoder: ChunkDecoder::new(),
+        parser: SseLineParser::default(),
+        stats: HoldStats::new(),
+        t_request_sent: None,
+        first_byte_at: None,
+        last_event_at: None,
+    })
+    .and_then(|mut sub| {
+        registry.register(
+            sub.stream.tcp_stream_mut(),
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
+        Ok(sub)
+    })
+}
+
+/// Drive one subscriber through one mio event. Loops through
+/// states transitioning synchronously when possible (e.g.
+/// `ConnectingTcp → WritingRequest` after a successful TCP connect
+/// reveals no TLS is required), returning to the caller only on
+/// `WouldBlock` or terminal events.
+fn drive_subscriber(sub: &mut Subscriber, request: &[u8]) -> DriveOutcome {
+    loop {
+        match sub.state {
+            SubState::ConnectingTcp => {
+                // mio reports writable once the TCP 3WHS is done.
+                // Confirm by probing peer_addr — returns NotConnected
+                // while the SYN-ACK is still pending.
+                let tcp = sub.stream.tcp_stream();
+                match tcp.peer_addr() {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::NotConnected => {
+                        return DriveOutcome::Alive;
                     }
+                    Err(_) => {
+                        sub.stats.errors_connect =
+                            sub.stats.errors_connect.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
+                }
+                sub.state = if sub.stream.is_handshaking() {
+                    SubState::TlsHandshaking
+                } else {
+                    SubState::WritingRequest
                 };
-
-                decoded.clear();
-                let _ended = decoder.decode(&slice[start..], &mut decoded);
-
-                if !decoded.is_empty() {
-                    parser.feed(&decoded, |ev| {
-                        match ev {
-                            SseEvent::Data(_payload) => {
-                                let now = Instant::now();
-                                if let Some(prev) = last_event_at {
-                                    let gap_ns = duration_to_hist_ns(
-                                        now.saturating_duration_since(prev),
-                                    );
-                                    let gap_ns =
-                                        gap_ns.clamp(HIST_LO_NS, HIST_HI_NS);
-                                    let _ = stats.event_gap.record(gap_ns);
-                                }
-                                last_event_at = Some(now);
-                                stats.events = stats.events.saturating_add(1);
-                            }
-                            SseEvent::Done => {
-                                stats.saw_done = true;
-                                // PHILOSOPHY §4.3 SseHold: do NOT
-                                // terminate on [DONE]. Hold mode cares
-                                // about subscriber lifetime, not logical
-                                // stream end — `[DONE]` is typically an
-                                // application signal, and real chat /
-                                // notification servers never emit it.
-                                // Continue reading until deadline.
-                            }
-                            SseEvent::Ignored => {
-                                // event: / id: / retry: — ignored for
-                                // Phase 6a; counters for these land with
-                                // reconnect-storm in a later commit.
+            }
+            SubState::TlsHandshaking => {
+                if let Err(_e) = sub.stream.drive_tls_io() {
+                    sub.stats.errors_connect =
+                        sub.stats.errors_connect.saturating_add(1);
+                    return DriveOutcome::Dead;
+                }
+                if sub.stream.is_handshaking() {
+                    return DriveOutcome::Alive;
+                }
+                sub.state = SubState::WritingRequest;
+            }
+            SubState::WritingRequest => loop {
+                let remaining = &request[sub.write_pos..];
+                if remaining.is_empty() {
+                    sub.t_request_sent = Some(Instant::now());
+                    sub.state = SubState::ReadingHeaders;
+                    break;
+                }
+                match sub.stream.write(remaining) {
+                    Ok(0) => {
+                        sub.stats.errors_connect =
+                            sub.stats.errors_connect.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
+                    Ok(n) => {
+                        sub.write_pos = sub.write_pos.saturating_add(n);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return DriveOutcome::Alive;
+                    }
+                    Err(_) => {
+                        sub.stats.errors_connect =
+                            sub.stats.errors_connect.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
+                }
+            },
+            SubState::ReadingHeaders => {
+                let mut buf = [0u8; 4096];
+                match sub.stream.read(&mut buf) {
+                    Ok(0) => {
+                        sub.stats.errors_read =
+                            sub.stats.errors_read.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
+                    Ok(n) => {
+                        let now = Instant::now();
+                        if sub.first_byte_at.is_none() {
+                            sub.first_byte_at = Some(now);
+                            if let Some(t_sent) = sub.t_request_sent {
+                                sub.stats.ttfb =
+                                    Some(now.saturating_duration_since(t_sent));
                             }
                         }
-                    });
+                        sub.stats.bytes_received =
+                            sub.stats.bytes_received.saturating_add(n as u64);
+                        sub.pre_body.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) = find_header_end(&sub.pre_body) {
+                            let body_tail: Vec<u8> =
+                                sub.pre_body[hdr_end..].to_vec();
+                            sub.pre_body.clear();
+                            sub.state = SubState::ReadingBody;
+                            if !body_tail.is_empty() {
+                                feed_body(sub, &body_tail);
+                            }
+                        }
+                        // Loop again — more header bytes may already
+                        // be buffered; falls through to read more.
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return DriveOutcome::Alive;
+                    }
+                    Err(_) => {
+                        sub.stats.errors_read =
+                            sub.stats.errors_read.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
                 }
             }
-            Err(ref e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                // Read timeout fired — loop back and re-check stop /
-                // deadline.
-                continue;
+            SubState::ReadingBody => {
+                let mut buf = [0u8; 8192];
+                match sub.stream.read(&mut buf) {
+                    Ok(0) => return DriveOutcome::Dead,
+                    Ok(n) => {
+                        sub.stats.bytes_received =
+                            sub.stats.bytes_received.saturating_add(n as u64);
+                        feed_body(sub, &buf[..n]);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return DriveOutcome::Alive;
+                    }
+                    Err(_) => {
+                        sub.stats.errors_read =
+                            sub.stats.errors_read.saturating_add(1);
+                        return DriveOutcome::Dead;
+                    }
+                }
             }
-            Err(_) => {
-                stats.errors_read = stats.errors_read.saturating_add(1);
-                return;
-            }
+            SubState::Dead => return DriveOutcome::Dead,
         }
     }
+}
+
+/// Feed decoded body bytes through the chunked decoder + SSE line
+/// parser, updating `sub.stats` and `sub.last_event_at`.
+///
+/// Splitting field-level borrows explicitly so the parser callback
+/// can mutate `stats` and `last_event_at` without aliasing `parser`
+/// or `decoder`.
+fn feed_body(sub: &mut Subscriber, input: &[u8]) {
+    let mut decoded: Vec<u8> = Vec::with_capacity(input.len());
+    let _ended = sub.decoder.decode(input, &mut decoded);
+    if decoded.is_empty() {
+        return;
+    }
+    let parser = &mut sub.parser;
+    let stats = &mut sub.stats;
+    let last_event_at = &mut sub.last_event_at;
+    parser.feed(&decoded, |ev| match ev {
+        SseEvent::Data(_payload) => {
+            let now = Instant::now();
+            if let Some(prev) = *last_event_at {
+                let gap_ns =
+                    duration_to_hist_ns(now.saturating_duration_since(prev));
+                let gap_ns = gap_ns.clamp(HIST_LO_NS, HIST_HI_NS);
+                let _ = stats.event_gap.record(gap_ns);
+            }
+            *last_event_at = Some(now);
+            stats.events = stats.events.saturating_add(1);
+        }
+        SseEvent::Done => {
+            // PHILOSOPHY §4.3 SseHold: do NOT terminate on [DONE].
+            // Hold mode cares about subscriber lifetime, not logical
+            // stream end — `[DONE]` is typically an application
+            // signal, and real chat / notification servers never
+            // emit it. Continue reading until deadline.
+            stats.saw_done = true;
+        }
+        SseEvent::Ignored => {
+            // event: / id: / retry: — counters for these land with
+            // reconnect-storm in a later commit.
+        }
+    });
 }
 
 /// Returns the byte index after the `\r\n\r\n` header terminator if
@@ -440,10 +540,8 @@ fn run_hold_scenario(
     hold_plan: &SseHoldPlan,
     duration: Duration,
     stop: &Arc<AtomicBool>,
-    _tls_config: Option<Arc<ClientConfig>>,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> ScenarioRollup {
-    // Deadline — whichever fires first between the caller's `duration`
-    // and this scenario's hold_for.
     let wall_deadline = Instant::now()
         + duration.min(if hold_plan.hold_for.is_zero() {
             duration
@@ -451,22 +549,8 @@ fn run_hold_scenario(
             hold_plan.hold_for
         });
 
-    let request_bytes = build_hold_request(target, hold_plan);
-
-    let handles: Vec<_> = (0..hold_plan.subscribers.max(1))
-        .map(|_| {
-            let target = target.clone();
-            let opts = opts.clone();
-            let req = request_bytes.clone();
-            let stop = Arc::clone(stop);
-            std::thread::Builder::new()
-                .name("zerobench-sse-hold".into())
-                .spawn(move || {
-                    run_one_hold(&target, &opts, &req, wall_deadline, &stop, None)
-                })
-                .expect("spawn sse-hold worker")
-        })
-        .collect();
+    let request = build_hold_request(target, hold_plan);
+    let n_subs = hold_plan.subscribers.max(1) as usize;
 
     let mut rollup = ScenarioRollup {
         ttfb: new_hist(),
@@ -478,19 +562,113 @@ fn run_hold_scenario(
         errors_read: 0,
     };
 
-    for h in handles {
-        let s = h.join().expect("sse-hold worker panicked");
-        if let Some(t) = s.ttfb {
-            let _ = rollup.ttfb.record(duration_to_hist_ns(t));
+    // Resolve once — all subscribers share the same target.
+    let addr = match target.resolve(opts) {
+        Ok(a) => a,
+        Err(_) => {
+            rollup.errors_connect = n_subs as u64;
+            return rollup;
         }
-        let _ = rollup.event_gap.add(&s.event_gap);
-        rollup.events += s.events;
-        rollup.bytes_received += s.bytes_received;
-        if s.saw_done {
-            rollup.streams_completed += 1;
+    };
+
+    let mut poll = match Poll::new() {
+        Ok(p) => p,
+        Err(_) => {
+            rollup.errors_connect = n_subs as u64;
+            return rollup;
         }
-        rollup.errors_connect += s.errors_connect;
-        rollup.errors_read += s.errors_read;
+    };
+    let mut events = Events::with_capacity(n_subs.clamp(64, 1024));
+
+    // Create + register all subscribers. Creation failures count as
+    // connect errors but don't abort the scenario — other subscribers
+    // continue independently.
+    let mut subs: Vec<Option<Subscriber>> = Vec::with_capacity(n_subs);
+    for i in 0..n_subs {
+        match create_subscriber(
+            addr,
+            target,
+            tls_config.as_ref(),
+            Token(i),
+            poll.registry(),
+        ) {
+            Ok(sub) => subs.push(Some(sub)),
+            Err(_) => {
+                rollup.errors_connect = rollup.errors_connect.saturating_add(1);
+                subs.push(None);
+            }
+        }
+    }
+
+    let mut alive = subs.iter().filter(|s| s.is_some()).count();
+
+    // Event loop: single thread multiplexes all subscribers. The
+    // 100ms poll timeout bounds how long we wait before re-checking
+    // `stop` and `deadline`.
+    while alive > 0 {
+        let now = Instant::now();
+        if stop.load(Ordering::Relaxed) || now >= wall_deadline {
+            break;
+        }
+        let budget = (wall_deadline - now).min(Duration::from_millis(100));
+        if poll.poll(&mut events, Some(budget)).is_err() {
+            break;
+        }
+        for event in events.iter() {
+            let idx = event.token().0;
+            let Some(slot) = subs.get_mut(idx) else { continue };
+            let Some(sub) = slot.as_mut() else { continue };
+            if sub.state == SubState::Dead {
+                continue;
+            }
+
+            // Socket-level error → fail fast.
+            if event.is_error() {
+                if let Ok(Some(_e)) = sub.stream.tcp_stream_mut().take_error() {
+                    // Classify as connect error if we hadn't yet sent
+                    // the request; otherwise as read error.
+                    if sub.t_request_sent.is_none() {
+                        sub.stats.errors_connect =
+                            sub.stats.errors_connect.saturating_add(1);
+                    } else {
+                        sub.stats.errors_read =
+                            sub.stats.errors_read.saturating_add(1);
+                    }
+                }
+                sub.state = SubState::Dead;
+                alive -= 1;
+                continue;
+            }
+
+            // For TLS, writable events may also need to flush pending
+            // cipher output even when the app layer is in a reading
+            // state.
+            if event.is_writable() {
+                sub.stream.flush_tls();
+            }
+
+            if let DriveOutcome::Dead = drive_subscriber(sub, &request) {
+                sub.state = SubState::Dead;
+                alive -= 1;
+            }
+        }
+    }
+
+    // Merge per-subscriber stats into rollup.
+    for s in subs.into_iter().flatten() {
+        if let Some(ttfb) = s.stats.ttfb {
+            let _ = rollup.ttfb.record(duration_to_hist_ns(ttfb));
+        }
+        let _ = rollup.event_gap.add(&s.stats.event_gap);
+        rollup.events = rollup.events.saturating_add(s.stats.events);
+        rollup.bytes_received =
+            rollup.bytes_received.saturating_add(s.stats.bytes_received);
+        if s.stats.saw_done {
+            rollup.streams_completed = rollup.streams_completed.saturating_add(1);
+        }
+        rollup.errors_connect =
+            rollup.errors_connect.saturating_add(s.stats.errors_connect);
+        rollup.errors_read = rollup.errors_read.saturating_add(s.stats.errors_read);
     }
 
     rollup
@@ -546,7 +724,7 @@ fn extract_path(url: &zerobench_core::Template) -> String {
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::sync::Arc;
 
     /// Spawn a minimal SSE stub server that loop-accepts and, per
