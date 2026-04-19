@@ -6,11 +6,12 @@
 //! unit-test without standing up a runtime.
 
 use std::fs;
+use std::time::Duration;
 
 use http::Method;
 use smallvec::SmallVec;
 use zerobench_core::plan::{
-    Assertion, BodySource, Plan, RateProfile, RequestPlan, Scenario, Step,
+    Assertion, BodySource, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
 use zerobench_core::request_file::{
     parse_request_bytes, parse_scenario_dir, RequestFileError,
@@ -218,8 +219,12 @@ fn build_from_url(
         scenarios: vec![scenario],
         vars,
         duration: args.duration,
-        warmup: args.warmup,
+        warmup: args.warmup.unwrap_or(Duration::ZERO),
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
 
     Ok((plan, target, opts.clone()))
@@ -325,8 +330,12 @@ fn build_from_request_file(
         scenarios: vec![scenario],
         vars,
         duration: args.duration,
-        warmup: args.warmup,
+        warmup: args.warmup.unwrap_or(Duration::ZERO),
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
 
     Ok((plan, target, opts.clone()))
@@ -427,8 +436,12 @@ fn build_from_request_dir(
         scenarios,
         vars,
         duration: args.duration,
-        warmup: args.warmup,
+        warmup: args.warmup.unwrap_or(Duration::ZERO),
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     Ok((plan, target, opts.clone()))
 }
@@ -798,14 +811,14 @@ mod tests {
             "http://h:1/",
         ]);
         let (plan, _target, _opts) = build(&args).unwrap();
-        assert_eq!(plan.warmup, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(plan.warmup, std::time::Duration::from_secs(7));
     }
 
     #[test]
-    fn build_warmup_absent_yields_none() {
+    fn build_warmup_absent_yields_zero() {
         let args = parse(&["zerobench", "--saturate", "http://h:1/"]);
         let (plan, _target, _opts) = build(&args).unwrap();
-        assert!(plan.warmup.is_none());
+        assert_eq!(plan.warmup, std::time::Duration::ZERO);
     }
 
     #[test]

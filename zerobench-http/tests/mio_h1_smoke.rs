@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zerobench_core::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
 // TaskStats used by type inference only
 use zerobench_core::template::Template;
 use zerobench_core::transport::Target;
@@ -104,8 +104,12 @@ fn simple_plan(addr: SocketAddr) -> (Plan, Target) {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(2),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     let target = Target::parse(&format!("http://{addr}")).unwrap();
     (plan, target)
@@ -215,8 +219,12 @@ fn mio_https_without_server_records_connect_errors() {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(1),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
     // With TLS config but no server -- should not panic, just record errors.
     let opts = zerobench_core::transport::TransportOpts {
@@ -473,8 +481,12 @@ fn mio_h1_tls_with_self_signed_cert() {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(2),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     let mut target = Target::parse(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
     target.sni = Some("localhost".into());

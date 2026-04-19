@@ -33,8 +33,8 @@ use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, ImmutableString, NativeCallCon
 use smallvec::SmallVec;
 
 use zerobench_core::plan::{
-    Assertion, BodySource, Extract, Plan, RateProfile, RequestPlan, Scenario, SsePlan, Step,
-    WsRoundPlan,
+    Assertion, BodySource, Extract, Mode, Plan, RateProfile, RequestPlan, Scenario, SsePlan,
+    Step, WsRoundPlan,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::HttpVersionPref;
@@ -264,8 +264,12 @@ fn finalize_state(
         scenarios: scenarios_out,
         vars: state.vars,
         duration,
-        warmup: state.warmup,
+        warmup: state.warmup.unwrap_or(Duration::ZERO),
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     Ok((plan, state.transport))
 }

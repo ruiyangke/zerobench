@@ -124,15 +124,19 @@ fn construct_full_plan_and_read_fields_back() {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(30),
-        warmup: Some(Duration::from_secs(2)),
+        warmup: Duration::from_secs(2),
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
 
     assert_eq!(plan.scenarios.len(), 1);
     assert_eq!(plan.scenarios[0].name, "login-then-fetch");
     assert_eq!(plan.scenarios[0].steps.len(), 4);
     assert_eq!(plan.duration, Duration::from_secs(30));
-    assert_eq!(plan.warmup, Some(Duration::from_secs(2)));
+    assert_eq!(plan.warmup, Duration::from_secs(2));
     assert_eq!(plan.vars.len(), 1);
     assert_eq!(plan.vars.name(token), Some("token"));
 
@@ -166,8 +170,12 @@ fn plan_is_clone_for_sharing_across_threads() {
         )],
         vars,
         duration: Duration::from_secs(1),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
 
     let cloned = plan.clone();
@@ -196,7 +204,7 @@ fn default_plan_is_empty_with_sensible_duration() {
     assert!(p.scenarios.is_empty());
     assert_eq!(p.vars.len(), 0);
     assert_eq!(p.duration, Duration::from_secs(30));
-    assert!(p.warmup.is_none());
+    assert_eq!(p.warmup, Duration::ZERO);
 }
 
 /// Ensures the Plan serialization contract stays intact so the diff tool
@@ -257,8 +265,12 @@ fn plan_roundtrips_through_serde_json() {
         }],
         vars,
         duration: Duration::from_secs(30),
-        warmup: Some(Duration::from_secs(2)),
+        warmup: Duration::from_secs(2),
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
 
     let json = serde_json::to_string(&original).expect("Plan serialization must succeed");
@@ -278,5 +290,5 @@ fn plan_roundtrips_through_serde_json() {
     assert_eq!(decoded.vars.name(token), Some("token"));
     assert_eq!(decoded.vars.name(status_slot), Some("last_status"));
     assert_eq!(decoded.duration, Duration::from_secs(30));
-    assert_eq!(decoded.warmup, Some(Duration::from_secs(2)));
+    assert_eq!(decoded.warmup, Duration::from_secs(2));
 }

@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn print_terminal_omits_transfer_line_when_bytes_zero() {
-        use crate::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
         use crate::stats::{Summary, TaskStats};
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1084,8 +1084,12 @@ mod tests {
             }],
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         };
 
         // Record requests but no bytes (SSE/WS style).
@@ -1109,7 +1113,7 @@ mod tests {
 
     #[test]
     fn print_terminal_includes_transfer_line_when_bytes_present() {
-        use crate::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
         use crate::stats::{Summary, TaskStats};
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1124,8 +1128,12 @@ mod tests {
             }],
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         };
         let mut stats = TaskStats::new(1);
         for _ in 0..100 {
@@ -1168,7 +1176,7 @@ mod tests {
 
     fn plan_with_protocols(entries: &[(&str, Protocol)]) -> Plan {
         use crate::plan::{
-            Plan, RateProfile, RequestPlan, Scenario, SsePlan, Step, WsRoundPlan,
+            Mode, Plan, RateProfile, RequestPlan, Scenario, SsePlan, Step, WsRoundPlan,
         };
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1205,8 +1213,12 @@ mod tests {
             scenarios,
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         }
     }
 

@@ -34,8 +34,12 @@ fn mio_h2_https_without_server_records_connect_errors() {
         }],
         vars,
         duration: Duration::from_secs(1),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
     let opts = zerobench_core::transport::TransportOpts {
         insecure_tls: true,
@@ -66,8 +70,12 @@ fn mio_h2_plain_without_server_records_connect_errors() {
         }],
         vars,
         duration: Duration::from_secs(1),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
 
     let stop = Arc::new(AtomicBool::new(false));

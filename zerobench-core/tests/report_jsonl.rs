@@ -105,8 +105,12 @@ fn make_summary_and_plan() -> (Summary, Plan) {
         }],
         vars,
         duration: Duration::from_secs(30),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
     (summary, plan)
 }
