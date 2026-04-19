@@ -67,6 +67,20 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             },
+            Subcommand::Calibrate(ca) => match verbs::calibrate::run(ca) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Curve(cv) => match verbs::curve::run(cv) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
         };
     }
 

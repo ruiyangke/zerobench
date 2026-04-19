@@ -17,6 +17,8 @@
 //! existing `Diff` subcommand in `zerobench-cli/src/diff.rs` remains
 //! the v0.0.1 fallback until `verbs::diff` supersedes it.
 
+pub mod calibrate;
+pub mod curve;
 pub mod diff;
 pub mod measure;
 pub mod probe;

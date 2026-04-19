@@ -379,6 +379,13 @@ pub enum Subcommand {
     /// deltas. Alternative to the top-level `Diff` subcommand (which
     /// reads v0.0.1 format).
     Compare(crate::verbs::diff::CompareArgs),
+    /// Run the client-side self-check (loopback echo) and print the
+    /// ceiling + scheduler jitter. Useful for "what's the fastest
+    /// my machine can push?" without a target.
+    Calibrate(crate::verbs::calibrate::CalibrateArgs),
+    /// Ramp offered rate across --from..--to over --over; report the
+    /// (rate, p99) curve and the knee. Per PHILOSOPHY §P4.
+    Curve(crate::verbs::curve::CurveArgs),
 }
 
 /// Arguments for `zerobench run <script.rhai>`.
@@ -796,6 +803,8 @@ mod tests {
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
             Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
             Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
+            Subcommand::Calibrate(_) => panic!("expected Diff, got Calibrate"),
+            Subcommand::Curve(_) => panic!("expected Diff, got Curve"),
         }
     }
 
@@ -818,6 +827,8 @@ mod tests {
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
             Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
             Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
+            Subcommand::Calibrate(_) => panic!("expected Diff, got Calibrate"),
+            Subcommand::Curve(_) => panic!("expected Diff, got Curve"),
         }
     }
 
