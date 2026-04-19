@@ -51,7 +51,18 @@ pub enum SseEvent<'a> {
     /// The underlying connection may or may not stay open after this;
     /// the parser keeps reading regardless.
     Done,
-    /// A non-`data:` field or comment (`event:`, `id:`, `retry:`,
+    /// An `id:` field value. Emitted immediately when the `id:` line
+    /// is fully consumed (at its terminating newline) — not deferred
+    /// to the event's blank-line dispatch. For reconnect purposes,
+    /// the *most recent* `Id` is the value the caller should send
+    /// back as `Last-Event-ID` on the next reconnect, which matches
+    /// the spec's "last event ID string" update semantics closely
+    /// enough for a benchmark (we don't need per-dispatch timing).
+    ///
+    /// The value has the spec's single-space trim applied; further
+    /// trimming (e.g. CR, whitespace) is the caller's choice.
+    Id(Cow<'a, [u8]>),
+    /// A non-`data:`, non-`id:` field or comment (`event:`, `retry:`,
     /// `:comment`). The parser recognises these but does not try to
     /// decode them; emitting `Ignored` lets the caller count "how many
     /// other fields did I see?" if it wants to.
@@ -251,8 +262,15 @@ fn process_line_and_emit(
         }
         data_buf.extend_from_slice(value);
         *have_data = true;
+    } else if field == b"id" {
+        // Per WHATWG SSE §9.2, `id:` sets the event's last-event-id
+        // buffer; Last-Event-ID updates on dispatch. For reconnect-
+        // storm purposes we forward the value immediately — the
+        // caller keeps "most recent id seen" which is what gets
+        // sent back as `Last-Event-ID` on the next reconnect.
+        emit(SseEvent::Id(Cow::Borrowed(value)));
     } else {
-        // Any other field (event, id, retry, or something weird) —
+        // Any other field (event, retry, or something weird) —
         // record that we saw *something* non-data for this event. The
         // actual field values aren't used by the benchmark.
         *ignored_pending = true;

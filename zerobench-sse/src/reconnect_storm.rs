@@ -287,15 +287,24 @@ fn run_one_subscriber(
                         stats.reconnects_resumed += 1;
                     }
                 }
+                // Only track end-of-session on successful completions.
+                // A failed connect or mid-session read error never had
+                // a stable "session end" instant; measuring from the
+                // failure-retry boundary would bias `reconnect_gaps`
+                // toward artificially large values on flaky servers.
+                prior_session_end = Some(Instant::now());
             }
             Err(SessionErr::Connect) => {
                 stats.errors_connect += 1;
+                // Leave prior_session_end as-is: the next successful
+                // reconnect will compute its gap relative to the last
+                // *good* session, not relative to a connect-failure
+                // pit that contains no useful timing signal.
             }
             Err(SessionErr::Read) => {
                 stats.errors_read += 1;
             }
         }
-        prior_session_end = Some(Instant::now());
         first_connect = false;
     }
     (stats, first_ttfb, reconnect_gaps)
@@ -429,28 +438,28 @@ fn run_one_session(
                 let _ = decoder.decode(body_slice, &mut decoded);
                 if !decoded.is_empty() {
                     let events_ref = &mut outcome.events;
-                    // Capture `id:` values for Last-Event-ID
-                    // propagation, and also check each against the
-                    // caller's expected_prior_id so the worker can
-                    // tell whether the server actually skipped past
-                    // the id we asked it to resume from.
-                    for line in decoded.split(|&b| b == b'\n') {
-                        if line.starts_with(b"id:") {
-                            let val = line[3..]
-                                .trim_ascii_start()
-                                .trim_ascii_end();
-                            if let Ok(s) = std::str::from_utf8(val) {
-                                if let Some(expected) = expected_prior_id {
-                                    if s == expected {
-                                        outcome.saw_prior_id = true;
-                                    }
-                                }
-                                outcome.last_event_id = Some(s.to_string());
-                            }
-                        }
-                    }
+                    let last_id_ref = &mut outcome.last_event_id;
+                    let saw_prior_ref = &mut outcome.saw_prior_id;
+                    // Route Id extraction through the line parser so
+                    // `id:` lines split across TCP reads are stitched
+                    // back together — the parser owns line buffering
+                    // and handles CRLF / LF / bare-CR boundaries. A
+                    // chunk-boundary `id:\r\n12` + `345\r\n` previously
+                    // lost the `12` on the first read and produced
+                    // `345` instead of `12345`.
                     parser.feed(&decoded, |ev| match ev {
                         SseEvent::Data(_) => *events_ref += 1,
+                        SseEvent::Id(val) => {
+                            if let Ok(s) = std::str::from_utf8(&val) {
+                                let trimmed = s.trim();
+                                if let Some(expected) = expected_prior_id {
+                                    if trimmed == expected {
+                                        *saw_prior_ref = true;
+                                    }
+                                }
+                                *last_id_ref = Some(trimmed.to_string());
+                            }
+                        }
                         SseEvent::Done | SseEvent::Ignored => {}
                     });
                 }

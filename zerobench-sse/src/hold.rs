@@ -176,7 +176,12 @@ fn create_subscriber(
 /// `ConnectingTcp → WritingRequest` after a successful TCP connect
 /// reveals no TLS is required), returning to the caller only on
 /// `WouldBlock` or terminal events.
-fn drive_subscriber(sub: &mut Subscriber, request: &[u8]) -> DriveOutcome {
+fn drive_subscriber(
+    sub: &mut Subscriber,
+    request: &[u8],
+    live: Option<&zerobench_core::LiveSnapshot>,
+    scenario_id: u16,
+) -> DriveOutcome {
     loop {
         match sub.state {
             SubState::ConnectingTcp => {
@@ -264,7 +269,7 @@ fn drive_subscriber(sub: &mut Subscriber, request: &[u8]) -> DriveOutcome {
                             sub.pre_body.clear();
                             sub.state = SubState::ReadingBody;
                             if !body_tail.is_empty() {
-                                feed_body(sub, &body_tail);
+                                feed_body(sub, &body_tail, live, scenario_id);
                             }
                         }
                         // Loop again — more header bytes may already
@@ -287,7 +292,7 @@ fn drive_subscriber(sub: &mut Subscriber, request: &[u8]) -> DriveOutcome {
                     Ok(n) => {
                         sub.stats.bytes_received =
                             sub.stats.bytes_received.saturating_add(n as u64);
-                        feed_body(sub, &buf[..n]);
+                        feed_body(sub, &buf[..n], live, scenario_id);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         return DriveOutcome::Alive;
@@ -310,7 +315,23 @@ fn drive_subscriber(sub: &mut Subscriber, request: &[u8]) -> DriveOutcome {
 /// Splitting field-level borrows explicitly so the parser callback
 /// can mutate `stats` and `last_event_at` without aliasing `parser`
 /// or `decoder`.
-fn feed_body(sub: &mut Subscriber, input: &[u8]) {
+///
+/// When `live` is `Some`, each `Data` event is also recorded into
+/// the live snapshot so the TUI's req/s and bytes gauges update in
+/// real time. The op-count semantic is one-op-per-event, matching
+/// SseHold's reporting in `TaskStats::requests`. Latency slot for
+/// the snapshot is the inter-event gap (nanoseconds, clamped to the
+/// histogram bounds) — the same signal the end-of-run `chunk_gap`
+/// histogram carries. For the first event in a subscriber's stream
+/// we have no prior gap, so we record `0` — it's a known
+/// small-percentile artefact (one sample per subscriber) and lets
+/// the scenario's requests count stay consistent with the TUI.
+fn feed_body(
+    sub: &mut Subscriber,
+    input: &[u8],
+    live: Option<&zerobench_core::LiveSnapshot>,
+    scenario_id: u16,
+) {
     let mut decoded: Vec<u8> = Vec::with_capacity(input.len());
     let _ended = sub.decoder.decode(input, &mut decoded);
     if decoded.is_empty() {
@@ -320,16 +341,22 @@ fn feed_body(sub: &mut Subscriber, input: &[u8]) {
     let stats = &mut sub.stats;
     let last_event_at = &mut sub.last_event_at;
     parser.feed(&decoded, |ev| match ev {
-        SseEvent::Data(_payload) => {
+        SseEvent::Data(payload) => {
             let now = Instant::now();
+            let mut gap_ns: u64 = 0;
             if let Some(prev) = *last_event_at {
-                let gap_ns =
-                    duration_to_hist_ns(now.saturating_duration_since(prev));
-                let gap_ns = gap_ns.clamp(HIST_LO_NS, HIST_HI_NS);
-                let _ = stats.event_gap.record(gap_ns);
+                let d = duration_to_hist_ns(now.saturating_duration_since(prev))
+                    .clamp(HIST_LO_NS, HIST_HI_NS);
+                let _ = stats.event_gap.record(d);
+                gap_ns = d;
             }
             *last_event_at = Some(now);
             stats.events = stats.events.saturating_add(1);
+            if let Some(live) = live {
+                let blen = payload.len() as u64;
+                live.record(gap_ns, 0, blen);
+                live.record_scenario(scenario_id, gap_ns, 0, blen);
+            }
         }
         SseEvent::Done => {
             // PHILOSOPHY §4.3 SseHold: do NOT terminate on [DONE].
@@ -339,9 +366,10 @@ fn feed_body(sub: &mut Subscriber, input: &[u8]) {
             // emit it. Continue reading until deadline.
             stats.saw_done = true;
         }
-        SseEvent::Ignored => {
-            // event: / id: / retry: — counters for these land with
-            // reconnect-storm in a later commit.
+        SseEvent::Id(_) | SseEvent::Ignored => {
+            // event: / id: / retry: / comments — Hold-mode doesn't
+            // care about the resume id; reconnect_storm consumes the
+            // Id event for Last-Event-ID propagation.
         }
     });
 }
@@ -469,6 +497,7 @@ pub fn run_sse_hold_from_plan_threaded(
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<zerobench_core::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -496,8 +525,16 @@ pub fn run_sse_hold_from_plan_threaded(
         });
         let Some(hold_plan) = hold_plan else { continue };
 
-        let per_scenario_stats =
-            run_hold_scenario(target, opts, &hold_plan, duration, &stop, tls_config.clone());
+        let per_scenario_stats = run_hold_scenario(
+            target,
+            opts,
+            &hold_plan,
+            duration,
+            &stop,
+            tls_config.clone(),
+            live.as_deref(),
+            sid as u16,
+        );
 
         let mut task = TaskStats::new(num_scenarios);
         if let Some(sc) = task.per_scenario.get_mut(sid) {
@@ -535,6 +572,7 @@ struct ScenarioRollup {
     errors_read: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hold_scenario(
     target: &Target,
     opts: &TransportOpts,
@@ -542,6 +580,8 @@ fn run_hold_scenario(
     duration: Duration,
     stop: &Arc<AtomicBool>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<&zerobench_core::LiveSnapshot>,
+    scenario_id: u16,
 ) -> ScenarioRollup {
     let wall_deadline = Instant::now()
         + duration.min(if hold_plan.hold_for.is_zero() {
@@ -648,7 +688,9 @@ fn run_hold_scenario(
                 sub.stream.flush_tls();
             }
 
-            if let DriveOutcome::Dead = drive_subscriber(sub, &request) {
+            if let DriveOutcome::Dead =
+                drive_subscriber(sub, &request, live, scenario_id)
+            {
                 sub.state = SubState::Dead;
                 alive -= 1;
             }
@@ -835,6 +877,7 @@ mod tests {
             &plan,
             Duration::from_millis(500),
             None,
+            None,
             Some(stop),
         );
 
@@ -877,6 +920,7 @@ mod tests {
             &plan,
             Duration::from_millis(500),
             None,
+            None,
             Some(stop),
         );
 
@@ -907,6 +951,7 @@ mod tests {
             &opts,
             &plan,
             Duration::from_millis(300),
+            None,
             None,
             Some(stop),
         );
@@ -939,6 +984,7 @@ mod tests {
             &plan,
             Duration::from_millis(300),
             None,
+            None,
             Some(stop),
         );
         let ts = &stats[0];
@@ -961,6 +1007,7 @@ mod tests {
             &opts,
             &plan,
             Duration::from_millis(300),
+            None,
             None,
             Some(stop),
         );

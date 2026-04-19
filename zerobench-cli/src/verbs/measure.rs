@@ -157,6 +157,14 @@ pub struct MeasureArgs {
           help_heading = "Archive")]
     pub context: Vec<(String, String)>,
 
+    /// Enable the live TUI. Streams per-second req/s, p50/p99, error
+    /// rate, and per-scenario breakdowns to the terminal. Incompatible
+    /// with `--format jsonl` (both write to stdout). Requires the
+    /// `tui` feature to have useful output; without it the flag is
+    /// accepted but produces headless behaviour.
+    #[arg(long = "tui", action = ArgAction::SetTrue, help_heading = "Display")]
+    pub tui: bool,
+
     // -------------------------------------------------------------------
     // SSE Hold
     //
@@ -169,7 +177,15 @@ pub struct MeasureArgs {
     /// Open N concurrent SSE subscribers and hold them for `--for`.
     /// URL must be an SSE endpoint (`text/event-stream`); measures
     /// events/s and inter-event gap rather than req/s.
-    #[arg(long = "sse-hold", value_name = "SUBSCRIBERS", help_heading = "SSE")]
+    #[arg(
+        long = "sse-hold",
+        value_name = "SUBSCRIBERS",
+        help_heading = "SSE",
+        conflicts_with_all = [
+            "ws_echo", "cold_connect", "ws_hold", "ws_push",
+            "sse_fanout", "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub sse_hold: Option<u32>,
 
     /// Subscriber hold duration for `--sse-hold`. Defaults to
@@ -197,7 +213,15 @@ pub struct MeasureArgs {
     /// message. URL must be `ws://` or `wss://`; the server must
     /// echo text frames verbatim (or preserve the 16-char monotonic
     /// id prefix for correlation).
-    #[arg(long = "ws-echo", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    #[arg(
+        long = "ws-echo",
+        value_name = "CONNECTIONS",
+        help_heading = "WebSocket",
+        conflicts_with_all = [
+            "sse_hold", "cold_connect", "ws_hold", "ws_push",
+            "sse_fanout", "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub ws_echo: Option<u32>,
 
     /// Per-connection send rate for `--ws-echo`. Defaults to 100 msg/s
@@ -222,7 +246,15 @@ pub struct MeasureArgs {
     /// Open a fresh connection for every request — no pool reuse.
     /// Records handshake + TTFB together as the primary latency;
     /// meaningful only for HTTP targets.
-    #[arg(long = "cold-connect", action = ArgAction::SetTrue, help_heading = "HTTP")]
+    #[arg(
+        long = "cold-connect",
+        action = ArgAction::SetTrue,
+        help_heading = "HTTP",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "ws_hold", "ws_push",
+            "sse_fanout", "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub cold_connect: bool,
 
     // -------------------------------------------------------------------
@@ -230,7 +262,15 @@ pub struct MeasureArgs {
     // -------------------------------------------------------------------
     /// Open N persistent WS connections and hold them open with
     /// periodic heartbeats — measures idle-capacity / conn-drop rate.
-    #[arg(long = "ws-hold", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    #[arg(
+        long = "ws-hold",
+        value_name = "CONNECTIONS",
+        help_heading = "WebSocket",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "cold_connect", "ws_push",
+            "sse_fanout", "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub ws_hold: Option<u32>,
 
     /// Heartbeat interval for `--ws-hold`. Default 25s (margin
@@ -246,7 +286,15 @@ pub struct MeasureArgs {
     /// Open N persistent WS connections and only read inbound frames.
     /// Records the inter-message gap distribution; flags a stall if
     /// observed rate < 50% of `--ws-expected-rate`.
-    #[arg(long = "ws-push", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    #[arg(
+        long = "ws-push",
+        value_name = "CONNECTIONS",
+        help_heading = "WebSocket",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "cold_connect", "ws_hold",
+            "sse_fanout", "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub ws_push: Option<u32>,
 
     /// Expected server-push rate per connection (msg/s). When set,
@@ -267,12 +315,28 @@ pub struct MeasureArgs {
     // -------------------------------------------------------------------
     /// Open N SSE subscribers and fire `--trigger-url` periodically;
     /// report broadcast RTT.
-    #[arg(long = "sse-fanout", value_name = "SUBSCRIBERS", help_heading = "SSE")]
+    #[arg(
+        long = "sse-fanout",
+        value_name = "SUBSCRIBERS",
+        help_heading = "SSE",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "cold_connect", "ws_hold", "ws_push",
+            "ws_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub sse_fanout: Option<u32>,
 
     /// Open N WS subscribers and fire `--trigger-url` periodically;
     /// report broadcast RTT.
-    #[arg(long = "ws-fanout", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    #[arg(
+        long = "ws-fanout",
+        value_name = "CONNECTIONS",
+        help_heading = "WebSocket",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "cold_connect", "ws_hold", "ws_push",
+            "sse_fanout", "sse_reconnect_storm",
+        ],
+    )]
     pub ws_fanout: Option<u32>,
 
     /// Trigger URL for `--sse-fanout` / `--ws-fanout`. HTTP POST.
@@ -283,8 +347,15 @@ pub struct MeasureArgs {
 
     /// Open N SSE subscribers and kill them at `--kill-rate` per second
     /// (exponential interval), reconnecting with Last-Event-ID.
-    #[arg(long = "sse-reconnect-storm", value_name = "SUBSCRIBERS",
-          help_heading = "SSE")]
+    #[arg(
+        long = "sse-reconnect-storm",
+        value_name = "SUBSCRIBERS",
+        help_heading = "SSE",
+        conflicts_with_all = [
+            "sse_hold", "ws_echo", "cold_connect", "ws_hold", "ws_push",
+            "sse_fanout", "ws_fanout",
+        ],
+    )]
     pub sse_reconnect_storm: Option<u32>,
 
     /// Aggregate kill rate (per subscriber per second) for
@@ -310,6 +381,22 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------
     // Plan construction
     // -------------------------------------------------------------------
+
+    // TUI is wired for the top-level `zerobench <url>` dispatch path
+    // but not for the `measure` verb's multi-run + archive lifecycle:
+    // the per-run reset / cooldown interaction with a single
+    // long-lived live snapshot is different enough that we reject
+    // the combination explicitly rather than silently rendering
+    // nothing. Users who need live metrics for a one-off should
+    // use the top-level form, which carries the TUI wiring end to
+    // end. The flag is accepted on `measure` so that `zerobench
+    // measure ... --tui` produces a clear, actionable error rather
+    // than a Clap parse failure.
+    if args.tui {
+        return Err(
+            "--tui is not supported by the `measure` verb; use `zerobench <url> --tui` for live metrics".into(),
+        );
+    }
 
     // Capture the wall-clock start for .histlog interval timestamps.
     let run_start_wall = SystemTime::now();
@@ -554,6 +641,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         args.warmup,
                         tls_config.clone(),
                         None,
+                        None,
                     );
                 }
                 #[cfg(feature = "sse")]
@@ -588,6 +676,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         &plan,
                         args.warmup,
                         tls_config.clone(),
+                        None,
                         None,
                     );
                 }
@@ -733,6 +822,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                             &plan,
                             args.duration,
                             tls_config.clone(),
+                            None,
                             stop,
                         ),
                     }
@@ -796,6 +886,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                             &plan,
                             args.duration,
                             tls_config.clone(),
+                            None,
                             stop,
                         ),
                     }
@@ -963,8 +1054,12 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         writer.finalise(&index)?;
     }
 
-    let total_errors = summary.errors.total();
-    if summary.requests == 0 || total_errors > 0 {
+    // Exit code gates on *transport* errors (connect/read/write/
+    // timeout/keepup) only. 4xx/5xx and assertion failures are part
+    // of the benchmark signal — a load test against a route that
+    // legitimately 404s should still exit 0.
+    let hard_errors = summary.errors.hard_total();
+    if summary.requests == 0 || hard_errors > 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -1265,6 +1360,7 @@ mod tests {
             trigger_url: None,
             sse_reconnect_storm: None,
             kill_rate: 0.1,
+            tui: false,
         }
     }
 

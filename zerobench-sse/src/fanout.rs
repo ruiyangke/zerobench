@@ -518,7 +518,7 @@ fn run_one_subscriber(
                     let events_ref = &mut stats.events;
                     parser.feed(&decoded, |ev| match ev {
                         SseEvent::Data(_) => events_ref.push(Instant::now()),
-                        SseEvent::Done | SseEvent::Ignored => {}
+                        SseEvent::Done | SseEvent::Id(_) | SseEvent::Ignored => {}
                     });
                 }
             }

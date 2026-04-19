@@ -119,6 +119,11 @@ fn run_one_push(
             Ok(None) => {
                 // Timeout — loop back to check deadline/stop.
             }
+            Err(crate::conn::WsError::Closed { .. }) => {
+                // Server closed cleanly — push scenario's definition
+                // of "session" ends here. Not an error.
+                break;
+            }
             Err(_) => {
                 stats.errors_read += 1;
                 return stats;

@@ -576,10 +576,15 @@ fn dispatch_multi_protocol_plan(
             None
         };
         let dur = plan.duration;
+        // `dispatch_multi_protocol_plan` is the Rhai-scripted path; it
+        // does not wire TUI today, so pass None — adding it here
+        // requires threading a LiveSnapshot through the function's
+        // signature, which is a bigger surface change than this fix.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         let _ = connections; // SseHold takes subscriber count from its own plan field.
         Some(std::thread::spawn(move || {
             zerobench_sse::run_sse_hold_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, None,
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -606,9 +611,11 @@ fn dispatch_multi_protocol_plan(
             None
         };
         let dur = plan.duration;
+        // Multi-protocol dispatcher does not wire TUI; pass None.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, None,
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -764,7 +771,7 @@ fn run_script_sync(
                 args.output.as_deref(),
                 color,
             )?;
-            if summary.errors.total() > 0 {
+            if summary.errors.hard_total() > 0 {
                 any_errors = true;
             }
             if summary.requests > 0 {
@@ -850,9 +857,14 @@ fn run_script_sync(
         };
         let _ = args.connections; // SseHold drives subscriber count from its own plan field.
         let dur = plan.duration;
+        // `run_script_sync` is the Rhai path; it does not wire TUI
+        // today, so live stays None. `run_mio_sync` (the default
+        // dispatch) is the TUI-aware path and threads `live` through
+        // its own backend calls.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_sse::run_sse_hold_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, None,
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -886,9 +898,13 @@ fn run_script_sync(
         };
         let _ = args.connections; // WsEchoRtt drives conn count from its own plan field.
         let dur = plan.duration;
+        // `run_script_sync` is the Rhai path; TUI is wired only for
+        // `run_mio_sync`. Pass None to stay consistent with the
+        // Rhai SSE path above.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, None,
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -929,10 +945,11 @@ fn run_script_sync(
         color,
     )?;
 
-    // Exit-code policy: any errors (connect/read/write/timeout/...) or
-    // zero operations completed → exit 1. Matches the single-protocol
-    // CLI path.
-    if summary.errors.total() > 0 || summary.requests == 0 {
+    // Exit-code policy: hard transport errors (connect/read/write/
+    // timeout/keepup) or zero operations completed → exit 1. 4xx/5xx
+    // and assertion failures are signal, not infrastructure problems,
+    // so they do not gate exit status. Matches the measure-verb path.
+    if summary.errors.hard_total() > 0 || summary.requests == 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)

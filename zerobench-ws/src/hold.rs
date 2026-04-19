@@ -133,6 +133,13 @@ fn run_one_hold(
                     }
                 }
                 Ok(None) => {}
+                Err(crate::conn::WsError::Closed { .. }) => {
+                    // Clean RFC 6455 Close handshake from the server —
+                    // WsHold's definition of "held" ends here. Not an
+                    // error; exit the inner loop so the worker returns
+                    // the stats it has.
+                    return stats;
+                }
                 Err(_) => {
                     stats.errors_read += 1;
                     return stats;

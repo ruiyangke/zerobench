@@ -75,6 +75,7 @@ impl ConnStats {
 /// Run one WS connection for at most `deadline` wall-clock time (or
 /// until `stop` fires). Sends text frames at `msg_rate_per_conn` with
 /// a monotonic-id prefix, recv-matches echoes, records RTT.
+#[allow(clippy::too_many_arguments)]
 fn run_one_echo_rtt(
     target: &Target,
     opts: &TransportOpts,
@@ -82,6 +83,8 @@ fn run_one_echo_rtt(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
+    live: Option<&zerobench_core::LiveSnapshot>,
+    scenario_id: u16,
 ) -> ConnStats {
     let mut stats = ConnStats::new();
 
@@ -159,9 +162,21 @@ fn run_one_echo_rtt(
         match recv_matching(&mut conn, prefix, deadline, stop) {
             Ok(bytes) => {
                 let rtt = Instant::now().saturating_duration_since(intended_start);
-                let _ = stats.rtt.record(duration_to_hist_ns(rtt));
+                let rtt_ns = duration_to_hist_ns(rtt);
+                let _ = stats.rtt.record(rtt_ns);
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(bytes as u64);
+                if let Some(live) = live {
+                    // Each matched echo is one op; latency = RTT.
+                    let blen = bytes as u64;
+                    live.record(rtt_ns, send_buf.len() as u64, blen);
+                    live.record_scenario(
+                        scenario_id,
+                        rtt_ns,
+                        send_buf.len() as u64,
+                        blen,
+                    );
+                }
             }
             Err(RecvErr::Timeout) => {
                 // Deadline fired while waiting for echo — stop cleanly.
@@ -199,17 +214,37 @@ fn recv_matching(
     // Try up to 100 frames before giving up — guards against server
     // pushing unrelated frames ahead of our echo.
     for _ in 0..100 {
-        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        if stop.load(Ordering::Relaxed) {
             return Err(RecvErr::Timeout);
         }
-        match conn.recv() {
-            Ok(DataFrame::Text(b)) | Ok(DataFrame::Binary(b)) => {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RecvErr::Timeout);
+        }
+        // Use try_recv so the underlying socket read respects the
+        // remaining deadline budget. Previously `conn.recv()` could
+        // block until the OS default socket timeout — minutes in the
+        // worst case — under backpressure. Under saturate runs that
+        // produced a per-connection stall that CO-corrupted the RTT
+        // histogram.
+        let budget = deadline - now;
+        match conn.try_recv(budget) {
+            Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 if b.len() >= prefix.len() && &b[..prefix.len()] == prefix {
                     return Ok(b.len());
                 }
                 // Not our frame — keep looking.
             }
-            Err(WsError::Io(_)) => return Err(RecvErr::Transport),
+            Ok(None) => {
+                // Deadline reached with no frame in hand.
+                return Err(RecvErr::Timeout);
+            }
+            Err(WsError::Closed { .. }) => {
+                // Server closed cleanly (Close handshake). Treat as
+                // timeout so the outer loop exits without flagging a
+                // transport error — the connection is simply gone.
+                return Err(RecvErr::Timeout);
+            }
             Err(_) => return Err(RecvErr::Transport),
         }
     }
@@ -236,12 +271,14 @@ fn write_hex16(v: u64, out: &mut Vec<u8>) {
 /// `hold_for` (from the plan) and `duration` (from the caller).
 ///
 /// Returns a `Vec<TaskStats>`, one per scenario.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ws_echo_rtt_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<zerobench_core::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -277,6 +314,8 @@ pub fn run_ws_echo_rtt_from_plan_threaded(
             duration,
             &stop,
             tls_config.clone(),
+            live.clone(),
+            sid as u16,
         );
 
         let mut task = TaskStats::new(num_scenarios);
@@ -319,6 +358,7 @@ struct ScenarioRollup {
     errors_write: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_echo_scenario(
     target: &Target,
     opts: &TransportOpts,
@@ -326,6 +366,8 @@ fn run_echo_scenario(
     duration: Duration,
     stop: &Arc<AtomicBool>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    scenario_id: u16,
 ) -> ScenarioRollup {
     // Deadline = `duration` (WsEchoRtt doesn't carry a hold_for — the
     // caller's duration is the bound).
@@ -338,10 +380,20 @@ fn run_echo_scenario(
             let plan = echo_plan.clone();
             let stop = Arc::clone(stop);
             let tls = tls_config.clone();
+            let live = live.clone();
             std::thread::Builder::new()
                 .name("zerobench-ws-echo-rtt".into())
                 .spawn(move || {
-                    run_one_echo_rtt(&target, &opts, &plan, deadline, &stop, tls.as_ref())
+                    run_one_echo_rtt(
+                        &target,
+                        &opts,
+                        &plan,
+                        deadline,
+                        &stop,
+                        tls.as_ref(),
+                        live.as_deref(),
+                        scenario_id,
+                    )
                 })
                 .expect("spawn ws-echo-rtt worker")
         })
@@ -613,6 +665,7 @@ mod tests {
             Duration::from_millis(500),
             None,
             None,
+            None,
         );
         assert_eq!(stats.len(), 1);
         let ws = stats[0].per_scenario[0].ws.as_ref().expect("ws extras");
@@ -643,6 +696,7 @@ mod tests {
             Duration::from_millis(500),
             None,
             None,
+            None,
         );
         let ts = &stats[0];
         assert!(ts.errors.connect >= 1);
@@ -660,6 +714,7 @@ mod tests {
             &TransportOpts::default(),
             &plan,
             Duration::from_millis(200),
+            None,
             None,
             None,
         );

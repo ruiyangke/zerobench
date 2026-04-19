@@ -250,6 +250,12 @@ fn run_one_subscriber(
                 stats.bytes_recv = stats.bytes_recv.saturating_add(b.len() as u64);
             }
             Ok(None) => {}
+            Err(crate::conn::WsError::Closed { .. }) => {
+                // Clean close from the server — the fanout subscriber's
+                // session has ended. Not an error; the stats we have
+                // are the stats we report.
+                break;
+            }
             Err(_) => {
                 stats.errors_read += 1;
                 return stats;
