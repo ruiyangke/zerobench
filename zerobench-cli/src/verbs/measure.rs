@@ -171,6 +171,9 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Plan construction
     // -------------------------------------------------------------------
 
+    // Capture the wall-clock start for .histlog interval timestamps.
+    let run_start_wall = SystemTime::now();
+
     let target = Target::parse(&args.url)?;
     let name = args
         .name
@@ -408,12 +411,30 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         writer.write_env(&env)?;
 
         // Phase 5b: emit result.json with the Summary projection.
-        // Phase 5c follow-up adds `.histlog` alongside.
         let mut export = summary.to_export();
         // Phase 8a: attach per-run metric vectors so the compare
         // engine can bootstrap CIs from the elementary samples.
         export.per_run = per_run;
         writer.write_result(&export)?;
+
+        // Phase 5c: canonical HDR-V2-compressed-log sidecar. Readable
+        // by HdrHistogram Plotter, jHiccup, wrk2 pipeline, any JVM
+        // HDR consumer. Carries the raw bucket counts — where
+        // result.json carries percentile snapshots.
+        let comment = format!(
+            "zerobench {} · plan={} · target={} · run_id={}",
+            env!("CARGO_PKG_VERSION"),
+            plan.name,
+            args.url,
+            id,
+        );
+        writer.write_histlog(
+            "result",
+            &summary.latency,
+            run_start_wall,
+            total_measured,
+            Some(&comment),
+        )?;
 
         let index = Index {
             schema_version: Index::SCHEMA_VERSION,

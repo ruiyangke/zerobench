@@ -39,8 +39,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use hdrhistogram::serialization::interval_log::IntervalLogWriterBuilder;
+use hdrhistogram::serialization::V2DeflateSerializer;
+use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineFingerprint;
@@ -326,12 +329,65 @@ impl ArchiveWriter {
     }
 
     /// Write `result.json` — the archive's record of what the run
-    /// measured. Phase 5b carries percentile + counts only; the
-    /// canonical HDR-V2-log `.histlog` sidecar lands in Phase 5c.
+    /// measured. Carries percentiles + counts.
+    ///
+    /// For the canonical raw HDR data, pair this with
+    /// [`ArchiveWriter::write_histlog`] which emits the HDR-V2
+    /// compressed-log format that external tooling (HdrHistogram
+    /// Plotter, jHiccup, wrk2) reads directly.
     pub fn write_result(&self, result: &SummaryExport) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(result)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.write_file("result.json", &bytes)
+    }
+
+    /// Write an HDR V2 compressed-log sidecar — `<name>.histlog` —
+    /// containing a single interval record for `hist`. `name` is the
+    /// artifact stem, conventionally `"result"` or `"warmup"`.
+    ///
+    /// `start` is the wall-clock instant the measurement began
+    /// (used verbatim in the interval's start-timestamp field). The
+    /// interval duration is `duration`. Optional `comment` lands as
+    /// a leading `#`-prefixed line and is typically something like
+    /// `"zerobench 0.1.0 result"`.
+    ///
+    /// Output format: documented at
+    /// <https://github.com/HdrHistogram/HdrHistogram/wiki/V2-Log-Encoding>.
+    /// Compatible with every mainstream reader that understands HDR
+    /// V2 logs (JVM ecosystem, wrk2 output, Coda Hale metrics).
+    pub fn write_histlog(
+        &self,
+        name: &str,
+        hist: &Histogram<u64>,
+        start: SystemTime,
+        duration: Duration,
+        comment: Option<&str>,
+    ) -> io::Result<()> {
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        {
+            let mut serializer = V2DeflateSerializer::new();
+            let mut builder = IntervalLogWriterBuilder::new();
+            builder.with_start_time(start);
+            let mut writer = builder
+                .begin_log_with(&mut buf, &mut serializer)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog begin: {e:?}")))?;
+
+            if let Some(c) = comment {
+                writer
+                    .write_comment(c)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog comment: {e:?}")))?;
+            }
+
+            // Use the same `SystemTime` base for both start and
+            // interval-offset: offset = `start.duration_since(start) = 0`.
+            writer
+                .write_histogram(hist, Duration::ZERO, duration, None)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog write: {e:?}")))?;
+            // IntervalLogWriter flushes on drop.
+        }
+
+        let file_name = format!("{name}.histlog");
+        self.write_file(&file_name, &buf)
     }
 
     /// Write `INDEX.json` last — acts as a completion marker. A reader
@@ -566,5 +622,91 @@ mod tests {
         env.set_ended();
         assert!(env.ended_at_unix.is_some());
         assert!(env.ended_at_unix.unwrap() >= env.started_at_unix);
+    }
+
+    #[test]
+    fn write_histlog_produces_readable_file() {
+        let root = tempdir();
+        let archive = Archive::at(&root);
+        let writer = ArchiveWriter::begin(&archive, "fp", "run-hlog").unwrap();
+
+        let mut hist: Histogram<u64> = Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+        for v in [100u64, 200, 1_000, 10_000, 100_000] {
+            hist.record(v).unwrap();
+        }
+        writer
+            .write_histlog(
+                "result",
+                &hist,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_744_000_000),
+                Duration::from_secs(5),
+                Some("zerobench test"),
+            )
+            .expect("write_histlog");
+
+        let path = writer.dir().join("result.histlog");
+        assert!(path.exists(), "{} missing", path.display());
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "histlog empty");
+
+        // The V2 log format is a mixed-text header + base64
+        // histogram records. Header lines begin with `#`.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with("#"),
+            "histlog should begin with a header line; got {:?}",
+            &text[..40.min(text.len())]
+        );
+        assert!(
+            text.contains("zerobench test"),
+            "user comment should appear in histlog"
+        );
+        // The histogram record itself is base64; it always contains
+        // a legend/column line after comments.
+        assert!(text.contains("HIST"), "expected HIST record marker");
+    }
+
+    #[test]
+    fn write_histlog_iterates_as_hdr_interval_log() {
+        use hdrhistogram::serialization::interval_log::{IntervalLogIterator, LogEntry};
+
+        let root = tempdir();
+        let archive = Archive::at(&root);
+        let writer = ArchiveWriter::begin(&archive, "fp", "run-hlog-rt").unwrap();
+
+        let mut hist: Histogram<u64> = Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+        for v in [50u64, 500, 5_000, 50_000] {
+            hist.record(v).unwrap();
+        }
+        writer
+            .write_histlog(
+                "result",
+                &hist,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_744_000_000),
+                Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+
+        // Round-trip via hdrhistogram's own iterator — validates that
+        // our emitted file is parseable by any HDR-V2-log reader. Full
+        // byte-level decode of the histogram body is owned by hdrhistogram's
+        // test suite; here we only care that we produce valid framing.
+        let bytes = fs::read(writer.dir().join("result.histlog")).unwrap();
+        let mut iter = IntervalLogIterator::new(&bytes);
+        let mut seen_interval = false;
+        while let Some(entry) = iter.next() {
+            let entry = entry.expect("parse entry");
+            if let LogEntry::Interval(ilh) = entry {
+                assert!(!ilh.encoded_histogram().is_empty(), "empty histogram record");
+                assert_eq!(
+                    ilh.duration(),
+                    Duration::from_secs(10),
+                    "duration field should round-trip",
+                );
+                seen_interval = true;
+            }
+        }
+        assert!(seen_interval, "expected at least one Interval entry");
     }
 }
