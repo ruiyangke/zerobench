@@ -26,7 +26,7 @@ use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{HeartbeatFrame, Plan, Protocol, Step, WsHoldPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::BenchRng;
+use zerobench_core::{BenchRng, LiveSnapshot};
 
 use crate::conn::WsConnection;
 
@@ -63,6 +63,7 @@ impl HoldStats {
 }
 
 /// Run one connection — connect, heartbeat loop, close on deadline.
+#[allow(clippy::too_many_arguments)]
 fn run_one_hold(
     target: &Target,
     opts: &TransportOpts,
@@ -70,6 +71,8 @@ fn run_one_hold(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
+    live: Option<&LiveSnapshot>,
+    scenario_id: u16,
 ) -> HoldStats {
     let mut stats = HoldStats::new();
     let path = extract_path(&plan.url);
@@ -112,8 +115,16 @@ fn run_one_hold(
             match conn.try_recv(nap) {
                 Ok(Some(frame)) => {
                     stats.frames_recv += 1;
-                    stats.bytes_recv =
-                        stats.bytes_recv.saturating_add(frame.len() as u64);
+                    let blen = frame.len() as u64;
+                    stats.bytes_recv = stats.bytes_recv.saturating_add(blen);
+                    if let Some(live) = live {
+                        // Op-count semantic for WsHold: each server-
+                        // side frame is a unit of work the server
+                        // delivered to us. Latency slot carries 0 —
+                        // there's no meaningful RTT axis for hold.
+                        live.record(1, 0, blen);
+                        live.record_scenario(scenario_id, 1, 0, blen);
+                    }
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -147,12 +158,14 @@ fn run_one_hold(
 }
 
 /// Drive all `WsHold` scenarios in `plan`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ws_hold_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -191,10 +204,21 @@ pub fn run_ws_hold_from_plan_threaded(
                 let plan = hold_plan.clone();
                 let stop = Arc::clone(&stop);
                 let tls = tls_config.clone();
+                let sid_u16 = sid as u16;
+                let live = live.clone();
                 std::thread::Builder::new()
                     .name("zerobench-ws-hold".into())
                     .spawn(move || {
-                        run_one_hold(&target, &opts, &plan, wall_deadline, &stop, tls.as_ref())
+                        run_one_hold(
+                            &target,
+                            &opts,
+                            &plan,
+                            wall_deadline,
+                            &stop,
+                            tls.as_ref(),
+                            live.as_deref(),
+                            sid_u16,
+                        )
                     })
                     .expect("spawn ws-hold worker")
             })

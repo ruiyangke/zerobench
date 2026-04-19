@@ -564,6 +564,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     args.duration,
                     target_rate,
                     tls_config.clone(),
+                    None,
                     stop,
                 )
             }
@@ -599,6 +600,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 &plan,
                                 args.duration,
                                 tls_config.clone(),
+                                None,
                                 stop,
                             )
                         }
@@ -609,6 +611,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 &plan,
                                 args.duration,
                                 tls_config.clone(),
+                                None,
                                 stop,
                             )
                         }
@@ -649,6 +652,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 &plan,
                                 args.duration,
                                 tls_config.clone(),
+                                None,
                                 stop,
                             )
                         }
@@ -659,6 +663,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 &plan,
                                 args.duration,
                                 tls_config.clone(),
+                                None,
                                 stop,
                             )
                         }
@@ -669,6 +674,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 &plan,
                                 args.duration,
                                 tls_config.clone(),
+                                None,
                                 stop,
                             )
                         }

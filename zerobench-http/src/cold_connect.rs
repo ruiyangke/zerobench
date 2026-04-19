@@ -34,6 +34,7 @@ use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_core::LiveSnapshot;
 
 use crate::mio_tls::{MioStream, MioTlsStream};
 use crate::raw_h1_common::build_raw_request;
@@ -45,6 +46,7 @@ const POLL_TOKEN: Token = Token(0);
 /// `connections` is the degree of parallelism (number of worker
 /// threads). `target_rps` bounds global throughput; `None` means
 /// saturate (fire as fast as each thread can).
+#[allow(clippy::too_many_arguments)]
 pub fn run_cold_connect_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
@@ -53,6 +55,7 @@ pub fn run_cold_connect_from_plan_threaded(
     duration: Duration,
     target_rps: Option<f64>,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let num_scenarios = plan.scenarios.len();
@@ -115,6 +118,7 @@ pub fn run_cold_connect_from_plan_threaded(
                 let stop = Arc::clone(&stop);
                 let elapsed = Arc::clone(&intended_elapsed_ns);
                 let tls = tls_config.clone();
+                let live = live.clone();
                 std::thread::Builder::new()
                     .name(format!("zerobench-cold-{worker_id}"))
                     .spawn(move || {
@@ -129,6 +133,7 @@ pub fn run_cold_connect_from_plan_threaded(
                             &elapsed,
                             interval_ns,
                             tls.as_ref(),
+                            live.as_deref(),
                             num_vars,
                             num_scenarios,
                             sid as u16,
@@ -163,6 +168,7 @@ fn run_worker(
     intended_elapsed_ns: &AtomicU64,
     interval_ns: u64,
     tls_config: Option<&Arc<ClientConfig>>,
+    live: Option<&LiveSnapshot>,
     num_vars: usize,
     num_scenarios: usize,
     scenario_id: u16,
@@ -248,14 +254,36 @@ fn run_worker(
                     outcome.request_bytes,
                     outcome.response_bytes,
                 );
+                if let Some(live) = live {
+                    let ns = total.as_nanos() as u64;
+                    live.record(ns, outcome.request_bytes, outcome.response_bytes);
+                    live.record_scenario(
+                        scenario_id,
+                        ns,
+                        outcome.request_bytes,
+                        outcome.response_bytes,
+                    );
+                }
                 // Classify 4xx/5xx.
                 if (400..500).contains(&outcome.status) {
                     task.record_error(scenario_id, ErrorKind::Status4xx);
+                    if let Some(live) = live {
+                        live.record_error(ErrorKind::Status4xx);
+                    }
                 } else if (500..600).contains(&outcome.status) {
                     task.record_error(scenario_id, ErrorKind::Status5xx);
+                    if let Some(live) = live {
+                        live.record_error(ErrorKind::Status5xx);
+                    }
                 }
             }
-            Err(e) => task.record_error(scenario_id, classify_err(e)),
+            Err(e) => {
+                let kind = classify_err(e);
+                task.record_error(scenario_id, kind);
+                if let Some(live) = live {
+                    live.record_error(kind);
+                }
+            }
         }
     }
 

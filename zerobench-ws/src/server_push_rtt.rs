@@ -28,7 +28,7 @@ use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_
 use zerobench_core::plan::{Plan, Protocol, Step, WsServerPushRttPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::BenchRng;
+use zerobench_core::{BenchRng, LiveSnapshot};
 
 use crate::conn::{DataFrame, WsConnection};
 
@@ -58,6 +58,7 @@ impl PushStats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one_push(
     target: &Target,
     opts: &TransportOpts,
@@ -65,6 +66,8 @@ fn run_one_push(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
+    live: Option<&LiveSnapshot>,
+    scenario_id: u16,
 ) -> PushStats {
     let mut stats = PushStats::new();
     let path = extract_path(&plan.url);
@@ -100,6 +103,13 @@ fn run_one_push(
                         duration_to_hist_ns(now.saturating_duration_since(prev))
                             .clamp(HIST_LO_NS, HIST_HI_NS);
                     let _ = stats.gap.record(gap);
+                    if let Some(live) = live {
+                        // Op-count semantic: each inbound frame is
+                        // one op; latency = inter-message gap.
+                        let blen = b.len() as u64;
+                        live.record(gap, 0, blen);
+                        live.record_scenario(scenario_id, gap, 0, blen);
+                    }
                 }
                 last_at = Some(now);
                 stats.messages_recv += 1;
@@ -127,12 +137,14 @@ fn run_one_push(
     stats
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_ws_server_push_rtt_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
+    live: Option<Arc<LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -171,10 +183,21 @@ pub fn run_ws_server_push_rtt_from_plan_threaded(
                 let plan = push_plan.clone();
                 let stop = Arc::clone(&stop);
                 let tls = tls_config.clone();
+                let live = live.clone();
+                let sid_u16 = sid as u16;
                 std::thread::Builder::new()
                     .name("zerobench-ws-push".into())
                     .spawn(move || {
-                        run_one_push(&target, &opts, &plan, wall_deadline, &stop, tls.as_ref())
+                        run_one_push(
+                            &target,
+                            &opts,
+                            &plan,
+                            wall_deadline,
+                            &stop,
+                            tls.as_ref(),
+                            live.as_deref(),
+                            sid_u16,
+                        )
                     })
                     .expect("spawn ws-push worker")
             })

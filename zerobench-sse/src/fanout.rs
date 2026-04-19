@@ -35,6 +35,7 @@ use zerobench_core::plan::{
 };
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_core::LiveSnapshot;
 use zerobench_http::mio_tls::MioStream;
 
 use crate::line_parser::{SseEvent, SseLineParser};
@@ -66,12 +67,20 @@ impl SubscriberStats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_sse_fanout_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
     _tls_config: Option<Arc<ClientConfig>>,
+    // LiveSnapshot plumbing is accepted for API symmetry but not
+    // populated yet — broadcast-RTT is computed post-hoc via
+    // trigger/event correlation, and per-event live recording would
+    // double-count because the fanout op-semantic is "one RTT per
+    // trigger per subscriber", not "one op per event". Wiring this
+    // cleanly is a follow-up; it doesn't fit the per-second window.
+    _live: Option<Arc<LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {

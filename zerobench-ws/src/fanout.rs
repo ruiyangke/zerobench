@@ -37,12 +37,15 @@ struct SubscriberStats {
     errors_read: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_ws_fanout_from_plan_threaded(
     target: &Target,
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
+    // See SseFanout for rationale on deferring live recording.
+    _live: Option<Arc<zerobench_core::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
