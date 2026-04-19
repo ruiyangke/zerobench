@@ -212,6 +212,19 @@ pub struct MeasureArgs {
     /// prefix is prepended automatically for correlation).
     #[arg(long = "ws-payload", default_value = "ping", help_heading = "WebSocket")]
     pub ws_payload: String,
+
+    // -------------------------------------------------------------------
+    // HTTP cold-connect
+    //
+    // Fresh TCP + TLS + HTTP connection per op — measures accept +
+    // handshake throughput separately from steady-state pool
+    // performance (PHILOSOPHY §4.2, design §3.1).
+    // -------------------------------------------------------------------
+    /// Open a fresh connection for every request — no pool reuse.
+    /// Records handshake + TTFB together as the primary latency;
+    /// meaningful only for HTTP targets.
+    #[arg(long = "cold-connect", action = ArgAction::SetTrue, help_heading = "HTTP")]
+    pub cold_connect: bool,
 }
 
 fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
@@ -458,7 +471,28 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             scenario_protocol,
         );
         let stop: Option<Arc<AtomicBool>> = None;
+        let first_http_is_cold = plan
+            .scenarios
+            .first()
+            .map(|s| {
+                s.steps.iter().any(|st| {
+                    matches!(st, zerobench_core::plan::Step::HttpColdConnect(_))
+                })
+            })
+            .unwrap_or(false);
         let stats = match scenario_protocol {
+            Protocol::Http if first_http_is_cold => {
+                zerobench_http::cold_connect::run_cold_connect_from_plan_threaded(
+                    &target,
+                    &opts,
+                    &plan,
+                    args.connections as u32,
+                    args.duration,
+                    target_rate,
+                    tls_config.clone(),
+                    stop,
+                )
+            }
             Protocol::Http => zerobench_http::mio_h1::run_mio_threaded(
                 &target,
                 &opts,
@@ -674,9 +708,8 @@ fn build_measure_plan(
             })],
         }
     } else {
-        // HTTP (Phase 7a MVP) — single-step GET. Multi-step scenarios
-        // go through `zerobench run` (Rhai) until Phase 7 wires
-        // richer CLI-built plans.
+        // HTTP — single-step GET. Multi-step scenarios
+        // go through `zerobench run` (Rhai).
         let request = RequestPlan {
             method: http::Method::GET,
             url,
@@ -694,10 +727,17 @@ fn build_measure_plan(
             },
         };
 
+        let step = if args.cold_connect {
+            Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan {
+                request,
+            })
+        } else {
+            Step::Request(request)
+        };
         Scenario {
             name: "measure".into(),
             rate,
-            steps: vec![Step::Request(request)],
+            steps: vec![step],
         }
     };
 
@@ -794,6 +834,7 @@ mod tests {
             ws_echo: None,
             ws_msg_rate: 100.0,
             ws_payload: "ping".to_string(),
+            cold_connect: false,
         }
     }
 

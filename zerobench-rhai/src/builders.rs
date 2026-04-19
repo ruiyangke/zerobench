@@ -394,6 +394,9 @@ pub(crate) struct RequestBuilderState {
     pub body: Option<BodySourceSpec>,
     pub extract: Vec<Extract>,
     pub checks: Vec<Assertion>,
+    /// If true, the finalize step emits `Step::HttpColdConnect` — one
+    /// fresh TCP+TLS+HTTP connection per request, no pool reuse.
+    pub cold: bool,
 }
 
 impl Default for RequestBuilderState {
@@ -410,6 +413,7 @@ impl Default for RequestBuilderState {
             body: None,
             extract: Vec::new(),
             checks: Vec::new(),
+            cold: false,
         }
     }
 }
@@ -437,6 +441,7 @@ impl RequestBuilder {
                 body: None,
                 extract: Vec::new(),
                 checks: Vec::new(),
+                cold: false,
             })),
         }
     }
@@ -690,6 +695,7 @@ fn compile_step(
                 body,
                 extract,
                 checks,
+                cold,
             } = state;
 
             let url_tpl = Template::compile(&url, vars).map_err(|e| {
@@ -736,7 +742,7 @@ fn compile_step(
                 }
             };
 
-            Ok(Step::Request(RequestPlan {
+            let request = RequestPlan {
                 method,
                 url: url_tpl,
                 headers: compiled_headers,
@@ -744,7 +750,14 @@ fn compile_step(
                 extract,
                 checks,
                 expect_streaming: false,
-            }))
+            };
+            Ok(if cold {
+                Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan {
+                    request,
+                })
+            } else {
+                Step::Request(request)
+            })
         }
     }
 }
@@ -1075,6 +1088,13 @@ fn register_request_builders(engine: &mut Engine) {
             b
         },
     );
+
+    // .cold_connect()  — fresh TCP+TLS+HTTP connection per request,
+    // no pool reuse. Compiles to Step::HttpColdConnect at finalize.
+    engine.register_fn("cold_connect", move |b: RequestBuilder| {
+        b.with_state(|s| s.cold = true);
+        b
+    });
 }
 
 fn register_sse_hold_builders(engine: &mut Engine) {
