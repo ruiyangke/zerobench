@@ -371,6 +371,14 @@ pub enum Subcommand {
     /// under `$ZEROBENCH_HOME/runs/<url_fp>/<run_id>/`. Default
     /// 60s × 3 runs with 15s warmup and 10s cooldown.
     Measure(crate::verbs::measure::MeasureArgs),
+    /// 5-second smoke test (v0.1.0). Small, opinionated, no archive,
+    /// no calibration gate — "does the target respond, roughly how
+    /// fast?" For rigorous measurements use `measure`.
+    Probe(crate::verbs::probe::ProbeArgs),
+    /// Compare two v0.1.0 `result.json` files and report percentile
+    /// deltas. Alternative to the top-level `Diff` subcommand (which
+    /// reads v0.0.1 format).
+    Compare(crate::verbs::diff::CompareArgs),
 }
 
 /// Arguments for `zerobench run <script.rhai>`.
@@ -786,6 +794,8 @@ mod tests {
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
+            Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
+            Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
         }
     }
 
@@ -806,6 +816,8 @@ mod tests {
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
+            Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
+            Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
         }
     }
 

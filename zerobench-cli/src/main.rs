@@ -53,6 +53,20 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             },
+            Subcommand::Probe(pa) => match verbs::probe::run(pa) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Compare(ca) => match verbs::diff::run(ca) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
         };
     }
 
