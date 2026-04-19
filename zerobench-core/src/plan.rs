@@ -631,7 +631,7 @@ fn default_emit_field() -> String {
 /// Wire-level protocol a scenario speaks. Inferred from the first
 /// non-Pause step; used by the CLI dispatcher to route scenarios to the
 /// right backend (HTTP / SSE / WS).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     /// HTTP request/response (via mio_h1 or mio_h2).
     Http,

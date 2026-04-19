@@ -158,15 +158,22 @@ pub fn print_terminal(
     }
 
     // -- latency percentiles ---------------------------------------------
+    //
+    // Phase 6c: protocol-aware source. For SSE-only plans we report
+    // chunk_gap (inter-event gap) from the scenario extras; for
+    // WS-only plans we report rtt. Mixed or HTTP plans use the
+    // aggregate `summary.latency` as before.
+    let (lat_label, lat_p50, lat_p90, lat_p99, lat_p999, lat_max) =
+        pick_latency_source(summary, plan);
     writeln!(
         out,
-        "{}        p50={}  p90={}  p99={}  p99.9={}  max={}",
-        p.bold("latency"),
-        p.green(&format_ns(summary.latency_p(50.0).as_nanos() as u64)),
-        p.green(&format_ns(summary.latency_p(90.0).as_nanos() as u64)),
-        p.yellow(&format_ns(summary.latency_p(99.0).as_nanos() as u64)),
-        p.yellow(&format_ns(summary.latency_p(99.9).as_nanos() as u64)),
-        p.red(&format_ns(summary.latency.max())),
+        "{}      p50={}  p90={}  p99={}  p99.9={}  max={}",
+        p.bold(lat_label),
+        p.green(&format_ns(lat_p50)),
+        p.green(&format_ns(lat_p90)),
+        p.yellow(&format_ns(lat_p99)),
+        p.yellow(&format_ns(lat_p999)),
+        p.red(&format_ns(lat_max)),
     )?;
 
     // -- errors -----------------------------------------------------------
@@ -681,6 +688,85 @@ fn pct_ns(summary: &Summary, pct: f64) -> u64 {
         0
     } else {
         summary.latency.value_at_percentile(pct)
+    }
+}
+
+/// Pick the right latency source + label for the terminal report's
+/// `latency`-line based on plan protocol.
+///
+/// - All scenarios HTTP → aggregate `summary.latency` (HTTP req/resp).
+/// - All scenarios SSE → sum per-scenario `sse.chunk_gap` histograms
+///   (inter-event gap — the primary SSE latency axis).
+/// - All scenarios WS → sum per-scenario `ws.rtt` histograms.
+/// - Mixed → aggregate `summary.latency` (HTTP-centric fallback; the
+///   per-scenario breakdown in the scenarios panel shows the rest).
+///
+/// Returns `(label, p50, p90, p99, p999, max)` all in nanoseconds.
+fn pick_latency_source(summary: &Summary, plan: &Plan) -> (&'static str, u64, u64, u64, u64, u64) {
+    let protocols: std::collections::HashSet<Protocol> =
+        plan.scenarios.iter().map(|s| s.protocol()).collect();
+
+    // Single-protocol fast paths.
+    if protocols.len() == 1 {
+        match protocols.iter().next().copied() {
+            Some(Protocol::Sse) => return sse_latency_from_scenarios(summary),
+            Some(Protocol::Ws) => return ws_latency_from_scenarios(summary),
+            _ => {}
+        }
+    }
+
+    // HTTP-or-mixed: aggregate.
+    let hist = &summary.latency;
+    let label = if protocols.len() > 1 { "latency" } else { "latency" };
+    (
+        label,
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(50.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(90.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.9) },
+        hist.max(),
+    )
+}
+
+fn sse_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
+    let mut agg = crate::histogram::new_hist();
+    for sc in &summary.per_scenario {
+        if let Some(sse) = sc.sse.as_ref() {
+            let _ = agg.add(&sse.chunk_gap);
+        }
+    }
+    if agg.is_empty() {
+        ("chunk-gap", 0, 0, 0, 0, 0)
+    } else {
+        (
+            "chunk-gap",
+            agg.value_at_percentile(50.0),
+            agg.value_at_percentile(90.0),
+            agg.value_at_percentile(99.0),
+            agg.value_at_percentile(99.9),
+            agg.max(),
+        )
+    }
+}
+
+fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
+    let mut agg = crate::histogram::new_hist();
+    for sc in &summary.per_scenario {
+        if let Some(ws) = sc.ws.as_ref() {
+            let _ = agg.add(&ws.rtt);
+        }
+    }
+    if agg.is_empty() {
+        ("rtt", 0, 0, 0, 0, 0)
+    } else {
+        (
+            "rtt",
+            agg.value_at_percentile(50.0),
+            agg.value_at_percentile(90.0),
+            agg.value_at_percentile(99.0),
+            agg.value_at_percentile(99.9),
+            agg.max(),
+        )
     }
 }
 
