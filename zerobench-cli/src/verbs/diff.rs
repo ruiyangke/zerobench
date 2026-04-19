@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Args;
+use zerobench_core::compare::{compare_all, CompareOptions, Metric, StrategyUsed};
 use zerobench_core::{LatencyExport, SummaryExport};
 
 // ---------------------------------------------------------------------------
@@ -173,7 +174,62 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let rows = compute_rows(&baseline, &current);
+
+    // Phase 8a: layer in the compare engine for CI and
+    // bootstrap-aware threshold gating. The raw-row path still
+    // drives display formatting (unchanged for back-compat).
+    let compare_opts = CompareOptions::default();
+    let results = compare_all(&baseline, &current, &compare_opts);
+    let used_bootstrap = results
+        .iter()
+        .any(|r| r.strategy == StrategyUsed::RunBootstrap);
+
     render_table(&baseline, &current, &rows, &args);
+
+    if used_bootstrap {
+        println!();
+        println!(
+            "bootstrap: {} resamples, seed 0x{:016x} (per-run N = A:{} / B:{})",
+            compare_opts.bootstrap_resamples,
+            compare_opts.seed,
+            results.first().map(|r| r.n_a).unwrap_or(0),
+            results.first().map(|r| r.n_b).unwrap_or(0),
+        );
+        println!("{:>10}  {:>22}", "metric", "95% CI on Δ");
+        for r in &results {
+            if let Some((lo, hi)) = r.ci {
+                let label = r.metric.label();
+                let unit = if matches!(r.metric, Metric::Rate) {
+                    "/s"
+                } else if matches!(r.metric, Metric::ErrorRate) {
+                    ""
+                } else {
+                    "ns"
+                };
+                // Render signed magnitudes. For ns-valued CIs the
+                // sign lives outside the formatted magnitude; for rate
+                // and ratio metrics we let the numeric formatter carry
+                // the sign natively (otherwise we get `--1.00/s`).
+                let cell = if unit == "ns" {
+                    let lo_sign = if lo < 0.0 { "-" } else { "+" };
+                    let hi_sign = if hi < 0.0 { "-" } else { "+" };
+                    format!(
+                        "[{}{}, {}{}]",
+                        lo_sign,
+                        fmt_ns(lo.abs() as u64),
+                        hi_sign,
+                        fmt_ns(hi.abs() as u64)
+                    )
+                } else if unit == "/s" {
+                    format!("[{lo:+.2}/s, {hi:+.2}/s]")
+                } else {
+                    // error_rate — absolute fraction, report with 5 sf.
+                    format!("[{lo:+.5}, {hi:+.5}]")
+                };
+                println!("{:>10}  {}", label, cell);
+            }
+        }
+    }
 
     // Apply regression gating if asked.
     let regressed = match &args.regress_on {
@@ -188,9 +244,32 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .map_err(|e| format!("--regress-on: {e}"))?;
             let mut any = false;
             for t in &thresholds {
-                if let Some(row) = rows.iter().find(|r| r.metric == t.metric) {
-                    let crossed = check_threshold(row.delta_pct, t);
-                    if crossed {
+                // Prefer the compare-engine result (uses CI when available)
+                // over raw-delta check. Map MetricId → Metric and find
+                // the result; fall back to raw-row path if not matched.
+                let engine_metric = metric_id_to_engine(t.metric);
+                if let Some(result) =
+                    results.iter().find(|r| r.metric == engine_metric)
+                {
+                    if result.regressed_beyond(t.delta.abs()) {
+                        let how = match result.strategy {
+                            StrategyUsed::RunBootstrap => "bootstrap-CI",
+                            StrategyUsed::RawDelta => "raw",
+                        };
+                        eprintln!(
+                            "regressed ({}): {} Δ={:+.2}% threshold={:+.2}%",
+                            how,
+                            t.metric.label(),
+                            result.delta_pct.unwrap_or(0.0) * 100.0,
+                            t.delta * 100.0,
+                        );
+                        any = true;
+                    }
+                } else if let Some(row) = rows.iter().find(|r| r.metric == t.metric) {
+                    // Metric not in engine canonical axes — fall back
+                    // to raw delta. In practice every MetricId maps to
+                    // a Metric, so this branch is dead defensive code.
+                    if check_threshold(row.delta_pct, t) {
                         eprintln!(
                             "regressed: {} delta {:+.2}% exceeds threshold {:+.2}%",
                             t.metric.label(),
@@ -204,6 +283,23 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             any
         }
     };
+
+    /// Project the diff-verb-local [`MetricId`] onto the engine's
+    /// [`Metric`]. The enums are distinct because the verb module
+    /// predates the engine and its canonical axis list; future
+    /// refactor can merge them.
+    fn metric_id_to_engine(m: MetricId) -> Metric {
+        match m {
+            MetricId::Rate => Metric::Rate,
+            MetricId::P50 => Metric::P50,
+            MetricId::P90 => Metric::P90,
+            MetricId::P99 => Metric::P99,
+            MetricId::P99_9 => Metric::P99_9,
+            MetricId::P99_99 => Metric::P99_99,
+            MetricId::Max => Metric::Max,
+            MetricId::ErrorRate => Metric::ErrorRate,
+        }
+    }
 
     Ok(if regressed {
         ExitCode::from(1)
@@ -474,6 +570,7 @@ mod tests {
                 assertion_failed: 0,
             },
             scenarios: Vec::new(),
+            per_run: Vec::new(),
         }
     }
 

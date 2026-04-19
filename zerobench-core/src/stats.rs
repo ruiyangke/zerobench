@@ -531,6 +531,31 @@ pub struct SummaryExport {
     pub errors: ErrorCountersExport,
     /// Per-scenario breakdown.
     pub scenarios: Vec<ScenarioExport>,
+    /// Per-run metric vectors, one entry per individual run when
+    /// `--runs N > 1`. Empty when the caller merged all runs into a
+    /// single aggregate (e.g. `probe`, `--runs 1`). Bootstrap CI
+    /// (§9.3 `run-bootstrap` strategy) resamples these values when
+    /// both sides of a `compare` have `per_run.len() ≥ 3`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_run: Vec<PerRunMetrics>,
+}
+
+/// Metrics captured from a single run — the elementary unit the
+/// run-level bootstrap resamples over. One entry per `--runs` loop
+/// iteration in `measure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerRunMetrics {
+    /// Run index (0-based) within this `measure` invocation.
+    pub index: u32,
+    /// Achieved rate (req/s) over the run's duration.
+    pub rate_per_s: f64,
+    /// Run-level request count.
+    pub requests: u64,
+    /// Run-level error total (sum across categories).
+    pub errors_total: u64,
+    /// Run-level latency percentiles. Extracted from the run's
+    /// HDR histogram before it was folded into the aggregate.
+    pub latency: LatencyExport,
 }
 
 impl SummaryExport {
@@ -731,6 +756,7 @@ impl Summary {
                     ws: s.ws.as_ref().map(WsExtrasExport::from),
                 })
                 .collect(),
+            per_run: Vec::new(),
         }
     }
 }

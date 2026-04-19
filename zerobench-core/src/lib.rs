@@ -4,6 +4,7 @@
 
 pub mod archive;
 pub mod calibrate;
+pub mod compare;
 pub mod fingerprint;
 pub mod histogram;
 pub mod live_snapshot;
@@ -42,9 +43,14 @@ pub use request_file::{
 };
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
+pub use compare::{
+    compare_all, compare_metric, CompareOptions, ComparisonResult, Metric, Significance,
+    StrategyUsed,
+};
 pub use stats::{
-    ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, ScenarioExport, ScenarioStats,
-    SseExtras, SseExtrasExport, Summary, SummaryExport, TaskStats, WsExtras, WsExtrasExport,
+    ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, PerRunMetrics, ScenarioExport,
+    ScenarioStats, SseExtras, SseExtrasExport, Summary, SummaryExport, TaskStats, WsExtras,
+    WsExtrasExport,
 };
 pub use stop::StopSignal;
 pub use template::{ExpandCtx, Template, TemplateError};

@@ -43,6 +43,7 @@ use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step}
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
+use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::{ColorChoice, Summary, SummaryExport, TaskStats};
 
 // ---------------------------------------------------------------------------
@@ -308,6 +309,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     );
 
     let mut all_stats: Vec<TaskStats> = Vec::new();
+    let mut per_run: Vec<PerRunMetrics> = Vec::new();
     for run_idx in 0..args.runs {
         if run_idx > 0 && !args.cooldown.is_zero() {
             eprintln!(
@@ -355,6 +357,25 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         );
         let run_requests: u64 = stats.iter().map(|s| s.requests).sum();
         eprintln!("[run {}/{}] {} requests", run_idx + 1, args.runs, run_requests);
+
+        // Phase 8a: capture per-run metrics before merging into the
+        // aggregate. These are the elementary samples the bootstrap
+        // CI resamples over. Cloning TaskStats here is cheap (HDR
+        // histograms are contiguous u64 arrays; for typical bounds
+        // that's ~30 KiB per stat).
+        let run_summary = Summary::merge(stats.clone(), args.duration);
+        per_run.push(PerRunMetrics {
+            index: run_idx,
+            rate_per_s: run_summary.requests_per_sec(),
+            requests: run_summary.requests,
+            errors_total: run_summary.errors.total(),
+            latency: LatencyExport::from_hist(&run_summary.latency),
+        });
+        // Silence unused-import warning when LatencyExport /
+        // ErrorCountersExport / PerRunMetrics happen not to be used
+        // in some build configurations.
+        let _ = std::marker::PhantomData::<(LatencyExport, ErrorCountersExport)>::default();
+
         all_stats.extend(stats);
     }
 
@@ -388,7 +409,10 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
         // Phase 5b: emit result.json with the Summary projection.
         // Phase 5c follow-up adds `.histlog` alongside.
-        let export = summary.to_export();
+        let mut export = summary.to_export();
+        // Phase 8a: attach per-run metric vectors so the compare
+        // engine can bootstrap CIs from the elementary samples.
+        export.per_run = per_run;
         writer.write_result(&export)?;
 
         let index = Index {
