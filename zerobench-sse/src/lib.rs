@@ -21,7 +21,10 @@
 //! connection for each iteration. N workers × 1 connection each, all
 //! concurrent.
 
+pub mod hold;
 pub mod line_parser;
+
+pub use hold::run_sse_hold_from_plan_threaded;
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
