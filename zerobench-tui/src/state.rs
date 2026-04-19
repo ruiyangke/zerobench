@@ -357,9 +357,9 @@ pub struct DashboardState {
 
     /// User toggled via `p` — renderer skips `terminal.draw` when set.
     pub paused_rendering: bool,
-    /// User toggled via `l` — renderer shows a "log (stub)" panel when
-    /// set. v0.0.1 has no real log content; this is a scaffolded
-    /// toggle for future use.
+    /// User toggled via `l` — renderer shows a log panel when set.
+    /// Currently a placeholder until per-op log lines flow through
+    /// `LiveSnapshot`.
     pub log_visible: bool,
     /// `q` pressed — main loop breaks on the next iteration.
     pub exit_requested: bool,

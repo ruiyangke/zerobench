@@ -81,7 +81,7 @@ pub enum RequestFileError {
     /// the source name, line number, and offending text.
     #[error("invalid request line: {0}")]
     InvalidRequestLine(String),
-    /// `HTTP/2` or later in the request line. Phase D only speaks HTTP/1.x.
+    /// `HTTP/2` or later in the request line. only speaks HTTP/1.x.
     #[error("unsupported HTTP version: {0}")]
     UnsupportedVersion(String),
     /// A header line did not contain a `:` separator. The inner string
@@ -320,7 +320,7 @@ pub fn parse_request_bytes(
         }
         // We assume plain HTTP for relative paths. TLS users should either
         // use an absolute URL in the request line or wrap with `--url`
-        // override (outside the scope of the v0.0.1 parser).
+        // override (outside the scope of this parser).
         let full = format!("http://{host}{raw_target}");
         let target = Target::parse(&full)?;
         (target, full)

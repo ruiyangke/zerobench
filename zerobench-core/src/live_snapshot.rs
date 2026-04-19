@@ -6,25 +6,25 @@
 //! empty histogram, reset counters, and hand the previous bucket to the
 //! reporter.
 //!
-//! # Design: "swap histogram each tick" vs t-digest
+//! # Design: sharded HDR histograms
 //!
-//! We deliberately use a per-second-bucket HDR histogram that gets
-//! swapped on each tick, rather than a streaming t-digest. Rationale:
+//! The latency histogram is sharded across [`LATENCY_SHARDS`] mutexes
+//! keyed by a per-thread hash. A single-mutex design was serialising
+//! every worker at ~1M req/s; each thread sticking to its own shard
+//! reduces expected contention to `1/SHARDS` of what a round-robin or
+//! single-mutex layout would produce.
 //!
-//! - HDR histograms are already a project dependency.
-//! - Per-second buckets give *exact* percentiles for the window that
-//!   the tick actually represents, rather than an approximation over
-//!   the whole run.
-//! - The cost of swapping a `Histogram<u64>` is a single `parking_lot`
-//!   mutex acquire on the ticker path (once per second) and a mutex
-//!   acquire per recorded sample on the worker path; the latter is
-//!   amortised against the much more expensive network roundtrip, so
-//!   it is not on the critical hot path.
+//! On tick, the ticker walks all shards, swaps each one for a fresh
+//! `Histogram`, and merges the previous buckets into one result. The
+//! merge cost (~16 HDR adds per second) is negligible next to the
+//! per-sample lock-contention savings on the worker path.
 //!
-//! If per-sample mutex contention ever shows up in profiling we can
-//! switch to a sharded `Vec<Mutex<Histogram>>` keyed by worker thread
-//! id, but that's a Phase-E optimisation, not Phase D.
+//! **Why not t-digest?** Per-second HDR buckets give *exact*
+//! percentiles for the window; t-digest is an approximation we don't
+//! need when the samples fit in memory — which they always do for a
+//! one-second bucket.
 
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +33,52 @@ use hdrhistogram::Histogram;
 use parking_lot::Mutex;
 
 use crate::stats::{ErrorCounters, ErrorKind};
+
+// ---------------------------------------------------------------------------
+// Sharding — number of latency-histogram mutexes.
+// ---------------------------------------------------------------------------
+
+/// Number of shards for the aggregate and per-scenario latency
+/// histograms. Must be a power of two — the shard-picker masks with
+/// `SHARDS - 1` instead of a modulo for branch-free indexing.
+///
+/// 16 is enough to cover typical bench worker counts (4..32) without
+/// contention; larger counts share shards but under load the sample
+/// bursts still spread out because different threads generally hash
+/// to different shards.
+const LATENCY_SHARDS: usize = 16;
+const LATENCY_SHARDS_MASK: usize = LATENCY_SHARDS - 1;
+
+/// Pick a per-thread shard index deterministically from the thread's
+/// id. Cached in a thread-local so each thread computes the hash once
+/// and reuses it for every `record` call.
+///
+/// Using `ThreadId`'s stable hash keeps the workload balanced across
+/// shards regardless of scheduler whim: thread A always writes to the
+/// same shard, thread B to a different one, so two hot threads never
+/// contend unless they happen to land on the same slot (1-in-SHARDS
+/// collision).
+fn pick_shard() -> usize {
+    thread_local! {
+        static SHARD: std::cell::Cell<Option<usize>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
+    SHARD.with(|cell| {
+        if let Some(s) = cell.get() {
+            return s;
+        }
+        // `DefaultHasher` is std's FxHash-equivalent — cheap and
+        // high-quality for the single hash-per-thread we do here.
+        let tid = std::thread::current().id();
+        let mut h = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .build_hasher();
+        std::hash::Hash::hash(&tid, &mut h);
+        let s = (h.finish() as usize) & LATENCY_SHARDS_MASK;
+        cell.set(Some(s));
+        s
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Histogram bounds — match TaskStats' so the bucket sizes align.
@@ -118,12 +164,15 @@ pub struct LiveSnapshot {
     bytes_recv: AtomicU64,
     /// Error counters since the last swap.
     errors: AtomicLiveErrors,
-    /// Latency samples for this bucket. Mutex is acquired on every
-    /// sample; see the module-level doc for why that's OK.
-    latency_bucket: Mutex<Histogram<u64>>,
+    /// Sharded latency histograms. Writers hash their thread id to
+    /// `LATENCY_SHARDS_MASK` and acquire only that shard's mutex;
+    /// the ticker merges across shards on swap. Boxed to keep the
+    /// per-`LiveSnapshot` footprint bounded and allocated once at
+    /// construction.
+    latency_shards: Box<[Mutex<Histogram<u64>>; LATENCY_SHARDS]>,
     /// Per-scenario live counters. Initialized with `num_scenarios` slots.
     /// Index = scenario_id. Each slot tracks its own requests + errors
-    /// + latency histogram (behind a Mutex, same pattern as the aggregate).
+    /// + latency histogram (sharded, same pattern as the aggregate).
     scenario_counters: Vec<ScenarioLiveSlot>,
 }
 
@@ -133,7 +182,22 @@ struct ScenarioLiveSlot {
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
     errors: AtomicLiveErrors,
-    latency: Mutex<Histogram<u64>>,
+    /// Sharded histogram, matching the aggregate layout. `Box`ed so the
+    /// per-scenario memory (~16 · 30 KiB ≈ 480 KiB) lives on the heap;
+    /// the per-`LiveSnapshot` footprint grows as `N_scenarios · 480 KiB`.
+    latency_shards: Box<[Mutex<Histogram<u64>>; LATENCY_SHARDS]>,
+}
+
+fn new_shard_array() -> Box<[Mutex<Histogram<u64>>; LATENCY_SHARDS]> {
+    // `array::from_fn` can't be used with a closure that captures state
+    // AND produces a `Mutex<Histogram>` in a no-alloc way, so we build
+    // the array via a vector and unwrap into a boxed array. The boxing
+    // avoids a 480 KiB stack object at construction time.
+    let vec: Vec<Mutex<Histogram<u64>>> =
+        (0..LATENCY_SHARDS).map(|_| Mutex::new(new_hist())).collect();
+    vec.into_boxed_slice()
+        .try_into()
+        .expect("LATENCY_SHARDS vec always has the right length")
 }
 
 impl LiveSnapshot {
@@ -147,7 +211,7 @@ impl LiveSnapshot {
                 bytes_sent: AtomicU64::new(0),
                 bytes_recv: AtomicU64::new(0),
                 errors: AtomicLiveErrors::default(),
-                latency: Mutex::new(new_hist()),
+                latency_shards: new_shard_array(),
             })
             .collect();
         Arc::new(Self {
@@ -156,7 +220,7 @@ impl LiveSnapshot {
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
             errors: AtomicLiveErrors::default(),
-            latency_bucket: Mutex::new(new_hist()),
+            latency_shards: new_shard_array(),
             scenario_counters,
         })
     }
@@ -165,13 +229,19 @@ impl LiveSnapshot {
     /// to the histogram's configured bounds (workers use the same
     /// `duration_to_hist_ns` helper as `TaskStats::record`, reachable
     /// indirectly through this method's caller).
+    ///
+    /// The sample is appended to this thread's shard — under realistic
+    /// loads with `threads >> LATENCY_SHARDS` each shard sees roughly
+    /// `threads / LATENCY_SHARDS` concurrent writers, not `threads`,
+    /// which is where the S3 contention win comes from.
     pub fn record(&self, latency_ns: u64, bytes_sent: u64, bytes_recv: u64) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
         self.bytes_recv.fetch_add(bytes_recv, Ordering::Relaxed);
         let ns = clamp_ns(latency_ns);
+        let shard = &self.latency_shards[pick_shard()];
+        let mut bucket = shard.lock();
         // `record` can only fail for out-of-range; we just clamped.
-        let mut bucket = self.latency_bucket.lock();
         let _ = bucket.record(ns);
     }
 
@@ -195,7 +265,8 @@ impl LiveSnapshot {
             slot.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
             slot.bytes_recv.fetch_add(bytes_recv, Ordering::Relaxed);
             let ns = clamp_ns(latency_ns);
-            let mut h = slot.latency.lock();
+            let shard = &slot.latency_shards[pick_shard()];
+            let mut h = shard.lock();
             let _ = h.record(ns);
         }
     }
@@ -216,11 +287,7 @@ impl LiveSnapshot {
         let bytes_sent = self.bytes_sent.swap(0, Ordering::Relaxed);
         let bytes_recv = self.bytes_recv.swap(0, Ordering::Relaxed);
         let errors = self.errors.swap_all();
-        let latency = {
-            let mut bucket = self.latency_bucket.lock();
-            let fresh = new_hist();
-            std::mem::replace(&mut *bucket, fresh)
-        };
+        let latency = merge_shards(&self.latency_shards);
         let per_scenario: Vec<ScenarioTick> = self
             .scenario_counters
             .iter()
@@ -229,10 +296,7 @@ impl LiveSnapshot {
                 bytes_sent: slot.bytes_sent.swap(0, Ordering::Relaxed),
                 bytes_recv: slot.bytes_recv.swap(0, Ordering::Relaxed),
                 errors: slot.errors.swap_all(),
-                latency: {
-                    let mut h = slot.latency.lock();
-                    std::mem::replace(&mut *h, new_hist())
-                },
+                latency: merge_shards(&slot.latency_shards),
             })
             .collect();
         LiveTick {
@@ -311,6 +375,24 @@ fn clamp_ns(ns: u64) -> u64 {
     }
 }
 
+/// Atomically swap each shard with a fresh empty histogram and merge
+/// the previous buckets into one. Runs once per tick; per-shard mutex
+/// hold is strictly shorter than the record path, so writers never
+/// observe the merge window.
+fn merge_shards(shards: &[Mutex<Histogram<u64>>; LATENCY_SHARDS]) -> Histogram<u64> {
+    let mut merged = new_hist();
+    for shard in shards.iter() {
+        let prev = {
+            let mut guard = shard.lock();
+            std::mem::replace(&mut *guard, new_hist())
+        };
+        // `add` can fail only on incompatible bounds — every shard is
+        // built with the same `new_hist` so this is unreachable.
+        let _ = merged.add(&prev);
+    }
+    merged
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -361,6 +443,53 @@ mod tests {
         assert_eq!(clamp_ns(0), HIST_LO_NS);
         assert_eq!(clamp_ns(500), 500);
         assert_eq!(clamp_ns(u64::MAX), HIST_HI_NS);
+    }
+
+    #[test]
+    fn many_threads_record_concurrently_all_samples_survive() {
+        // Regression cover for the S3 sharding refactor: N threads
+        // each record M samples. After swap the total sample count
+        // and request counter must equal N * M, regardless of how
+        // the hash-based shard assignment played out.
+        let live = LiveSnapshot::new(1);
+        const THREADS: usize = 32;
+        const PER_THREAD: u64 = 2_000;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let live = Arc::clone(&live);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    // Spread latencies across shards so the merged
+                    // histogram's percentiles would visibly break
+                    // if a shard were dropped.
+                    let lat_ns = 10_000 + ((t as u64) * 1000) + i;
+                    live.record(lat_ns, 10, 20);
+                    live.record_scenario(0, lat_ns, 10, 20);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let tick = live.swap_and_snapshot();
+        let expected = (THREADS as u64) * PER_THREAD;
+        assert_eq!(tick.requests, expected);
+        assert_eq!(tick.latency.len(), expected);
+        assert_eq!(tick.per_scenario[0].requests, expected);
+        assert_eq!(tick.per_scenario[0].latency.len(), expected);
+    }
+
+    #[test]
+    fn pick_shard_is_stable_per_thread() {
+        // Calling `pick_shard` repeatedly from the same thread must
+        // return the same slot — the thread-local caching is what
+        // keeps hash cost out of the record hot path.
+        let first = pick_shard();
+        for _ in 0..1_000 {
+            assert_eq!(pick_shard(), first);
+        }
     }
 
     #[test]

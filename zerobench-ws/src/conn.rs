@@ -5,7 +5,7 @@
 //! frame codec and below the benchmark loop:
 //!
 //! ```text
-//!     run_ws_threaded
+//!     run_ws_echo_rtt_from_plan_threaded
 //!       └── WsConnection ← this module
 //!             └── frame  ← zerobench_ws::frame
 //!                 └── MioStream (plain or TLS)
@@ -29,7 +29,7 @@
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use mio::net::TcpStream;
@@ -58,7 +58,7 @@ pub enum WsError {
     /// A frame decode problem — bad RSV bits, masked server frame,
     /// oversized control frame, etc. Connection is fatal after this.
     #[error("frame: {0}")]
-    Frame(#[from] frame::WsError),
+    Frame(#[from] frame::FrameError),
 
     /// A close frame arrived. Not really an error — the caller decides
     /// whether to count it, but the variant exists so the recv loop
@@ -186,9 +186,9 @@ impl WsConnection {
         // --- Optional TLS handshake ---
         //
         // For TLS targets, `MioTlsStream::complete_handshake` handles
-        // both waiting for TCP connect to complete (Phase 1) and driving
-        // the TLS state machine (Phase 2). We skip `wait_for_tcp_connect`
-        // to avoid consuming the mio edge event that Phase 1 needs.
+        // both waiting for TCP connect to complete and driving
+        // the TLS state machine. We skip `wait_for_tcp_connect`
+        // to avoid consuming the mio edge event the connect step needs.
         //
         // For plain TCP, we wait for the connect event ourselves before
         // writing the WS upgrade request.
@@ -199,7 +199,7 @@ impl WsConnection {
             let sni = target.sni_name().to_string();
             let mut tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
                 .map_err(|e| WsError::Tls(format!("tls init: {e}")))?;
-            tls.complete_handshake(&mut poll, token)
+            tls.complete_handshake(&mut poll, token, opts.connect_timeout)
                 .map_err(|e| WsError::Tls(format!("tls handshake: {e}")))?;
             poll.registry()
                 .reregister(tls.tcp_stream_mut(), token, Interest::READABLE | Interest::WRITABLE)
@@ -291,7 +291,31 @@ impl WsConnection {
 
     /// Send a Pong frame with the given payload.
     fn send_pong(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Frame(frame::FrameError::ControlFrameTooLarge(
+                payload.len(),
+            )));
+        }
         self.send_frame(Opcode::Pong, payload)
+    }
+
+    /// Send a Ping frame (RFC 6455 §5.5.2) with the given payload.
+    /// Compliant servers auto-reply with Pong. Used by `WsHold`
+    /// heartbeats where the client wants to keep a proxy's idle
+    /// timeout at bay.
+    ///
+    /// RFC 6455 §5.5 caps control-frame payloads at 125 bytes. An
+    /// oversized ping is rejected locally rather than put on the wire:
+    /// any RFC 6455 server that read it would tear the connection down
+    /// on the client's behalf, producing a hard-to-diagnose "transport
+    /// closed" error on the next recv.
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Frame(frame::FrameError::ControlFrameTooLarge(
+                payload.len(),
+            )));
+        }
+        self.send_frame(Opcode::Ping, payload)
     }
 
     /// Wait for the next data message.
@@ -316,10 +340,50 @@ impl WsConnection {
                         None => continue,
                     }
                 }
-                Err(frame::WsError::NeedMore { needed }) => {
+                Err(frame::FrameError::NeedMore { needed }) => {
                     self.fill_recv_buf(needed)?;
                 }
                 Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Like [`recv`] but returns `Ok(None)` once `timeout` elapses with
+    /// no data frame arriving. Control frames (Ping/Pong/Close) are
+    /// still handled transparently, so this also keeps auto-Pong alive
+    /// for callers that need bounded waits (e.g. `WsHold` between
+    /// heartbeats; `WsServerPushRtt` deadline polling).
+    pub fn try_recv(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<DataFrame>, WsError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match frame::decode_frame(&self.recv_buf) {
+                Ok(hdr) => {
+                    let frame_bytes = self.recv_buf.split_to(hdr.total_len);
+                    match self.handle_frame(hdr, frame_bytes.freeze())? {
+                        Some(f) => return Ok(Some(f)),
+                        None => continue,
+                    }
+                }
+                Err(frame::FrameError::NeedMore { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            match read_some_timed(
+                &mut self.stream,
+                &mut self.recv_buf,
+                &mut self.poll,
+                &mut self.events,
+                deadline - now,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => return Ok(None),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -338,7 +402,7 @@ impl WsConnection {
         match hdr.opcode {
             Opcode::Text | Opcode::Binary => {
                 if self.fragment.is_some() {
-                    return Err(WsError::Frame(frame::WsError::ProtocolOther(
+                    return Err(WsError::Frame(frame::FrameError::ProtocolOther(
                         "new data frame without finishing previous fragment".into(),
                     )));
                 }
@@ -356,7 +420,7 @@ impl WsConnection {
                 let (opcode, buf) = match self.fragment.as_mut() {
                     Some(f) => f,
                     None => {
-                        return Err(WsError::Frame(frame::WsError::ProtocolOther(
+                        return Err(WsError::Frame(frame::FrameError::ProtocolOther(
                             "continuation frame without preceding text/binary".into(),
                         )));
                     }
@@ -560,6 +624,45 @@ fn read_some_bytes_into(
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let _ = poll.poll(events, Some(Duration::from_millis(100)));
+                stream.flush_tls();
+            }
+            Err(e) => return Err(WsError::Io(e)),
+        }
+    }
+}
+
+/// Like [`read_some_bytes_into`] but bounded by a caller-supplied
+/// timeout. Returns `Ok(true)` when some bytes were read, `Ok(false)`
+/// on timeout, and `Err` on EOF or hard I/O failure.
+fn read_some_timed(
+    stream: &mut MioStream,
+    buf: &mut BytesMut,
+    poll: &mut Poll,
+    events: &mut Events,
+    timeout: Duration,
+) -> Result<bool, WsError> {
+    let deadline = Instant::now() + timeout;
+    let mut tmp = [0u8; 4096];
+    loop {
+        stream.flush_tls();
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                return Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed before frame completed",
+                )));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                return Ok(true);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                let wait = (deadline - now).min(Duration::from_millis(100));
+                let _ = poll.poll(events, Some(wait));
                 stream.flush_tls();
             }
             Err(e) => return Err(WsError::Io(e)),

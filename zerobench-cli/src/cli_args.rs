@@ -12,7 +12,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 
 /// Return the number of available CPU cores, falling back to 1 if the
 /// query fails (e.g. inside a restricted container).
-fn num_cpus() -> usize {
+pub fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -233,26 +233,6 @@ pub struct CliArgs {
           help_heading = "Protocol")]
     pub http2_prior_knowledge: bool,
 
-    /// Benchmark SSE streams instead of one-shot HTTP. `-c N` =
-    /// concurrent streams. Reporter adds an SSE block.
-    #[cfg(feature = "sse")]
-    #[arg(long = "sse", action = ArgAction::SetTrue,
-          help_heading = "Protocol")]
-    pub sse: bool,
-
-    /// Benchmark WebSocket RTT (RFC 6455) instead of one-shot HTTP.
-    /// `-c N` = concurrent connections. Accepts `ws://` and `wss://`.
-    #[cfg(feature = "ws")]
-    #[arg(long = "ws", action = ArgAction::SetTrue,
-          help_heading = "Protocol")]
-    pub ws: bool,
-
-    /// WebSocket payload per iteration (default `ping`). Sent as a text frame.
-    #[cfg(feature = "ws")]
-    #[arg(long = "message", default_value = "ping",
-          help_heading = "Protocol")]
-    pub ws_message: String,
-
     // ---------- Network ----------
 
     /// TCP+TLS connect timeout.
@@ -365,6 +345,25 @@ pub enum Subcommand {
     /// benchmark runs as pure Rust.
     #[cfg(feature = "script")]
     Run(RunArgs),
+    /// Rigorous steady-state measurement (v0.1.0). Runs N consecutive
+    /// benchmark runs against `URL` with warmup + cooldown, ships
+    /// through the client self-check gate, and archives the result
+    /// under `$ZEROBENCH_HOME/runs/<url_fp>/<run_id>/`. Default
+    /// 60s × 3 runs with 15s warmup and 10s cooldown.
+    Measure(crate::verbs::measure::MeasureArgs),
+    /// 5-second smoke test (v0.1.0). Small, opinionated, no archive,
+    /// no calibration gate — "does the target respond, roughly how
+    /// fast?" For rigorous measurements use `measure`.
+    Probe(crate::verbs::probe::ProbeArgs),
+    /// Compare two `result.json` files and report percentile deltas.
+    Compare(crate::verbs::diff::CompareArgs),
+    /// Run the client-side self-check (loopback echo) and print the
+    /// ceiling + scheduler jitter. Useful for "what's the fastest
+    /// my machine can push?" without a target.
+    Calibrate(crate::verbs::calibrate::CalibrateArgs),
+    /// Ramp offered rate across --from..--to over --over; report the
+    /// (rate, p99) curve and the knee. Per PHILOSOPHY §P4.
+    Curve(crate::verbs::curve::CurveArgs),
 }
 
 /// Arguments for `zerobench run <script.rhai>`.
@@ -779,6 +778,11 @@ mod tests {
             }
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
+            Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
+            Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
+            Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
+            Subcommand::Calibrate(_) => panic!("expected Diff, got Calibrate"),
+            Subcommand::Curve(_) => panic!("expected Diff, got Curve"),
         }
     }
 
@@ -798,6 +802,11 @@ mod tests {
             }
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
+            Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
+            Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
+            Subcommand::Compare(_) => panic!("expected Diff, got Compare"),
+            Subcommand::Calibrate(_) => panic!("expected Diff, got Calibrate"),
+            Subcommand::Curve(_) => panic!("expected Diff, got Curve"),
         }
     }
 

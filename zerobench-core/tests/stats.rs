@@ -1,4 +1,4 @@
-//! Integration tests for the Phase 1 stats primitives.
+//! Integration tests for the stats primitives.
 //!
 //! These ensure that nanosecond precision, per-scenario roll-up, and
 //! merge semantics all behave as the reporter will eventually rely on.

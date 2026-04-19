@@ -18,6 +18,7 @@ use zerobench_core::{
 mod cli_args;
 mod diff;
 mod plan_from_cli;
+mod verbs;
 
 use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
@@ -42,6 +43,41 @@ fn main() -> ExitCode {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Measure(ma) => match verbs::measure::run(ma) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Probe(pa) => match verbs::probe::run(pa) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Compare(ca) => match verbs::diff::run(ca) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Calibrate(ca) => match verbs::calibrate::run(ca) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Curve(cv) => match verbs::curve::run(cv) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
                     ExitCode::from(2)
                 }
             },
@@ -244,16 +280,9 @@ fn build_transport_info(
 fn run_mio_sync(
     args: &CliArgs,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // SSE and WS take dedicated paths — no shared dispatch with H1/H2.
-    #[cfg(feature = "sse")]
-    if args.sse {
-        return run_sse_sync(args);
-    }
-    #[cfg(feature = "ws")]
-    if args.ws {
-        return run_ws_sync(args);
-    }
-
+    // SSE / WS bench paths go through `zerobench measure --sse-hold N`
+    // / `--ws-echo N` (v0.1.0). The old top-level `--sse` / `--ws`
+    // flags are rejected at the clap level (see CliArgs).
     #[cfg(feature = "tui")]
     let tui_enabled = args.tui;
     #[cfg(not(feature = "tui"))]
@@ -473,238 +502,6 @@ fn write_report<W: Write>(
 // SSE dispatch
 // ---------------------------------------------------------------------------
 
-/// Drive the SSE benchmark loop, merge per-worker stats, and render a
-/// bespoke SSE report to stdout. Mirrors the shape of the main dispatch
-/// path, minus the open-loop / TUI / JSONL branches — those aren't
-/// wired for SSE in v0.0.1 (the design doc's §6 mentions SSE-specific
-/// stats blocks, but the live-snapshot / TUI integration is a later
-/// polish pass).
-#[cfg(feature = "sse")]
-fn run_sse_sync(
-    args: &CliArgs,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let (plan, target, opts) = plan_from_cli::build(args)?;
-
-    let use_h2 = matches!(args.http_version, cli_args::CliHttpVersion::H2);
-    if use_h2 {
-        return Err("--sse does not support HTTP/2".into());
-    }
-
-    let tls_config = if target.tls {
-        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
-    } else {
-        None
-    };
-
-    let t_start = std::time::Instant::now();
-    let stats = zerobench_sse::run_sse_threaded(
-        &target,
-        &opts,
-        &plan,
-        args.connections,
-        plan.duration,
-        tls_config,
-    );
-    let duration = t_start.elapsed();
-    let summary = zerobench_sse::SseSummary::merge(stats, duration);
-
-    render_sse_summary(&summary, args)?;
-
-    if summary.streams == 0 {
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
-}
-
-#[cfg(feature = "sse")]
-fn render_sse_summary(
-    s: &zerobench_sse::SseSummary,
-    _args: &CliArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-
-    writeln!(out, "SSE streaming")?;
-    writeln!(
-        out,
-        "  duration      {:.2}s",
-        s.duration.as_secs_f64()
-    )?;
-    writeln!(
-        out,
-        "  streams       {} started  {} completed",
-        s.streams, s.completed
-    )?;
-    writeln!(
-        out,
-        "  chunks        {} total  {:.0}/s",
-        s.chunks,
-        s.chunks_per_sec()
-    )?;
-    writeln!(
-        out,
-        "  bytes         {} received",
-        s.bytes_received
-    )?;
-
-    if !s.ttfb.is_empty() {
-        writeln!(
-            out,
-            "  TTFB          p50={}  p90={}  p99={}  max={}",
-            format_ns(s.ttfb.value_at_percentile(50.0)),
-            format_ns(s.ttfb.value_at_percentile(90.0)),
-            format_ns(s.ttfb.value_at_percentile(99.0)),
-            format_ns(s.ttfb.max()),
-        )?;
-    }
-    if !s.chunk_latency.is_empty() {
-        writeln!(
-            out,
-            "  chunk gap     p50={}  p90={}  p99={}  max={}",
-            format_ns(s.chunk_latency.value_at_percentile(50.0)),
-            format_ns(s.chunk_latency.value_at_percentile(90.0)),
-            format_ns(s.chunk_latency.value_at_percentile(99.0)),
-            format_ns(s.chunk_latency.max()),
-        )?;
-    }
-    writeln!(
-        out,
-        "  errors        connect={} read={}",
-        s.errors_connect, s.errors_read
-    )?;
-
-    Ok(())
-}
-
-/// Compact ns → human formatting (`1.23ms` / `456µs` / `789ns`).
-///
-/// Used by the SSE and WS reports; the main terminal reporter has
-/// its own formatter that's tied to HDR percentile queries.
-#[cfg(any(feature = "sse", feature = "ws"))]
-fn format_ns(ns: u64) -> String {
-    if ns >= 1_000_000_000 {
-        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
-    } else if ns >= 1_000_000 {
-        format!("{:.2}ms", ns as f64 / 1_000_000.0)
-    } else if ns >= 1_000 {
-        format!("{:.0}µs", ns as f64 / 1_000.0)
-    } else {
-        format!("{ns}ns")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket dispatch
-// ---------------------------------------------------------------------------
-
-/// Drive the WebSocket benchmark loop, merge per-worker stats, and render
-/// a bespoke WS report to stdout.
-///
-/// Mirrors the SSE dispatch shape — the WS runner is its own entry point
-/// rather than going through `Transport::exchange`, because a
-/// long-lived bidi connection doesn't fit the single-shot Response
-/// model (see comments on `zerobench_ws::lib`).
-#[cfg(feature = "ws")]
-fn run_ws_sync(
-    args: &CliArgs,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let (plan, opts) = plan_from_cli::build_ws_plan(args)?;
-
-    let tls_config = if plan.target.tls {
-        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
-    } else {
-        None
-    };
-
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_timer = stop.clone();
-    let duration = args.duration;
-    std::thread::spawn(move || {
-        std::thread::sleep(duration);
-        stop_timer.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-
-    let t_start = std::time::Instant::now();
-    let stats = zerobench_ws::run_ws_threaded(plan, args.connections, stop, None, tls_config);
-    let elapsed = t_start.elapsed();
-    let summary = zerobench_ws::WsSummary::merge(stats, elapsed);
-
-    render_ws_summary(&summary)?;
-
-    if summary.handshake.is_empty() {
-        Ok(ExitCode::from(1))
-    } else if summary.messages_recvd == 0 {
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
-}
-
-#[cfg(feature = "ws")]
-fn render_ws_summary(
-    s: &zerobench_ws::WsSummary,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-
-    writeln!(out, "WebSocket")?;
-    writeln!(
-        out,
-        "  duration      {:.2}s",
-        s.duration.as_secs_f64()
-    )?;
-    writeln!(
-        out,
-        "  connections   {} (handshake samples)",
-        s.handshake.len()
-    )?;
-
-    if !s.handshake.is_empty() {
-        writeln!(
-            out,
-            "  handshake     p50={}  p99={}  max={}",
-            format_ns(s.handshake.value_at_percentile(50.0)),
-            format_ns(s.handshake.value_at_percentile(99.0)),
-            format_ns(s.handshake.max()),
-        )?;
-    }
-    if !s.rtt.is_empty() {
-        writeln!(
-            out,
-            "  rtt           p50={}  p90={}  p99={}  p99.9={}  max={}",
-            format_ns(s.rtt.value_at_percentile(50.0)),
-            format_ns(s.rtt.value_at_percentile(90.0)),
-            format_ns(s.rtt.value_at_percentile(99.0)),
-            format_ns(s.rtt.value_at_percentile(99.9)),
-            format_ns(s.rtt.max()),
-        )?;
-    }
-    writeln!(
-        out,
-        "  messages      {} sent  {} received  {:.0}/s",
-        s.messages_sent,
-        s.messages_recvd,
-        s.messages_per_sec(),
-    )?;
-    writeln!(
-        out,
-        "  bytes         {} sent  {} received",
-        s.bytes_sent, s.bytes_recvd,
-    )?;
-    writeln!(
-        out,
-        "  errors        connect={}  upgrade={}  io={}  close={}",
-        s.errors_connect, s.errors_upgrade, s.errors_io, s.errors_close,
-    )?;
-
-    Ok(())
-}
-
-
 // ---------------------------------------------------------------------------
 // Rhai script dispatch
 // ---------------------------------------------------------------------------
@@ -779,9 +576,15 @@ fn dispatch_multi_protocol_plan(
             None
         };
         let dur = plan.duration;
+        // `dispatch_multi_protocol_plan` is the Rhai-scripted path; it
+        // does not wire TUI today, so pass None — adding it here
+        // requires threading a LiveSnapshot through the function's
+        // signature, which is a bigger surface change than this fix.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
+        let _ = connections; // SseHold takes subscriber count from its own plan field.
         Some(std::thread::spawn(move || {
-            zerobench_sse::run_sse_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, connections, dur, tls, None,
+            zerobench_sse::run_sse_hold_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -801,14 +604,19 @@ fn dispatch_multi_protocol_plan(
     let ws_handle = if has_ws {
         let plan_c = plan.clone();
         let opts_c = opts.clone();
+        let target_c = target.clone();
         let tls = if target.tls {
             Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
         } else {
             None
         };
         let dur = plan.duration;
+        // Multi-protocol dispatcher does not wire TUI; pass None.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, connections, dur, tls, None)
+            zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
+            )
         }))
     } else {
         None
@@ -963,7 +771,7 @@ fn run_script_sync(
                 args.output.as_deref(),
                 color,
             )?;
-            if summary.errors.total() > 0 {
+            if summary.errors.hard_total() > 0 {
                 any_errors = true;
             }
             if summary.requests > 0 {
@@ -1047,11 +855,16 @@ fn run_script_sync(
         } else {
             None
         };
-        let conns = args.connections;
+        let _ = args.connections; // SseHold drives subscriber count from its own plan field.
         let dur = plan.duration;
+        // `run_script_sync` is the Rhai path; it does not wire TUI
+        // today, so live stays None. `run_mio_sync` (the default
+        // dispatch) is the TUI-aware path and threads `live` through
+        // its own backend calls.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_sse::run_sse_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, conns, dur, tls, None,
+            zerobench_sse::run_sse_hold_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
@@ -1074,6 +887,7 @@ fn run_script_sync(
     let ws_handle = if has_ws {
         let plan_c = plan.clone();
         let opts_c = opts.clone();
+        let target_c = target.clone();
         let tls = if target.tls {
             Some(zerobench_http::mio_tls::build_tls_config(
                 &opts,
@@ -1082,10 +896,16 @@ fn run_script_sync(
         } else {
             None
         };
-        let conns = args.connections;
+        let _ = args.connections; // WsEchoRtt drives conn count from its own plan field.
         let dur = plan.duration;
+        // `run_script_sync` is the Rhai path; TUI is wired only for
+        // `run_mio_sync`. Pass None to stay consistent with the
+        // Rhai SSE path above.
+        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, conns, dur, tls, None)
+            zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
+            )
         }))
     } else {
         None
@@ -1125,10 +945,11 @@ fn run_script_sync(
         color,
     )?;
 
-    // Exit-code policy: any errors (connect/read/write/timeout/...) or
-    // zero operations completed → exit 1. Matches the single-protocol
-    // CLI path.
-    if summary.errors.total() > 0 || summary.requests == 0 {
+    // Exit-code policy: hard transport errors (connect/read/write/
+    // timeout/keepup) or zero operations completed → exit 1. 4xx/5xx
+    // and assertion failures are signal, not infrastructure problems,
+    // so they do not gate exit status. Matches the measure-verb path.
+    if summary.errors.hard_total() > 0 || summary.requests == 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)

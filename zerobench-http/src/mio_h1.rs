@@ -76,7 +76,10 @@ use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
 
 use super::mio_tls::{MioStream, MioTlsStream};
-use super::raw_h1_common::{build_raw_request, find_connection_close, find_content_length_raw};
+use super::raw_h1_common::{
+    build_raw_request, find_connection_close, find_content_length_raw, ConnectionMode,
+    ContentLength,
+};
 
 // ---------------------------------------------------------------------------
 // Connect helpers — split resolve / connect so we can re-resolve on failure
@@ -322,7 +325,7 @@ impl Conn {
         scenario_id: u16,
     ) {
         self.write_buf.clear();
-        build_raw_request(plan, ctx, target, &mut self.write_buf)
+        build_raw_request(plan, ctx, target, ConnectionMode::KeepAlive, &mut self.write_buf)
             .expect("failed to build request bytes");
         self.write_offset = 0;
         self.read_buf.clear();
@@ -412,7 +415,35 @@ impl Conn {
         match resp.parse(&buf[..header_end]) {
             Ok(httparse::Status::Complete(hdr_len)) => {
                 let status = resp.code.unwrap_or(0);
-                let content_length = find_content_length_raw(resp.headers);
+                let content_length = match find_content_length_raw(resp.headers) {
+                    ContentLength::Present(n) => n,
+                    ContentLength::Missing => {
+                        // No CL. For keep-alive semantics we don't
+                        // support Transfer-Encoding: chunked on the
+                        // response path, and a missing CL on a
+                        // keep-alive connection is ambiguous about
+                        // body length. Conservatively treat as 0 and
+                        // drop the connection after: this matches
+                        // RFC 9110 §8.6 "close-delimited" fallback
+                        // without letting us mis-frame the next
+                        // response on an open pool slot.
+                        self.state = ConnState::Dead;
+                        0
+                    }
+                    ContentLength::Malformed => {
+                        // Present-but-malformed CL: unrecoverable.
+                        // We cannot tell where the body ends, so the
+                        // next bytes on this socket may be body
+                        // continuation or a new response. The safe
+                        // (and spec-mandated) response is to kill
+                        // the connection and surface a read error.
+                        self.state = ConnState::Dead;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed Content-Length in response",
+                        ));
+                    }
+                };
                 let ttfb = now.duration_since(self.t0);
                 let keep_alive = !find_connection_close(resp.headers);
 
@@ -433,9 +464,12 @@ impl Conn {
                 let body_received = buf.len() - hdr_len;
                 if body_received >= content_length {
                     let total = now.duration_since(self.t0);
-                    if keep_alive {
+                    // Dead state from Missing-CL above takes
+                    // precedence over keep-alive because we cannot
+                    // trust the framing beyond this response.
+                    if keep_alive && !matches!(self.state, ConnState::Dead) {
                         self.state = ConnState::Idle;
-                    } else {
+                    } else if !keep_alive {
                         self.state = ConnState::Dead;
                     }
                     Ok(Some((status, ttfb, total)))
@@ -613,8 +647,14 @@ pub fn run_mio_worker(
 
     let static_bytes: Option<Vec<u8>> = if use_static {
         let mut buf = Vec::with_capacity(512);
-        build_raw_request(first_req_plan, &mut ctx, target, &mut buf)
-            .expect("failed to build static request bytes");
+        build_raw_request(
+            first_req_plan,
+            &mut ctx,
+            target,
+            ConnectionMode::KeepAlive,
+            &mut buf,
+        )
+        .expect("failed to build static request bytes");
         Some(buf)
     } else {
         None
@@ -681,8 +721,15 @@ pub fn run_mio_worker(
                     continue;
                 }
             };
-            // Drive the TLS handshake to completion using mio poll events.
-            if let Err(_) = tls_stream.complete_handshake(&mut poll, Token(i)) {
+            // Drive the TLS handshake to completion using mio poll
+            // events. Wall-clock bounded by `opts.connect_timeout` —
+            // that's the same budget the prior TCP connect already
+            // respects, so a slow TLS peer can't extend the total
+            // handshake past what the user asked for.
+            if tls_stream
+                .complete_handshake(&mut poll, Token(i), opts.connect_timeout)
+                .is_err()
+            {
                 err(&mut stats, live, 0, ErrorKind::Connect);
                 continue;
             }
@@ -825,9 +872,17 @@ pub fn run_mio_worker(
                     },
                     ConnState::Idle if !open_loop => {
                         // Saturate: start next request immediately.
+                        // CO-free discipline: `intended_start` is the
+                        // moment the previous response completed, which
+                        // we approximate with `batch_now` (the Instant
+                        // captured just before processing this event
+                        // batch). Using a fresh `Instant::now()` here
+                        // would undercount the latency of the next
+                        // response by the time we spent processing
+                        // prior events in this same batch.
                         let sel = pick_scenario(plan, &http_indices, &mut ctx);
                         conn_scenario_idx[idx] = sel.scenario_id as usize;
-                        prepare_conn!(conn, Instant::now(), sel.request_plan, &mut ctx, target, sel.scenario_id);
+                        prepare_conn!(conn, batch_now, sel.request_plan, &mut ctx, target, sel.scenario_id);
                         match conn.try_write() {
                             Ok(true) => {
                                 conn.state = ConnState::ReadingHeaders;
@@ -1071,8 +1126,14 @@ pub fn __test_build_request(
     target: &Target,
     out: &mut Vec<u8>,
 ) {
-    super::raw_h1_common::build_raw_request(plan, ctx, target, out)
-        .expect("build request");
+    super::raw_h1_common::build_raw_request(
+        plan,
+        ctx,
+        target,
+        ConnectionMode::KeepAlive,
+        out,
+    )
+    .expect("build request");
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,7 +1161,7 @@ mod tests {
         let status = resp.parse(&response[..hdr_end]);
         assert!(status.is_ok());
         assert_eq!(resp.code, Some(200));
-        assert_eq!(find_content_length_raw(resp.headers), 5);
+        assert_eq!(find_content_length_raw(resp.headers), ContentLength::Present(5));
         assert!(!find_connection_close(resp.headers));
     }
 

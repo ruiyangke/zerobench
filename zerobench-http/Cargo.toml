@@ -38,6 +38,8 @@ rustls = { workspace = true }
 [dev-dependencies]
 rustls = { workspace = true }
 rcgen = { workspace = true }
+smallvec = { workspace = true }
+http = { workspace = true }
 
 [lints]
 workspace = true

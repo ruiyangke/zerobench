@@ -316,12 +316,18 @@ fn unknown_variable_errors() {
 }
 
 #[test]
-fn line_file_is_not_yet_supported() {
+fn line_file_missing_path_surfaces_line_file_error() {
+    // Previously this expected NotYetSupported; the implementation
+    // now loads files at compile time and reports IO failures as
+    // the dedicated LineFile variant.
     let mut vars = VarRegistry::new();
     let err = Template::compile("{{line:./fixtures/ids.txt}}", &mut vars).unwrap_err();
     match err {
-        TemplateError::NotYetSupported(_) => {}
-        other => panic!("expected NotYetSupported, got {other:?}"),
+        TemplateError::LineFile { path, reason } => {
+            assert_eq!(path, "./fixtures/ids.txt");
+            assert!(reason.contains("No such file") || reason.contains("read failed"));
+        }
+        other => panic!("expected LineFile, got {other:?}"),
     }
 }
 

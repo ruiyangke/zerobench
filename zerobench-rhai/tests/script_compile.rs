@@ -344,3 +344,344 @@ fn json_body_adds_content_type_and_becomes_template() {
         other => panic!("expected Request, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.1.0 protocol-native builders
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sse_hold_builder_compiles_to_step() {
+    let src = r#"
+        scenario("sse-events", |s| {
+            s.step(sse_hold("http://api/stream", 100, "30s"));
+        });
+        duration("30s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.scenarios.len(), 1);
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert_eq!(p.subscribers, 100);
+            assert_eq!(p.hold_for, std::time::Duration::from_secs(30));
+        }
+        other => panic!("expected SseHold, got {other:?}"),
+    }
+}
+
+#[test]
+fn sse_hold_builder_accepts_integer_seconds() {
+    let src = r#"
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/stream", 10, 5));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert_eq!(p.subscribers, 10);
+            assert_eq!(p.hold_for, std::time::Duration::from_secs(5));
+        }
+        _ => panic!("expected SseHold"),
+    }
+}
+
+#[test]
+fn sse_hold_reconnect_setter() {
+    let src = r#"
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/stream", 1, "1s").reconnect(false));
+        });
+        duration("1s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert!(!p.reconnect, "reconnect(false) should disable reconnect");
+        }
+        _ => panic!("expected SseHold"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_builder_compiles_to_step() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 50, 100));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            assert_eq!(p.connections, 50);
+            assert!((p.msg_rate_per_conn - 100.0).abs() < 1e-9);
+            assert!(matches!(
+                p.correlate,
+                zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend
+            ));
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_payload_setter() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).payload("hello"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            // Payload compiled to a static Template; check via expansion.
+            let mut buf = Vec::new();
+            let mut rng = zerobench_core::rng::from_entropy();
+            let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut ctx = zerobench_core::ExpandCtx {
+                rng: &mut rng,
+                counter: &counter,
+                scenario_vars: &[],
+            };
+            p.payload.expand_into(&mut buf, &mut ctx);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), "hello");
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn mixed_protocol_plan_from_rhai() {
+    let src = r#"
+        scenario("http", |s| {
+            s.step(GET("http://api/ping"));
+        });
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/events", 5, "10s"));
+        });
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 2, 50));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.scenarios.len(), 3);
+
+    use zerobench_core::plan::Protocol;
+    let protocols: Vec<Protocol> = loaded
+        .plan
+        .scenarios
+        .iter()
+        .map(|s| s.protocol())
+        .collect();
+    assert_eq!(protocols, vec![Protocol::Http, Protocol::Sse, Protocol::Ws]);
+}
+
+// ---------------------------------------------------------------------------
+// D3: protocol-builder knobs — correlate / heartbeat_frame / mode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ws_echo_rtt_correlate_pingpong() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).correlate("pingpong"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            assert!(matches!(
+                p.correlate,
+                zerobench_core::plan::CorrelateStrategy::PingPong
+            ));
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_correlate_substring() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(
+                ws_echo_rtt("ws://api/chat", 1, 10)
+                    .correlate("substring:zb-echo-")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => match &p.correlate {
+            zerobench_core::plan::CorrelateStrategy::PayloadSubstring { marker } => {
+                assert_eq!(marker, "zb-echo-");
+            }
+            other => panic!("expected PayloadSubstring, got {other:?}"),
+        },
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_correlate_unknown_rejected() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).correlate("nope"));
+        });
+        duration("10s");
+    "#;
+    assert!(
+        load_script_str(src).is_err(),
+        "unknown correlate strategy must fail at script-eval time"
+    );
+}
+
+#[test]
+fn ws_hold_heartbeat_frame_text() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_hold("ws://api/bus", 1, "1s").heartbeat_frame("text"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsHold(p) => {
+            assert!(matches!(
+                p.heartbeat_frame,
+                zerobench_core::plan::HeartbeatFrame::TextApp
+            ));
+        }
+        _ => panic!("expected WsHold"),
+    }
+}
+
+#[test]
+fn sse_fanout_mode_timestamp_default_field() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                sse_fanout("http://api/events", 3, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .mode("timestamp")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseFanout(p) => match &p.mode {
+            zerobench_core::plan::FanoutMode::Timestamp { emit_field } => {
+                assert_eq!(emit_field, "emit_ns");
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        },
+        _ => panic!("expected SseFanout"),
+    }
+}
+
+#[test]
+fn sse_fanout_mode_timestamp_custom_field() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                sse_fanout("http://api/events", 3, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .mode("timestamp:server_ts")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseFanout(p) => match &p.mode {
+            zerobench_core::plan::FanoutMode::Timestamp { emit_field } => {
+                assert_eq!(emit_field, "server_ts");
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        },
+        _ => panic!("expected SseFanout"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D4: top-level plan metadata setters (cooldown / runs / threads / plan_name)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn top_level_cooldown_runs_threads_plan_name_are_honoured() {
+    let src = r#"
+        plan_name("chat-burst");
+        runs(3);
+        threads(8);
+        cooldown("5s");
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.name, "chat-burst");
+    assert_eq!(loaded.plan.runs, 3);
+    assert_eq!(loaded.plan.threads, 8);
+    assert_eq!(loaded.plan.cooldown, std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn defaults_match_single_run_zero_cooldown() {
+    // When the script omits the new setters, behaviour should match
+    // pre-D4 (runs=1, threads=1, cooldown=ZERO, name="").
+    let src = r#"
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.runs, 1);
+    assert_eq!(loaded.plan.threads, 1);
+    assert_eq!(loaded.plan.cooldown, std::time::Duration::ZERO);
+    assert!(loaded.plan.name.is_empty());
+}
+
+#[test]
+fn runs_clamped_to_minimum_one() {
+    // runs(0) or runs(-5) must not produce a zero-run plan — the
+    // dispatcher would skip the scenario entirely.
+    let src = r#"
+        runs(0);
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.runs, 1);
+}
+
+#[test]
+fn ws_fanout_heartbeat_frame_and_mode() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                ws_fanout("ws://api/bus", 2, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .heartbeat_frame("text")
+                    .mode("timestamp")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsFanout(p) => {
+            assert!(matches!(
+                p.subscribers.heartbeat_frame,
+                zerobench_core::plan::HeartbeatFrame::TextApp
+            ));
+            assert!(matches!(
+                p.mode,
+                zerobench_core::plan::FanoutMode::Timestamp { .. }
+            ));
+        }
+        _ => panic!("expected WsFanout"),
+    }
+}

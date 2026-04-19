@@ -24,7 +24,7 @@ pub enum VarError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VarSlot(pub u8);
 
-/// Name → slot mapping, built during Phase 1 and frozen into the plan.
+/// Name → slot mapping, built at plan compile time and frozen into the plan.
 ///
 /// Same name twice returns the same slot. Slot indices are sequential and
 /// stable for the lifetime of the plan.

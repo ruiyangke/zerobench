@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zerobench_core::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
 // TaskStats used by type inference only
 use zerobench_core::template::Template;
 use zerobench_core::transport::Target;
@@ -104,8 +104,12 @@ fn simple_plan(addr: SocketAddr) -> (Plan, Target) {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(2),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     let target = Target::parse(&format!("http://{addr}")).unwrap();
     (plan, target)
@@ -215,8 +219,12 @@ fn mio_https_without_server_records_connect_errors() {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(1),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: std::time::Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: zerobench_core::plan::Mode::default(),
+        name: String::new(),
     };
     // With TLS config but no server -- should not panic, just record errors.
     let opts = zerobench_core::transport::TransportOpts {
@@ -416,7 +424,8 @@ fn mio_tls_stream_low_level() {
     };
     let config = zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]);
     let mut tls = zerobench_http::mio_tls::MioTlsStream::new(tcp, config, "localhost").unwrap();
-    tls.complete_handshake(&mut poll, token).unwrap();
+    tls.complete_handshake(&mut poll, token, std::time::Duration::from_secs(10))
+        .unwrap();
 
     // Write HTTP request
     let req = b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -473,8 +482,12 @@ fn mio_h1_tls_with_self_signed_cert() {
         scenarios: vec![scenario],
         vars,
         duration: Duration::from_secs(2),
-        warmup: None,
+        warmup: Duration::ZERO,
+        cooldown: Duration::ZERO,
+        runs: 1,
         threads: 1,
+        mode: Mode::default(),
+        name: String::new(),
     };
     let mut target = Target::parse(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
     target.sni = Some("localhost".into());

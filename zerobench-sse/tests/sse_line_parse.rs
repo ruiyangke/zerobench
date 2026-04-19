@@ -43,6 +43,7 @@ fn feed_and_flush(input: &[u8]) -> Vec<OwnedEvent> {
 enum OwnedEvent {
     Data(Vec<u8>),
     Done,
+    Id(Vec<u8>),
     Ignored,
 }
 
@@ -51,6 +52,7 @@ impl From<SseEvent<'_>> for OwnedEvent {
         match ev {
             SseEvent::Data(b) => OwnedEvent::Data(b.into_owned()),
             SseEvent::Done => OwnedEvent::Done,
+            SseEvent::Id(v) => OwnedEvent::Id(v.into_owned()),
             SseEvent::Ignored => OwnedEvent::Ignored,
         }
     }
@@ -165,9 +167,15 @@ fn event_field_is_ignored_data_is_not() {
 }
 
 #[test]
-fn only_non_data_fields_emit_single_ignored() {
+fn only_non_data_fields_emit_id_then_single_ignored() {
+    // `id:` is surfaced immediately (for reconnect purposes);
+    // `event:` and `retry:` collapse into a single trailing Ignored
+    // at event dispatch.
     let out = feed_all(&[b"event: foo\nid: 42\nretry: 1000\n\n"]);
-    assert_eq!(out, vec![OwnedEvent::Ignored]);
+    assert_eq!(
+        out,
+        vec![OwnedEvent::Id(b"42".to_vec()), OwnedEvent::Ignored]
+    );
 }
 
 #[test]
@@ -286,6 +294,52 @@ fn consecutive_partial_writes_assemble_correctly() {
             OwnedEvent::Data(b"alpha".to_vec()),
             OwnedEvent::Data(b"beta".to_vec()),
             OwnedEvent::Data(b"gamma".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn id_line_emits_id_event() {
+    // Spec: `id: abc` sets the event's last-event-id. We surface it
+    // as `Id(b"abc")` for the reconnect-storm caller.
+    let out = feed_all(&[b"id: abc\ndata: payload\n\n"]);
+    assert_eq!(
+        out,
+        vec![
+            OwnedEvent::Id(b"abc".to_vec()),
+            OwnedEvent::Data(b"payload".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn id_split_across_chunks_is_reassembled() {
+    // Regression for the B4 ad-hoc `split(b'\n')` parser that
+    // dropped half of a chunk-boundary `id:` line. The parser must
+    // buffer across feed() calls and emit the full id at the
+    // terminating newline.
+    let chunks: &[&[u8]] = &[b"id: 12", b"345\ndata: x\n\n"];
+    let out = feed_all(chunks);
+    assert_eq!(
+        out,
+        vec![
+            OwnedEvent::Id(b"12345".to_vec()),
+            OwnedEvent::Data(b"x".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn id_split_across_crlf_boundary_is_stitched() {
+    // A feed boundary that cuts between `\r` and `\n` on a CRLF
+    // stream must still produce the correct id.
+    let chunks: &[&[u8]] = &[b"id: 999\r", b"\ndata: y\n\n"];
+    let out = feed_all(chunks);
+    assert_eq!(
+        out,
+        vec![
+            OwnedEvent::Id(b"999".to_vec()),
+            OwnedEvent::Data(b"y".to_vec()),
         ]
     );
 }

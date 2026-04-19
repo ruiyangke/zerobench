@@ -56,10 +56,11 @@ pub struct ScenarioContext {
     ///
     /// # Encapsulation
     ///
-    /// Kept `pub` (with `#[doc(hidden)]`) for the legacy in-crate users;
-    /// external callers should prefer [`ScenarioContext::take_url_buf`]
-    /// / [`ScenarioContext::return_url_buf`] or the closure-style
-    /// [`ScenarioContext::with_url_buf`] helper, which compose more
+    /// `pub`-with-`#[doc(hidden)]` so intra-crate hot paths can
+    /// access the buffer directly. External callers should prefer
+    /// [`ScenarioContext::take_url_buf`] /
+    /// [`ScenarioContext::return_url_buf`] or the closure-style
+    /// [`ScenarioContext::with_url_buf`] helper — they compose more
     /// cleanly with the split borrow of `rng` / `counter` / `vars`
     /// that template expansion needs.
     #[doc(hidden)]

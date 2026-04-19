@@ -8,6 +8,20 @@ use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::template::ExpandCtx;
 use zerobench_core::transport::{Target, TransportError};
 
+/// Whether the generated request carries `Connection: keep-alive` or
+/// `Connection: close`. Callers pick based on their session model:
+/// `mio_h1` reuses pooled connections (keep-alive); `cold_connect`
+/// tears the socket down after every op (close).
+///
+/// If the user supplied a literal `Connection:` header via
+/// `plan.headers`, their value wins and this default is skipped —
+/// important for WebSocket-like upgrade scenarios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionMode {
+    KeepAlive,
+    Close,
+}
+
 // ---------------------------------------------------------------------------
 // Request building — zero-alloc into a reusable Vec<u8>
 // ---------------------------------------------------------------------------
@@ -23,6 +37,7 @@ pub fn build_raw_request(
     plan: &RequestPlan,
     ctx: &mut ScenarioContext,
     target: &Target,
+    connection: ConnectionMode,
     out: &mut Vec<u8>,
 ) -> Result<(), TransportError> {
     // Build an ExpandCtx from individual fields so we can borrow
@@ -104,8 +119,25 @@ pub fn build_raw_request(
     out.extend_from_slice(target.addr().as_bytes());
     out.extend_from_slice(b"\r\n");
 
-    // Connection: keep-alive.
-    out.extend_from_slice(b"Connection: keep-alive\r\n");
+    // Default Connection header — skipped when the user supplied one
+    // via plan.headers (static literal match, case-insensitive). A
+    // dynamic header-name template isn't detectable without expansion,
+    // so a `{{var:...}}: close` override will race with the default;
+    // that edge case is out of scope.
+    let user_has_connection = plan.headers.iter().any(|(name_tpl, _)| {
+        name_tpl
+            .static_literal()
+            .map(|b| b.eq_ignore_ascii_case(b"connection"))
+            .unwrap_or(false)
+    });
+    if !user_has_connection {
+        match connection {
+            ConnectionMode::KeepAlive => {
+                out.extend_from_slice(b"Connection: keep-alive\r\n")
+            }
+            ConnectionMode::Close => out.extend_from_slice(b"Connection: close\r\n"),
+        }
+    }
 
     // User headers (expand templates).
     for (name_tpl, val_tpl) in &plan.headers {
@@ -153,16 +185,41 @@ pub fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Response header parsing — runtime-agnostic
 // ---------------------------------------------------------------------------
 
+/// Outcome of scanning response headers for `Content-Length`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentLength {
+    /// No `Content-Length` header in the response.
+    Missing,
+    /// A valid non-negative integer value.
+    Present(usize),
+    /// The header was present but its value didn't parse as a
+    /// non-negative integer. RFC 9110 §8.6 requires the client to
+    /// treat the message as "malformed" — the connection is
+    /// unrecoverable because we can't tell where the body ends.
+    Malformed,
+}
+
 /// Extract the `Content-Length` value from raw httparse headers.
-pub(crate) fn find_content_length_raw(headers: &[httparse::Header<'_>]) -> usize {
+///
+/// Returns `Missing` when the header is absent, `Malformed` when it
+/// is present but not a valid non-negative integer, and
+/// `Present(n)` otherwise. Callers that previously treated "missing
+/// or malformed" as `0` must now distinguish them — treating a
+/// malformed CL as 0 would let the parser slide past the body and
+/// mis-frame the next response on the same keep-alive connection.
+pub(crate) fn find_content_length_raw(headers: &[httparse::Header<'_>]) -> ContentLength {
     for h in headers {
         if h.name.eq_ignore_ascii_case("content-length") {
-            if let Ok(s) = std::str::from_utf8(h.value) {
-                return s.trim().parse().unwrap_or(0);
-            }
+            let Ok(s) = std::str::from_utf8(h.value) else {
+                return ContentLength::Malformed;
+            };
+            return match s.trim().parse::<usize>() {
+                Ok(n) => ContentLength::Present(n),
+                Err(_) => ContentLength::Malformed,
+            };
         }
     }
-    0
+    ContentLength::Missing
 }
 
 /// Check whether the server sent `Connection: close`.
@@ -197,16 +254,52 @@ mod tests {
                 value: b"42",
             },
         ];
-        assert_eq!(find_content_length_raw(&headers), 42);
+        assert_eq!(find_content_length_raw(&headers), ContentLength::Present(42));
     }
 
     #[test]
-    fn content_length_missing_returns_zero() {
+    fn content_length_missing_returns_missing() {
         let headers = [httparse::Header {
             name: "Content-Type",
             value: b"text/plain",
         }];
-        assert_eq!(find_content_length_raw(&headers), 0);
+        assert_eq!(find_content_length_raw(&headers), ContentLength::Missing);
+    }
+
+    #[test]
+    fn content_length_malformed_returns_malformed() {
+        let headers = [httparse::Header {
+            name: "Content-Length",
+            value: b"not-a-number",
+        }];
+        assert_eq!(
+            find_content_length_raw(&headers),
+            ContentLength::Malformed
+        );
+    }
+
+    #[test]
+    fn content_length_negative_treated_as_malformed() {
+        let headers = [httparse::Header {
+            name: "Content-Length",
+            value: b"-1",
+        }];
+        assert_eq!(
+            find_content_length_raw(&headers),
+            ContentLength::Malformed
+        );
+    }
+
+    #[test]
+    fn content_length_non_utf8_returns_malformed() {
+        let headers = [httparse::Header {
+            name: "Content-Length",
+            value: &[0xff, 0xfe, 0xfd],
+        }];
+        assert_eq!(
+            find_content_length_raw(&headers),
+            ContentLength::Malformed
+        );
     }
 
     #[test]
@@ -231,5 +324,87 @@ mod tests {
     fn find_subsequence_works() {
         assert_eq!(find_subsequence(b"hello://world", b"://"), Some(5));
         assert_eq!(find_subsequence(b"nope", b"://"), None);
+    }
+
+    // ----- Request builder: Connection header semantics -----
+
+    use smallvec::smallvec;
+    use zerobench_core::plan::RequestPlan;
+    use zerobench_core::rng::from_entropy;
+    use zerobench_core::template::Template;
+    use zerobench_core::transport::Target;
+    use zerobench_core::var::VarRegistry;
+
+    fn mk_plan(url: &str) -> RequestPlan {
+        let mut vars = VarRegistry::new();
+        let url_tpl = Template::compile(url, &mut vars).unwrap();
+        RequestPlan::get(url_tpl)
+    }
+
+    fn mk_ctx() -> ScenarioContext {
+        ScenarioContext::new(0, from_entropy())
+    }
+
+    fn mk_target() -> Target {
+        Target::parse("http://127.0.0.1:8080").unwrap()
+    }
+
+    #[test]
+    fn keepalive_emits_connection_keep_alive() {
+        let plan = mk_plan("http://127.0.0.1:8080/x");
+        let mut ctx = mk_ctx();
+        let mut out = Vec::new();
+        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::KeepAlive, &mut out).unwrap();
+        let wire = std::str::from_utf8(&out).unwrap();
+        assert!(wire.contains("Connection: keep-alive\r\n"), "wire = {wire}");
+        assert!(!wire.contains("Connection: close"), "wire = {wire}");
+    }
+
+    #[test]
+    fn close_emits_connection_close() {
+        let plan = mk_plan("http://127.0.0.1:8080/x");
+        let mut ctx = mk_ctx();
+        let mut out = Vec::new();
+        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::Close, &mut out).unwrap();
+        let wire = std::str::from_utf8(&out).unwrap();
+        assert!(wire.contains("Connection: close\r\n"), "wire = {wire}");
+        assert!(!wire.contains("Connection: keep-alive"), "wire = {wire}");
+    }
+
+    #[test]
+    fn user_connection_header_wins() {
+        // User overrides with `Connection: upgrade` (e.g. WS handshake).
+        // The default must NOT be emitted, regardless of mode.
+        let mut vars = VarRegistry::new();
+        let url_tpl = Template::compile("http://127.0.0.1:8080/ws", &mut vars).unwrap();
+        let mut plan = RequestPlan::get(url_tpl);
+        let name = Template::literal(bytes::Bytes::from_static(b"Connection"));
+        let val = Template::literal(bytes::Bytes::from_static(b"upgrade"));
+        plan.headers = smallvec![(name, val)];
+
+        let mut ctx = mk_ctx();
+        let mut out = Vec::new();
+        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::Close, &mut out).unwrap();
+        let wire = std::str::from_utf8(&out).unwrap();
+        // Exactly one Connection line, and it's the user's.
+        assert_eq!(wire.matches("Connection:").count(), 1, "wire = {wire}");
+        assert!(wire.contains("Connection: upgrade\r\n"), "wire = {wire}");
+    }
+
+    #[test]
+    fn user_connection_header_case_insensitive() {
+        let mut vars = VarRegistry::new();
+        let url_tpl = Template::compile("http://127.0.0.1:8080/x", &mut vars).unwrap();
+        let mut plan = RequestPlan::get(url_tpl);
+        let name = Template::literal(bytes::Bytes::from_static(b"connection"));
+        let val = Template::literal(bytes::Bytes::from_static(b"close"));
+        plan.headers = smallvec![(name, val)];
+
+        let mut ctx = mk_ctx();
+        let mut out = Vec::new();
+        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::KeepAlive, &mut out).unwrap();
+        let wire = std::str::from_utf8(&out).unwrap();
+        assert_eq!(wire.matches("Connection:").count(), 0);
+        assert_eq!(wire.matches("connection:").count(), 1, "wire = {wire}");
     }
 }

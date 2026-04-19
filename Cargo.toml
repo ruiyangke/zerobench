@@ -9,7 +9,6 @@ members = [
     "zerobench-tui",
     "zerobench-cli",
     "zerobench-stub",
-    "zerobench-stub-ntex",
 ]
 
 [workspace.package]
@@ -96,7 +95,19 @@ toml = "0.8"
 
 # WebSocket primitives
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
+hex = "0.4"
+
+# Time formatting for run_ids
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+# Blake3 for hostname hashing (fast, no rainbow surface for short inputs)
+blake3 = "1"
+
+# libc + num_cpus for machine fingerprint collection
+libc = "0.2"
+num_cpus = "1"
 
 [profile.release]
 opt-level = 3

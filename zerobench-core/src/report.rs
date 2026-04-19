@@ -158,15 +158,22 @@ pub fn print_terminal(
     }
 
     // -- latency percentiles ---------------------------------------------
+    //
+    // protocol-aware source. For SSE-only plans we report
+    // chunk_gap (inter-event gap) from the scenario extras; for
+    // WS-only plans we report rtt. Mixed or HTTP plans use the
+    // aggregate `summary.latency` as before.
+    let (lat_label, lat_p50, lat_p90, lat_p99, lat_p999, lat_max) =
+        pick_latency_source(summary, plan);
     writeln!(
         out,
-        "{}        p50={}  p90={}  p99={}  p99.9={}  max={}",
-        p.bold("latency"),
-        p.green(&format_ns(summary.latency_p(50.0).as_nanos() as u64)),
-        p.green(&format_ns(summary.latency_p(90.0).as_nanos() as u64)),
-        p.yellow(&format_ns(summary.latency_p(99.0).as_nanos() as u64)),
-        p.yellow(&format_ns(summary.latency_p(99.9).as_nanos() as u64)),
-        p.red(&format_ns(summary.latency.max())),
+        "{}      p50={}  p90={}  p99={}  p99.9={}  max={}",
+        p.bold(lat_label),
+        p.green(&format_ns(lat_p50)),
+        p.green(&format_ns(lat_p90)),
+        p.yellow(&format_ns(lat_p99)),
+        p.yellow(&format_ns(lat_p999)),
+        p.red(&format_ns(lat_max)),
     )?;
 
     // -- errors -----------------------------------------------------------
@@ -507,9 +514,8 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
 /// during the run, piping to stdout while the terminal summary goes
 /// to stderr at end-of-run.
 ///
-/// Format is stable; see docs/plans/2026-04-16-v0.0.1-impl.md Task 12.
-/// Consumers (Grafana, kibana, ad-hoc jq pipelines) must be able to
-/// round-trip every field as JSON — no NaN, no Infinity.
+/// Format is stable. Consumers (Grafana, kibana, ad-hoc jq pipelines)
+/// must be able to round-trip every field as JSON — no NaN, no Infinity.
 pub fn print_jsonl_tick(tick: &LiveTick, out: &mut impl Write) -> io::Result<()> {
     let t_secs = tick.elapsed.as_secs_f64();
     // The aggregator's window is 1s by convention (the ticker wakes on
@@ -684,6 +690,157 @@ fn pct_ns(summary: &Summary, pct: f64) -> u64 {
     }
 }
 
+/// Pick the right latency source + label for the terminal report's
+/// `latency`-line based on plan protocol.
+///
+/// - All scenarios HTTP → aggregate `summary.latency` (HTTP req/resp).
+/// - All scenarios SSE → sum per-scenario `sse.chunk_gap` histograms
+///   (inter-event gap — the primary SSE latency axis).
+/// - All scenarios WS → sum per-scenario `ws.rtt` histograms.
+/// - Mixed → aggregate `summary.latency` (HTTP-centric fallback; the
+///   per-scenario breakdown in the scenarios panel shows the rest).
+///
+/// Returns `(label, p50, p90, p99, p999, max)` all in nanoseconds.
+fn pick_latency_source(summary: &Summary, plan: &Plan) -> (&'static str, u64, u64, u64, u64, u64) {
+    let protocols: std::collections::HashSet<Protocol> =
+        plan.scenarios.iter().map(|s| s.protocol()).collect();
+
+    // Single-protocol fast paths.
+    if protocols.len() == 1 {
+        match protocols.iter().next().copied() {
+            Some(Protocol::Sse) => return sse_latency_from_scenarios(summary),
+            Some(Protocol::Ws) => return ws_latency_from_scenarios(summary),
+            _ => {}
+        }
+    }
+
+    // HTTP-or-mixed: aggregate.
+    let hist = &summary.latency;
+    let label = if protocols.len() > 1 { "latency" } else { "latency" };
+    (
+        label,
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(50.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(90.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.0) },
+        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.9) },
+        hist.max(),
+    )
+}
+
+fn sse_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
+    // Per protocol-native semantics: prefer the dedicated
+    // broadcast_rtt slot for SseFanout scenarios; fall back to
+    // chunk_gap for SseHold / SseReconnectStorm. An SSE scenario
+    // populates exactly one of the two.
+    let mut broadcast = crate::histogram::new_hist();
+    let mut chunk_gap = crate::histogram::new_hist();
+    for sc in &summary.per_scenario {
+        if let Some(sse) = sc.sse.as_ref() {
+            let _ = broadcast.add(&sse.broadcast_rtt);
+            let _ = chunk_gap.add(&sse.chunk_gap);
+        }
+    }
+    let (label, agg) = if !broadcast.is_empty() {
+        ("broadcast-rtt", broadcast)
+    } else {
+        ("chunk-gap", chunk_gap)
+    };
+    if agg.is_empty() {
+        (label, 0, 0, 0, 0, 0)
+    } else {
+        (
+            label,
+            agg.value_at_percentile(50.0),
+            agg.value_at_percentile(90.0),
+            agg.value_at_percentile(99.0),
+            agg.value_at_percentile(99.9),
+            agg.max(),
+        )
+    }
+}
+
+fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
+    // As with SSE: WsFanout writes broadcast_rtt and leaves rtt
+    // empty; WsEchoRtt / WsServerPushRtt populate rtt. Prefer
+    // broadcast_rtt when non-empty.
+    let mut broadcast = crate::histogram::new_hist();
+    let mut rtt = crate::histogram::new_hist();
+    for sc in &summary.per_scenario {
+        if let Some(ws) = sc.ws.as_ref() {
+            let _ = broadcast.add(&ws.broadcast_rtt);
+            let _ = rtt.add(&ws.rtt);
+        }
+    }
+    let (label, agg) = if !broadcast.is_empty() {
+        ("broadcast-rtt", broadcast)
+    } else {
+        ("rtt", rtt)
+    };
+    if agg.is_empty() {
+        (label, 0, 0, 0, 0, 0)
+    } else {
+        (
+            label,
+            agg.value_at_percentile(50.0),
+            agg.value_at_percentile(90.0),
+            agg.value_at_percentile(99.0),
+            agg.value_at_percentile(99.9),
+            agg.max(),
+        )
+    }
+}
+
+/// Return a borrowed reference to the histogram that carries the
+/// PRIMARY latency signal for this plan — the same slot the terminal
+/// report renders via [`pick_latency_source`], but as a histogram the
+/// caller can feed into `write_histlog`.
+///
+/// HTTP: `summary.latency`. SSE: `broadcast_rtt` if any scenario
+/// populated it, else aggregated `chunk_gap`. WS: `broadcast_rtt` if
+/// any, else aggregated `rtt`. On a mixed plan this falls back to
+/// `summary.latency` (HTTP-centric aggregate) — the per-scenario
+/// sidecars carry the rest.
+pub fn pick_primary_histogram<'a>(
+    summary: &'a Summary,
+    plan: &Plan,
+) -> &'a hdrhistogram::Histogram<u64> {
+    // Single-protocol SSE or WS → return the per-extras histogram
+    // cached on scenario[0]. When the plan has multiple SSE/WS
+    // scenarios, we'd have to allocate a fresh aggregate — that
+    // allocation doesn't fit the borrowed-return signature, so
+    // multi-scenario SSE/WS still writes summary.latency.
+    let protocols: std::collections::HashSet<Protocol> =
+        plan.scenarios.iter().map(|s| s.protocol()).collect();
+    if protocols.len() == 1 && plan.scenarios.len() == 1 {
+        if let Some(sc) = summary.per_scenario.first() {
+            match protocols.iter().next().copied() {
+                Some(Protocol::Sse) => {
+                    if let Some(sse) = sc.sse.as_ref() {
+                        if !sse.broadcast_rtt.is_empty() {
+                            return &sse.broadcast_rtt;
+                        }
+                        if !sse.chunk_gap.is_empty() {
+                            return &sse.chunk_gap;
+                        }
+                    }
+                }
+                Some(Protocol::Ws) => {
+                    if let Some(ws) = sc.ws.as_ref() {
+                        if !ws.broadcast_rtt.is_empty() {
+                            return &ws.broadcast_rtt;
+                        }
+                        if !ws.rtt.is_empty() {
+                            return &ws.rtt;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    &summary.latency
+}
+
 fn ns_to_seconds(ns: u64) -> f64 {
     ns as f64 / 1e9
 }
@@ -801,7 +958,7 @@ fn describe_target_rate(plan: &Plan) -> String {
 }
 
 /// One-line human summary of the assertions in the plan (for the
-/// "assertions" report line). Phase C: just the assertion count.
+/// "assertions" report line). 
 fn describe_assertions(plan: &Plan) -> String {
     use crate::plan::Assertion;
     let mut parts = Vec::new();
@@ -1069,7 +1226,7 @@ mod tests {
 
     #[test]
     fn print_terminal_omits_transfer_line_when_bytes_zero() {
-        use crate::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
         use crate::stats::{Summary, TaskStats};
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1084,8 +1241,12 @@ mod tests {
             }],
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         };
 
         // Record requests but no bytes (SSE/WS style).
@@ -1109,7 +1270,7 @@ mod tests {
 
     #[test]
     fn print_terminal_includes_transfer_line_when_bytes_present() {
-        use crate::plan::{Plan, RateProfile, RequestPlan, Scenario, Step};
+        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
         use crate::stats::{Summary, TaskStats};
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1124,8 +1285,12 @@ mod tests {
             }],
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         };
         let mut stats = TaskStats::new(1);
         for _ in 0..100 {
@@ -1168,7 +1333,7 @@ mod tests {
 
     fn plan_with_protocols(entries: &[(&str, Protocol)]) -> Plan {
         use crate::plan::{
-            Plan, RateProfile, RequestPlan, Scenario, SsePlan, Step, WsRoundPlan,
+            Mode, Plan, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step, WsEchoRttPlan,
         };
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1181,15 +1346,20 @@ mod tests {
             .map(|(name, proto)| {
                 let step = match proto {
                     Protocol::Http => Step::Request(RequestPlan::get(url.clone())),
-                    Protocol::Sse => Step::SseStream(SsePlan {
+                    Protocol::Sse => Step::SseHold(SseHoldPlan {
                         url: url.clone(),
                         headers: SmallVec::new(),
-                        expect_chunks: None,
+                        subscribers: 1,
+                        hold_for: Duration::from_secs(1),
+                        reconnect: true,
                     }),
-                    Protocol::Ws => Step::WsRound(WsRoundPlan {
+                    Protocol::Ws => Step::WsEchoRtt(WsEchoRttPlan {
                         url: url.clone(),
                         headers: SmallVec::new(),
-                        message: url.clone(),
+                        connections: 1,
+                        msg_rate_per_conn: 1.0,
+                        correlate: crate::plan::CorrelateStrategy::PingPong,
+                        payload: url.clone(),
                     }),
                 };
                 Scenario {
@@ -1205,8 +1375,12 @@ mod tests {
             scenarios,
             vars,
             duration: Duration::from_secs(1),
-            warmup: None,
+            warmup: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            runs: 1,
             threads: 1,
+            mode: Mode::default(),
+            name: String::new(),
         }
     }
 

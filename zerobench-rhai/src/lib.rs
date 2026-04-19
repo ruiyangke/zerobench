@@ -14,7 +14,7 @@
 //! The CLI combines these with transport options and dispatches through
 //! the normal runner.
 //!
-//! # What's in the DSL (v0.0.1)
+//! # DSL surface
 //!
 //! See the module docs on [`builders`] for the full registered surface.
 //! Highlights:
@@ -30,9 +30,9 @@
 //! - `env("NAME")`, `env("NAME", "default")`, `slot("slot_name")`
 //!   (named `slot` not `var` because `var` is a reserved Rhai keyword).
 //!
-//! # Not in v0.0.1 (explicitly deferred)
+//! # Not yet supported
 //!
-//! - `extract_json` — needs JsonPath; defer.
+//! - `extract_json` — needs JsonPath; deferred.
 //! - `on_response` hooks — hot-path hook; explicitly out of scope.
 //! - `body_multipart` — out of scope.
 //!
@@ -118,6 +118,29 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     use rhai::packages::{CorePackage, Package};
     CorePackage::new().register_into_engine(&mut engine);
 
+    // String → number conversions. `CorePackage` doesn't include
+    // these (they live in `BasicArithPackage`, which we skip to
+    // keep the eval surface tight). A DSL that reads `env(...)` —
+    // which always returns a string — is unusable without them,
+    // so register the minimum pair explicitly. Bad input yields a
+    // runtime error via `EvalAltResult::ErrorRuntime`.
+    engine.register_fn("parse_int", |s: rhai::ImmutableString| -> Result<i64, Box<rhai::EvalAltResult>> {
+        s.trim().parse::<i64>().map_err(|e| {
+            Box::new(rhai::EvalAltResult::ErrorRuntime(
+                rhai::Dynamic::from(format!("parse_int({:?}): {e}", s.as_str())),
+                rhai::Position::NONE,
+            ))
+        })
+    });
+    engine.register_fn("parse_float", |s: rhai::ImmutableString| -> Result<f64, Box<rhai::EvalAltResult>> {
+        s.trim().parse::<f64>().map_err(|e| {
+            Box::new(rhai::EvalAltResult::ErrorRuntime(
+                rhai::Dynamic::from(format!("parse_float({:?}): {e}", s.as_str())),
+                rhai::Position::NONE,
+            ))
+        })
+    });
+
     // Cap a runaway script at ~10M operations. A well-formed plan builds
     // in well under a million ops; this guard rail catches infinite loops
     // and pathological recursion without affecting any real use case. The
@@ -191,7 +214,15 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     debug_assert!(plan.scenarios.iter().any(|s| s.steps.iter().any(|st| {
         matches!(
             st,
-            Step::Request(_) | Step::SseStream(_) | Step::WsRound(_)
+            Step::Request(_)
+                | Step::SseHold(_)
+                | Step::WsEchoRtt(_)
+                | Step::HttpColdConnect(_)
+                | Step::SseFanout(_)
+                | Step::SseReconnectStorm(_)
+                | Step::WsHold(_)
+                | Step::WsServerPushRtt(_)
+                | Step::WsFanout(_)
         )
     })));
 

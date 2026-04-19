@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -72,16 +73,35 @@ impl ErrorCounters {
         self.assertion_failed += other.assertion_failed;
     }
 
-    /// Total error count across all categories.
+    /// Total error count across all categories — the sum of
+    /// [`Self::hard_total`] and [`Self::soft_total`].
+    ///
+    /// Use this for overall reporting. Do **not** use it to gate
+    /// process exit status: a healthy saturate run against a stub
+    /// server that returns 404s will have `total() > 0` even though
+    /// the tool itself is working correctly. Use `hard_total()` for
+    /// exit-code decisions.
     pub fn total(&self) -> u64 {
-        self.connect
-            + self.read
-            + self.write
-            + self.timeout
-            + self.keepup
-            + self.status_4xx
-            + self.status_5xx
-            + self.assertion_failed
+        self.hard_total() + self.soft_total()
+    }
+
+    /// Transport-level failures: the tool couldn't complete the op at
+    /// all. These are the errors that should gate a non-zero exit.
+    ///
+    /// `connect` / `read` / `write` / `timeout` / `keepup` all mean
+    /// zerobench gave up on an op before the server decided anything.
+    pub fn hard_total(&self) -> u64 {
+        self.connect + self.read + self.write + self.timeout + self.keepup
+    }
+
+    /// Server-layer responses: the op completed end-to-end but the
+    /// server returned a non-2xx status or a user assertion fired.
+    ///
+    /// These are part of the benchmark *signal* (latency of a 4xx
+    /// path is still a real measurement), so they must not, by
+    /// default, fail the bench. Reports surface them separately.
+    pub fn soft_total(&self) -> u64 {
+        self.status_4xx + self.status_5xx + self.assertion_failed
     }
 
     /// Increment the counter for a given [`ErrorKind`].
@@ -157,6 +177,8 @@ pub struct SseExtras {
     /// completion to the first response byte.
     pub ttfb: Histogram<u64>,
     /// Inter-chunk gap between successive data events within a stream.
+    /// Populated by `SseHold` / `SseReconnectStorm`. Empty histogram
+    /// for `SseFanout` (use `broadcast_rtt` instead).
     pub chunk_gap: Histogram<u64>,
     /// Total number of data events received across all streams.
     pub chunks: u64,
@@ -166,6 +188,11 @@ pub struct SseExtras {
     pub streams_completed: u64,
     /// Payload bytes received on SSE streams (post-chunked-decoding).
     pub bytes_received: u64,
+    /// Broadcast round-trip time — populated by `SseFanout` only.
+    /// Empty for every other SSE backend. Kept as a dedicated slot so
+    /// consumers of `result.json` don't have to know the scenario
+    /// topology to interpret `chunk_gap`.
+    pub broadcast_rtt: Histogram<u64>,
 }
 
 impl Default for SseExtras {
@@ -176,6 +203,7 @@ impl Default for SseExtras {
             chunks: 0,
             streams_completed: 0,
             bytes_received: 0,
+            broadcast_rtt: new_hist(),
         }
     }
 }
@@ -185,6 +213,7 @@ impl SseExtras {
     pub fn merge(&mut self, other: &Self) {
         let _ = self.ttfb.add(&other.ttfb);
         let _ = self.chunk_gap.add(&other.chunk_gap);
+        let _ = self.broadcast_rtt.add(&other.broadcast_rtt);
         self.chunks += other.chunks;
         self.streams_completed += other.streams_completed;
         self.bytes_received += other.bytes_received;
@@ -196,7 +225,10 @@ impl SseExtras {
 pub struct WsExtras {
     /// Handshake time — TCP connect to 101 Switching Protocols.
     pub handshake: Histogram<u64>,
-    /// Per-message round-trip time.
+    /// Per-message round-trip time. Populated by `WsEchoRtt` (echo
+    /// RTT) and `WsServerPushRtt` (inter-message gap).
+    /// Empty for `WsFanout` (use `broadcast_rtt` instead) and
+    /// `WsHold`.
     pub rtt: Histogram<u64>,
     /// Text/Binary frames sent from this client.
     pub messages_sent: u64,
@@ -206,6 +238,9 @@ pub struct WsExtras {
     pub bytes_sent: u64,
     /// Payload bytes received.
     pub bytes_recv: u64,
+    /// Broadcast round-trip time — populated by `WsFanout` only.
+    /// Empty for every other WS backend.
+    pub broadcast_rtt: Histogram<u64>,
 }
 
 impl Default for WsExtras {
@@ -217,6 +252,7 @@ impl Default for WsExtras {
             messages_recv: 0,
             bytes_sent: 0,
             bytes_recv: 0,
+            broadcast_rtt: new_hist(),
         }
     }
 }
@@ -226,6 +262,7 @@ impl WsExtras {
     pub fn merge(&mut self, other: &Self) {
         let _ = self.handshake.add(&other.handshake);
         let _ = self.rtt.add(&other.rtt);
+        let _ = self.broadcast_rtt.add(&other.broadcast_rtt);
         self.messages_sent += other.messages_sent;
         self.messages_recv += other.messages_recv;
         self.bytes_sent += other.bytes_sent;
@@ -491,6 +528,290 @@ fn duration_to_hist_ns(d: Duration) -> u64 {
         HIST_HI_NS
     } else {
         ns as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Export — serde-compatible projection of Summary for result.json.
+//
+// HDR histograms don't implement Serialize; the canonical archival
+// format is an `.histlog` V2 compressed log (§PHILOSOPHY P3). For
+// We emit JSON-friendly percentiles + counts — sufficient
+// for the diff / replay fast paths. The `.histlog` sidecar adds the .histlog
+// alongside (both derived from the same Histogram source of truth).
+// ---------------------------------------------------------------------------
+
+/// Serialisable projection of [`Summary`] — the content of
+/// `result.json` in the archive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryExport {
+    /// Schema version — bumps on rename / retype / remove.
+    pub schema_version: u32,
+    /// Measurement duration in nanoseconds. Excludes warmup.
+    pub duration_ns: u64,
+    /// Completed operations count (HTTP req/resp, SSE stream, WS
+    /// round). See protocol-specific meaning on [`ScenarioStats`].
+    pub requests: u64,
+    /// Average rate over the measurement window (req/s).
+    pub rate_per_s: f64,
+    /// Bytes written across all connections.
+    pub bytes_sent: u64,
+    /// Bytes read across all connections.
+    pub bytes_recv: u64,
+    /// Overall latency percentile breakdown.
+    pub latency: LatencyExport,
+    /// Overall TTFB percentile breakdown (HTTP only — zeros for
+    /// non-HTTP runs).
+    pub ttfb: LatencyExport,
+    /// Error category counts.
+    pub errors: ErrorCountersExport,
+    /// Per-scenario breakdown.
+    pub scenarios: Vec<ScenarioExport>,
+    /// Per-run metric vectors, one entry per individual run when
+    /// `--runs N > 1`. Empty when the caller merged all runs into a
+    /// single aggregate (e.g. `probe`, `--runs 1`). Bootstrap CI
+    /// (§9.3 `run-bootstrap` strategy) resamples these values when
+    /// both sides of a `compare` have `per_run.len() ≥ 3`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_run: Vec<PerRunMetrics>,
+}
+
+/// Metrics captured from a single run — the elementary unit the
+/// run-level bootstrap resamples over. One entry per `--runs` loop
+/// iteration in `measure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerRunMetrics {
+    /// Run index (0-based) within this `measure` invocation.
+    pub index: u32,
+    /// Achieved rate (req/s) over the run's duration.
+    pub rate_per_s: f64,
+    /// Run-level request count.
+    pub requests: u64,
+    /// Run-level error total (sum across categories).
+    pub errors_total: u64,
+    /// Run-level HTTP request latency percentiles. Empty for
+    /// protocol-native-only runs (SSE hold / WS echo / fanout /
+    /// storm) — consumers should read the dedicated
+    /// `protocol_latency` slot below instead.
+    pub latency: LatencyExport,
+    /// Protocol-native primary-latency percentiles per the same
+    /// per-protocol rules as the terminal report (SseHold →
+    /// chunk_gap; WsEchoRtt / WsServerPushRtt → rtt; fanouts →
+    /// broadcast_rtt; reconnect_storm → reconnect-gap aka
+    /// chunk_gap slot). Empty for pure-HTTP runs. Consumers of
+    /// `--regress-on p99:+5%` should read whichever of
+    /// `latency` / `protocol_latency` is non-empty.
+    pub protocol_latency: LatencyExport,
+}
+
+impl SummaryExport {
+    /// Schema version for `result.json`.
+    pub const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Percentile breakdown extracted from an HDR histogram.
+///
+/// All values are in nanoseconds. Zero means "no samples recorded" —
+/// a histogram with zero samples returns zero at every percentile per
+/// hdrhistogram semantics. Not `Eq` because `mean_ns` / `stddev_ns`
+/// are `f64`; use [`PartialEq`] for exact matching or compare fields
+/// within tolerance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LatencyExport {
+    /// Sample count.
+    pub count: u64,
+    /// Minimum observed.
+    pub min_ns: u64,
+    /// 50th percentile.
+    pub p50_ns: u64,
+    /// 90th percentile.
+    pub p90_ns: u64,
+    /// 99th percentile.
+    pub p99_ns: u64,
+    /// 99.9th percentile.
+    pub p99_9_ns: u64,
+    /// 99.99th percentile.
+    pub p99_99_ns: u64,
+    /// Maximum observed.
+    pub max_ns: u64,
+    /// Arithmetic mean.
+    pub mean_ns: f64,
+    /// Standard deviation.
+    pub stddev_ns: f64,
+}
+
+impl LatencyExport {
+    /// Extract percentiles from an HDR histogram. An empty histogram
+    /// yields zeros across the board.
+    pub fn from_hist(h: &Histogram<u64>) -> Self {
+        Self {
+            count: h.len(),
+            min_ns: h.min(),
+            p50_ns: h.value_at_percentile(50.0),
+            p90_ns: h.value_at_percentile(90.0),
+            p99_ns: h.value_at_percentile(99.0),
+            p99_9_ns: h.value_at_percentile(99.9),
+            p99_99_ns: h.value_at_percentile(99.99),
+            max_ns: h.max(),
+            mean_ns: h.mean(),
+            stddev_ns: h.stdev(),
+        }
+    }
+}
+
+/// Flat error-counter snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorCountersExport {
+    /// TCP connect failures.
+    pub connect: u64,
+    /// Read failures.
+    pub read: u64,
+    /// Write failures.
+    pub write: u64,
+    /// Per-request deadline exceeded.
+    pub timeout: u64,
+    /// Scheduler couldn't keep up (token dropped).
+    pub keepup: u64,
+    /// Status 4xx.
+    pub status_4xx: u64,
+    /// Status 5xx.
+    pub status_5xx: u64,
+    /// Assertion failures.
+    pub assertion_failed: u64,
+}
+
+impl ErrorCountersExport {
+    /// Project an [`ErrorCounters`] into the serialisable form.
+    pub fn from_counters(e: &ErrorCounters) -> Self {
+        Self {
+            connect: e.connect,
+            read: e.read,
+            write: e.write,
+            timeout: e.timeout,
+            keepup: e.keepup,
+            status_4xx: e.status_4xx,
+            status_5xx: e.status_5xx,
+            assertion_failed: e.assertion_failed,
+        }
+    }
+}
+
+/// Per-scenario row in `result.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioExport {
+    /// Index into `Plan::scenarios`.
+    pub scenario_id: u16,
+    /// Completed operations attributed to this scenario.
+    pub requests: u64,
+    /// Latency breakdown.
+    pub latency: LatencyExport,
+    /// Errors attributed here.
+    pub errors: ErrorCountersExport,
+    /// SSE-specific metrics, present iff the scenario speaks SSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse: Option<SseExtrasExport>,
+    /// WS-specific metrics, present iff the scenario speaks WS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsExtrasExport>,
+}
+
+/// SSE extras in serialisable form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SseExtrasExport {
+    /// Time-to-first-byte histogram.
+    pub ttfb: LatencyExport,
+    /// Inter-chunk gap histogram.
+    pub chunk_gap: LatencyExport,
+    /// Total data events received.
+    pub chunks: u64,
+    /// Streams that saw a clean close / `[DONE]`.
+    pub streams_completed: u64,
+    /// Payload bytes received.
+    pub bytes_received: u64,
+    /// Broadcast RTT histogram (SseFanout only). Empty for every
+    /// other SSE backend.
+    pub broadcast_rtt: LatencyExport,
+}
+
+impl SseExtrasExport {
+    fn from(s: &SseExtras) -> Self {
+        Self {
+            ttfb: LatencyExport::from_hist(&s.ttfb),
+            chunk_gap: LatencyExport::from_hist(&s.chunk_gap),
+            chunks: s.chunks,
+            streams_completed: s.streams_completed,
+            bytes_received: s.bytes_received,
+            broadcast_rtt: LatencyExport::from_hist(&s.broadcast_rtt),
+        }
+    }
+}
+
+/// WS extras in serialisable form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WsExtrasExport {
+    /// Handshake latency histogram.
+    pub handshake: LatencyExport,
+    /// Round-trip histogram.
+    pub rtt: LatencyExport,
+    /// Messages sent.
+    pub messages_sent: u64,
+    /// Messages received.
+    pub messages_recv: u64,
+    /// Bytes sent.
+    pub bytes_sent: u64,
+    /// Bytes received.
+    pub bytes_recv: u64,
+    /// Broadcast RTT histogram (WsFanout only). Empty for every
+    /// other WS backend.
+    pub broadcast_rtt: LatencyExport,
+}
+
+impl WsExtrasExport {
+    fn from(w: &WsExtras) -> Self {
+        Self {
+            handshake: LatencyExport::from_hist(&w.handshake),
+            rtt: LatencyExport::from_hist(&w.rtt),
+            messages_sent: w.messages_sent,
+            messages_recv: w.messages_recv,
+            bytes_sent: w.bytes_sent,
+            bytes_recv: w.bytes_recv,
+            broadcast_rtt: LatencyExport::from_hist(&w.broadcast_rtt),
+        }
+    }
+}
+
+impl Summary {
+    /// Project this summary into the archive-ready JSON shape.
+    ///
+    /// Percentiles are sampled at the standard ladder
+    /// `[min, p50, p90, p99, p99.9, p99.99, max]` plus mean + stddev.
+    /// Per-scenario extras (SSE / WS) are included when the underlying
+    /// `ScenarioStats` carries them.
+    pub fn to_export(&self) -> SummaryExport {
+        SummaryExport {
+            schema_version: SummaryExport::SCHEMA_VERSION,
+            duration_ns: self.duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+            requests: self.requests,
+            rate_per_s: self.requests_per_sec(),
+            bytes_sent: self.bytes_sent,
+            bytes_recv: self.bytes_recv,
+            latency: LatencyExport::from_hist(&self.latency),
+            ttfb: LatencyExport::from_hist(&self.ttfb),
+            errors: ErrorCountersExport::from_counters(&self.errors),
+            scenarios: self
+                .per_scenario
+                .iter()
+                .map(|s| ScenarioExport {
+                    scenario_id: s.scenario_id,
+                    requests: s.requests,
+                    latency: LatencyExport::from_hist(&s.latency),
+                    errors: ErrorCountersExport::from_counters(&s.errors),
+                    sse: s.sse.as_ref().map(SseExtrasExport::from),
+                    ws: s.ws.as_ref().map(WsExtrasExport::from),
+                })
+                .collect(),
+            per_run: Vec::new(),
+        }
     }
 }
 

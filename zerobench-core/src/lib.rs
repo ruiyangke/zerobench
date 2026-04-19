@@ -2,8 +2,13 @@
 //!
 //! See `docs/design.md` in the repo root for the architectural overview.
 
+pub mod archive;
+pub mod calibrate;
+pub mod compare;
+pub mod fingerprint;
 pub mod histogram;
 pub mod live_snapshot;
+pub mod machine;
 pub mod plan;
 pub mod report;
 pub mod request_file;
@@ -16,11 +21,19 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
+pub use archive::{
+    load_histogram_from_histlog, Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions,
+};
+pub use calibrate::{ClientSelfCheck, LoopbackEcho, SelfCheckResult, Verdict};
+pub use fingerprint::{
+    canonical_sha256, plan_hash, run_id, target_fingerprint, url_fingerprint,
+    url_fingerprint_anonymous, IpFamilyTag,
+};
 pub use histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
+pub use machine::MachineFingerprint;
 pub use plan::{
-    Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, SsePlan,
-    Step, WsRoundPlan,
+    Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, Step,
 };
 pub use report::{
     print_json, print_jsonl_tick, print_prometheus, print_terminal, ColorChoice,
@@ -31,8 +44,14 @@ pub use request_file::{
 };
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
+pub use compare::{
+    ad_test, compare_all, compare_metric, holm_bonferroni, ks_test, AdResult, CompareOptions,
+    ComparisonResult, KsResult, Metric, Significance, StrategyUsed,
+};
 pub use stats::{
-    ErrorCounters, ErrorKind, ScenarioStats, SseExtras, Summary, TaskStats, WsExtras,
+    ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, PerRunMetrics, ScenarioExport,
+    ScenarioStats, SseExtras, SseExtrasExport, Summary, SummaryExport, TaskStats, WsExtras,
+    WsExtrasExport,
 };
 pub use stop::StopSignal;
 pub use template::{ExpandCtx, Template, TemplateError};

@@ -81,14 +81,23 @@ impl MioTlsStream {
         &mut self,
         poll: &mut mio::Poll,
         token: mio::Token,
+        timeout: std::time::Duration,
     ) -> io::Result<()> {
         let mut events = mio::Events::with_capacity(64);
+        let deadline = std::time::Instant::now() + timeout;
 
-        // Phase 1: wait for TCP connect to complete.
+        // wait for TCP connect to complete.
         // mio signals the socket as writable when connect() finishes.
         // Check for connect errors via `peer_addr()` or `take_error()`.
         loop {
-            poll.poll(&mut events, Some(std::time::Duration::from_secs(5)))?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tcp connect timed out",
+                ));
+            }
+            poll.poll(&mut events, Some(deadline - now))?;
             let mut connected = false;
             for event in events.iter() {
                 if event.token() == token {
@@ -120,10 +129,13 @@ impl MioTlsStream {
             }
         }
 
-        // Phase 2: drive TLS handshake.
-        let mut rounds = 0u32;
+        // drive TLS handshake — wall-clock bounded by the same deadline.
+        // The loop exits either on handshake completion, on an error, or
+        // when the deadline elapses. A prior round-count bound (>200)
+        // was removed: on slow servers a valid handshake legitimately
+        // takes many I/O rounds, and on fast servers 200 rounds is
+        // orders of magnitude past when the deadline itself would fire.
         loop {
-            rounds += 1;
             if !self.tls.is_handshaking() {
                 return Ok(());
             }
@@ -176,20 +188,33 @@ impl MioTlsStream {
             if !self.tls.is_handshaking() {
                 return Ok(());
             }
-            if rounds > 200 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tls handshake timed out",
                 ));
             }
-            // Wait for socket readiness
-            poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
+            // Bound the individual poll to at most 100ms so the outer
+            // loop still reacts to external signals (the thread may
+            // need to observe stop flags), but never past the deadline.
+            let remaining = deadline - now;
+            let poll_budget =
+                remaining.min(std::time::Duration::from_millis(100));
+            poll.poll(&mut events, Some(poll_budget))?;
         }
+    }
+
+    /// `true` if the rustls state machine has not yet finished the
+    /// handshake. Use in a multiplexing loop to decide when to
+    /// transition out of the handshake state.
+    pub fn is_handshaking(&self) -> bool {
+        self.tls.is_handshaking()
     }
 
     /// Perform pending TLS reads/writes on the underlying TCP stream.
     /// Call this whenever mio reports the socket is readable or writable.
-    pub(crate) fn do_tls_io(&mut self) -> io::Result<()> {
+    pub fn do_tls_io(&mut self) -> io::Result<()> {
         // Write pending TLS data to TCP
         if self.tls.wants_write() {
             match self.tls.write_tls(&mut self.tcp) {
@@ -318,6 +343,26 @@ impl MioStream {
     pub fn flush_tls(&mut self) {
         if let Self::Tls(s) = self {
             let _ = s.do_tls_io();
+        }
+    }
+
+    /// Drive one round of TLS I/O against the underlying TCP socket.
+    /// Plain streams return `Ok(())` unconditionally. Use in a
+    /// multiplexing event loop where multiple TLS connections share
+    /// one Poll and need to drive handshakes incrementally.
+    pub fn drive_tls_io(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Tls(s) => s.do_tls_io(),
+        }
+    }
+
+    /// `true` if this is a TLS stream and its handshake is still in
+    /// progress. Plain streams always return `false`.
+    pub fn is_handshaking(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Tls(s) => s.is_handshaking(),
         }
     }
 }

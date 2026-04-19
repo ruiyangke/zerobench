@@ -33,7 +33,7 @@
 use bytes::BytesMut;
 
 /// RFC 6455 §5.2 opcode values. We treat the enum as authoritative; any
-/// opcode byte outside this set surfaces as [`WsError::ProtocolOther`]
+/// opcode byte outside this set surfaces as [`FrameError::ProtocolOther`]
 /// at decode time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -101,7 +101,7 @@ pub struct FrameHeader {
 
 /// Errors produced by [`decode_frame`] and [`encode_frame`].
 #[derive(Debug, thiserror::Error)]
-pub enum WsError {
+pub enum FrameError {
     /// Not enough bytes in the buffer to decode a whole frame yet.
     /// Non-fatal — caller should read more and retry.
     #[error("need more data ({needed} bytes)")]
@@ -228,11 +228,11 @@ pub fn encode_close(code: u16, reason: &str, mask: [u8; 4], out: &mut Vec<u8>) -
 /// + hdr.payload_len]`.
 ///
 /// Server frames MUST NOT be masked (RFC 6455 §5.1); if the MASK bit is
-/// set on input this returns [`WsError::ServerFrameMasked`].
-pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
+/// set on input this returns [`FrameError::ServerFrameMasked`].
+pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, FrameError> {
     // Every frame is at least 2 bytes (header + length byte).
     if buf.len() < 2 {
-        return Err(WsError::NeedMore {
+        return Err(FrameError::NeedMore {
             needed: 2 - buf.len(),
         });
     }
@@ -243,14 +243,14 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
     let fin = (b0 & 0x80) != 0;
     let rsv = (b0 & 0x70) >> 4;
     if rsv != 0 {
-        return Err(WsError::ReservedBitSet(rsv));
+        return Err(FrameError::ReservedBitSet(rsv));
     }
 
-    let opcode = Opcode::from_bits(b0).ok_or(WsError::UnknownOpcode(b0 & 0x0f))?;
+    let opcode = Opcode::from_bits(b0).ok_or(FrameError::UnknownOpcode(b0 & 0x0f))?;
 
     let masked = (b1 & 0x80) != 0;
     if masked {
-        return Err(WsError::ServerFrameMasked);
+        return Err(FrameError::ServerFrameMasked);
     }
 
     let short_len = (b1 & 0x7f) as u64;
@@ -258,7 +258,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
         0..=125 => (short_len as usize, 2usize),
         126 => {
             if buf.len() < 4 {
-                return Err(WsError::NeedMore {
+                return Err(FrameError::NeedMore {
                     needed: 4 - buf.len(),
                 });
             }
@@ -267,7 +267,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
         }
         127 => {
             if buf.len() < 10 {
-                return Err(WsError::NeedMore {
+                return Err(FrameError::NeedMore {
                     needed: 10 - buf.len(),
                 });
             }
@@ -278,7 +278,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
             // MUST be 0. That's enforced by the `> MAX_PAYLOAD` check
             // below since MAX_PAYLOAD (64 MiB) is far below 2^63.
             if n > MAX_PAYLOAD as u64 {
-                return Err(WsError::PayloadTooLarge(n as usize));
+                return Err(FrameError::PayloadTooLarge(n as usize));
             }
             (n as usize, 10)
         }
@@ -287,10 +287,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
 
     if opcode.is_control() {
         if !fin {
-            return Err(WsError::FragmentedControlFrame);
+            return Err(FrameError::FragmentedControlFrame);
         }
         if payload_len > 125 {
-            return Err(WsError::ControlFrameTooLarge(payload_len));
+            return Err(FrameError::ControlFrameTooLarge(payload_len));
         }
     }
 
@@ -300,7 +300,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<FrameHeader, WsError> {
     let total_len = payload_start + payload_len;
 
     if buf.len() < total_len {
-        return Err(WsError::NeedMore {
+        return Err(FrameError::NeedMore {
             needed: total_len - buf.len(),
         });
     }
@@ -438,7 +438,7 @@ mod tests {
         // Bytes: FIN+text | MASK+len=2 | mask(4) | payload(2)
         let bad = [0x81u8, 0x82, 0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00];
         let err = decode_frame(&bad).unwrap_err();
-        assert!(matches!(err, WsError::ServerFrameMasked));
+        assert!(matches!(err, FrameError::ServerFrameMasked));
     }
 
     /// Short buffer → NeedMore with a correct "bytes remaining" hint.
@@ -446,7 +446,7 @@ mod tests {
     fn decode_need_more_for_header() {
         let err = decode_frame(&[0x81]).unwrap_err();
         match err {
-            WsError::NeedMore { needed } => assert_eq!(needed, 1),
+            FrameError::NeedMore { needed } => assert_eq!(needed, 1),
             _ => panic!("expected NeedMore"),
         }
     }
@@ -458,7 +458,7 @@ mod tests {
         // FIN+text, len=126, partial header
         let err = decode_frame(&[0x81, 0x7E, 0x00]).unwrap_err();
         match err {
-            WsError::NeedMore { needed } => assert_eq!(needed, 1),
+            FrameError::NeedMore { needed } => assert_eq!(needed, 1),
             _ => panic!("expected NeedMore"),
         }
     }
@@ -469,7 +469,7 @@ mod tests {
         // FIN+text, len=127, no payload bytes yet
         let err = decode_frame(&[0x81, 0x7F, 0, 0, 0, 0]).unwrap_err();
         match err {
-            WsError::NeedMore { needed } => assert_eq!(needed, 4),
+            FrameError::NeedMore { needed } => assert_eq!(needed, 4),
             _ => panic!("expected NeedMore"),
         }
     }
@@ -509,7 +509,7 @@ mod tests {
         let frame = [0x09u8, 0x00];
         assert!(matches!(
             decode_frame(&frame).unwrap_err(),
-            WsError::FragmentedControlFrame
+            FrameError::FragmentedControlFrame
         ));
     }
 
@@ -521,7 +521,7 @@ mod tests {
         frame.extend_from_slice(&vec![0u8; 126]);
         assert!(matches!(
             decode_frame(&frame).unwrap_err(),
-            WsError::ControlFrameTooLarge(126)
+            FrameError::ControlFrameTooLarge(126)
         ));
     }
 
@@ -531,7 +531,7 @@ mod tests {
         let frame = [0x83u8, 0x00];
         assert!(matches!(
             decode_frame(&frame).unwrap_err(),
-            WsError::UnknownOpcode(0x3)
+            FrameError::UnknownOpcode(0x3)
         ));
     }
 
@@ -542,7 +542,7 @@ mod tests {
         let frame = [0xC1u8, 0x00];
         assert!(matches!(
             decode_frame(&frame).unwrap_err(),
-            WsError::ReservedBitSet(_)
+            FrameError::ReservedBitSet(_)
         ));
     }
 
@@ -570,7 +570,7 @@ mod tests {
         frame.extend_from_slice(&big);
         assert!(matches!(
             decode_frame(&frame).unwrap_err(),
-            WsError::PayloadTooLarge(_)
+            FrameError::PayloadTooLarge(_)
         ));
     }
 
