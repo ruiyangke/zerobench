@@ -257,6 +257,43 @@ pub struct MeasureArgs {
           default_value = "0",
           help_heading = "WebSocket")]
     pub ws_expected_rate: f64,
+
+    // -------------------------------------------------------------------
+    // Fanout / reconnect-storm (CLI surface — Rhai is richer)
+    //
+    // These need a trigger URL (for fanouts) or a kill rate (for
+    // storm), so the CLI accepts the minimum viable knobs. Multi-
+    // header / advanced scheduling still goes through `zerobench run`
+    // with a Rhai script.
+    // -------------------------------------------------------------------
+    /// Open N SSE subscribers and fire `--trigger-url` periodically;
+    /// report broadcast RTT.
+    #[arg(long = "sse-fanout", value_name = "SUBSCRIBERS", help_heading = "SSE")]
+    pub sse_fanout: Option<u32>,
+
+    /// Open N WS subscribers and fire `--trigger-url` periodically;
+    /// report broadcast RTT.
+    #[arg(long = "ws-fanout", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    pub ws_fanout: Option<u32>,
+
+    /// Trigger URL for `--sse-fanout` / `--ws-fanout`. HTTP POST.
+    /// Templates (`{{counter}}`, `{{uuid}}`) re-render per firing.
+    #[arg(long = "trigger-url", value_name = "URL",
+          help_heading = "Fanout")]
+    pub trigger_url: Option<String>,
+
+    /// Open N SSE subscribers and kill them at `--kill-rate` per second
+    /// (exponential interval), reconnecting with Last-Event-ID.
+    #[arg(long = "sse-reconnect-storm", value_name = "SUBSCRIBERS",
+          help_heading = "SSE")]
+    pub sse_reconnect_storm: Option<u32>,
+
+    /// Aggregate kill rate (per subscriber per second) for
+    /// `--sse-reconnect-storm`.
+    #[arg(long = "kill-rate", value_name = "RATE",
+          default_value = "0.1",
+          help_heading = "SSE")]
+    pub kill_rate: f64,
 }
 
 fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
@@ -826,7 +863,81 @@ fn build_measure_plan(
     let mut vars = VarRegistry::new();
     let url = Template::compile(&args.url, &mut vars)?;
 
-    let scenario = if let Some(connections) = args.ws_hold {
+    let scenario = if let Some(subscribers) = args.sse_fanout {
+        let Some(trig) = args.trigger_url.as_ref() else {
+            return Err("--sse-fanout requires --trigger-url".into());
+        };
+        let trigger = Template::compile(trig, &mut vars)?;
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        Scenario {
+            name: "sse-fanout".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: subscribers as usize,
+            },
+            steps: vec![Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
+                subscribers: SseHoldPlan {
+                    url,
+                    headers: SmallVec::new(),
+                    subscribers,
+                    hold_for,
+                    reconnect: true,
+                },
+                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+                    url: trigger,
+                    body: None,
+                },
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+            })],
+        }
+    } else if let Some(connections) = args.ws_fanout {
+        let Some(trig) = args.trigger_url.as_ref() else {
+            return Err("--ws-fanout requires --trigger-url".into());
+        };
+        let trigger = Template::compile(trig, &mut vars)?;
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        Scenario {
+            name: "ws-fanout".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: connections as usize,
+            },
+            steps: vec![Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
+                subscribers: zerobench_core::plan::WsHoldPlan {
+                    url,
+                    headers: SmallVec::new(),
+                    connections,
+                    heartbeat: args.ws_heartbeat.unwrap_or(Duration::from_secs(25)),
+                    heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                    hold_for,
+                },
+                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+                    url: trigger,
+                    body: None,
+                },
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+            })],
+        }
+    } else if let Some(subscribers) = args.sse_reconnect_storm {
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        Scenario {
+            name: "sse-reconnect-storm".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: subscribers as usize,
+            },
+            steps: vec![Step::SseReconnectStorm(
+                zerobench_core::plan::SseReconnectStormPlan {
+                    subscribers: SseHoldPlan {
+                        url,
+                        headers: SmallVec::new(),
+                        subscribers,
+                        hold_for,
+                        reconnect: true,
+                    },
+                    kill_rate_per_s: args.kill_rate,
+                    verify_last_event_id: true,
+                },
+            )],
+        }
+    } else if let Some(connections) = args.ws_hold {
         // WsHold — N persistent connections + heartbeat.
         let hold_for = args.hold_for.unwrap_or(args.duration);
         let heartbeat = args.ws_heartbeat.unwrap_or(Duration::from_secs(25));
@@ -1029,6 +1140,11 @@ mod tests {
             ws_heartbeat: None,
             ws_push: None,
             ws_expected_rate: 0.0,
+            sse_fanout: None,
+            ws_fanout: None,
+            trigger_url: None,
+            sse_reconnect_storm: None,
+            kill_rate: 0.1,
         }
     }
 

@@ -118,14 +118,14 @@ pub fn run_ws_fanout_from_plan_threaded(
         let trigger_triggers = Arc::clone(&triggers);
         let trigger_target = target.clone();
         let trigger_opts = opts.clone();
-        let trigger_url_str = render_template(&trigger_url);
+        let trigger_url_tpl = trigger_url.clone();
         let trigger_handle = std::thread::Builder::new()
             .name("zerobench-ws-fanout-trigger".into())
             .spawn(move || {
                 run_trigger_loop(
                     &trigger_target,
                     &trigger_opts,
-                    &trigger_url_str,
+                    &trigger_url_tpl,
                     wall_deadline,
                     &trigger_stop,
                     &trigger_triggers,
@@ -250,21 +250,33 @@ fn run_one_subscriber(
 fn run_trigger_loop(
     target: &Target,
     opts: &TransportOpts,
-    trigger_url: &str,
+    trigger_url: &zerobench_core::Template,
     deadline: Instant,
     stop: &AtomicBool,
     triggers: &Mutex<Vec<Instant>>,
 ) {
     let interval = Duration::from_millis(TRIGGER_INTERVAL_MS);
     let mut next = Instant::now() + interval;
+    let mut rng = zerobench_core::rng::from_entropy();
+    let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         let now = Instant::now();
         if now < next {
             std::thread::sleep((next - now).min(Duration::from_millis(100)));
             continue;
         }
+        let mut url_buf: Vec<u8> = Vec::with_capacity(128);
+        {
+            let mut ctx = zerobench_core::ExpandCtx {
+                rng: &mut rng,
+                counter: &counter,
+                scenario_vars: &[],
+            };
+            trigger_url.expand_into(&mut url_buf, &mut ctx);
+        }
+        let url_str = String::from_utf8_lossy(&url_buf).to_string();
         let t = Instant::now();
-        if fire_http_trigger(target, opts, trigger_url).is_ok() {
+        if fire_http_trigger(target, opts, &url_str).is_ok() {
             triggers.lock().expect("triggers mutex").push(t);
         }
         next = Instant::now() + interval;
