@@ -46,8 +46,8 @@ pub use request_file::{
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
 pub use compare::{
-    compare_all, compare_metric, ks_test, CompareOptions, ComparisonResult, KsResult, Metric,
-    Significance, StrategyUsed,
+    ad_test, compare_all, compare_metric, holm_bonferroni, ks_test, AdResult, CompareOptions,
+    ComparisonResult, KsResult, Metric, Significance, StrategyUsed,
 };
 pub use stats::{
     ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, PerRunMetrics, ScenarioExport,

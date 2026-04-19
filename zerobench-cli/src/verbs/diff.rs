@@ -22,9 +22,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use zerobench_core::archive::load_histogram_from_histlog;
-use zerobench_core::compare::{compare_all, ks_test, CompareOptions, Metric, StrategyUsed};
+use zerobench_core::compare::{
+    ad_test, compare_all, holm_bonferroni, ks_test, CompareOptions, Metric, StrategyUsed,
+};
 use zerobench_core::{LatencyExport, Significance, SummaryExport};
 
 // ---------------------------------------------------------------------------
@@ -50,6 +52,35 @@ pub struct CompareArgs {
     /// Example: `--regress-on p99:+5%,p99_9:+10%,error_rate:+0.01%`
     #[arg(long = "regress-on")]
     pub regress_on: Option<String>,
+
+    /// Distribution-level comparison strategy when sibling
+    /// result.histlog files are present. `auto` reports both AD and
+    /// KS; `ad` / `ks` pick one; `none` skips the distribution line.
+    /// The bootstrap CI table (when per_run ≥ 3) is always shown
+    /// independently.
+    #[arg(long = "compare-strategy", value_enum,
+          default_value_t = CompareStrategyArg::Auto)]
+    pub compare_strategy: CompareStrategyArg,
+
+    /// Apply Holm-Bonferroni correction to the per-metric p-values
+    /// from the distribution test. Relevant when you gate on
+    /// multiple metrics simultaneously — controls family-wise
+    /// error rate.
+    #[arg(long = "holm-bonferroni", action = clap::ArgAction::SetTrue)]
+    pub holm_bonferroni: bool,
+}
+
+/// Which distribution-level test to run in the diff output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompareStrategyArg {
+    /// Auto — runs both AD and KS when histlogs are available.
+    Auto,
+    /// Anderson-Darling (tail-sensitive; PHILOSOPHY default for N=1).
+    Ad,
+    /// Kolmogorov-Smirnov.
+    Ks,
+    /// None — skip distribution-level tests entirely.
+    None,
 }
 
 /// One parsed `METRIC:+PCT%` threshold.
@@ -187,23 +218,65 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     render_table(&baseline, &current, &rows, &args);
 
-    // Phase 8b: if the sibling result.histlog exists on both sides,
-    // run a two-sample Kolmogorov–Smirnov distribution test and
-    // report it as a one-line verdict alongside the per-metric CI
-    // table. Distribution-level test complements the metric-level
-    // bootstrap: KS answers "are these two populations the same at
-    // all?", bootstrap gives "by how much does each percentile differ?"
-    let ks_line = try_ks_from_sibling_histlogs(&args.baseline, &args.current);
-    if let Some((d, p, n_a, n_b, sig)) = ks_line {
-        println!();
-        let verdict = match sig {
-            Significance::Significant => "differ (p < 0.05)",
-            Significance::NotSignificant => "consistent (p ≥ 0.05)",
-            Significance::NotApplicable => "n/a (empty histogram)",
-        };
-        println!(
-            "KS two-sample: D={d:.4}  p={p:.4}  N={n_a}/{n_b}  → distributions {verdict}",
-        );
+    // Phase 8b/8c: if the sibling result.histlog files are present,
+    // run distribution-level tests. AD is tail-sensitive (PHILOSOPHY
+    // default for N=1); KS is the classic less-tail-sensitive
+    // comparison. --compare-strategy chooses which to show.
+    if !matches!(args.compare_strategy, CompareStrategyArg::None) {
+        let dist_hists = try_load_sibling_histograms(&args.baseline, &args.current);
+        if let Some((a_hist, b_hist)) = dist_hists {
+            println!();
+            let mut dist_pvalues: Vec<(&'static str, f64)> = Vec::new();
+            if matches!(
+                args.compare_strategy,
+                CompareStrategyArg::Ad | CompareStrategyArg::Auto
+            ) {
+                let r = ad_test(&a_hist, &b_hist);
+                let verdict = match r.significance {
+                    Significance::Significant => "differ (p < 0.05)",
+                    Significance::NotSignificant => "consistent (p ≥ 0.05)",
+                    Significance::NotApplicable => "n/a (empty histogram)",
+                };
+                println!(
+                    "AD two-sample: A²={:.3}  T={:.3}  p={:.4}  N={}/{}  → {verdict}",
+                    r.a_squared, r.standardized, r.p_value, r.n_a, r.n_b
+                );
+                if matches!(r.significance, Significance::Significant | Significance::NotSignificant) {
+                    dist_pvalues.push(("AD", r.p_value));
+                }
+            }
+            if matches!(
+                args.compare_strategy,
+                CompareStrategyArg::Ks | CompareStrategyArg::Auto
+            ) {
+                let r = ks_test(&a_hist, &b_hist);
+                let verdict = match r.significance {
+                    Significance::Significant => "differ (p < 0.05)",
+                    Significance::NotSignificant => "consistent (p ≥ 0.05)",
+                    Significance::NotApplicable => "n/a (empty histogram)",
+                };
+                println!(
+                    "KS two-sample: D={:.4}  p={:.4}  N={}/{}  → {verdict}",
+                    r.d_statistic, r.p_value, r.n_a, r.n_b
+                );
+                if matches!(r.significance, Significance::Significant | Significance::NotSignificant) {
+                    dist_pvalues.push(("KS", r.p_value));
+                }
+            }
+
+            if args.holm_bonferroni && dist_pvalues.len() > 1 {
+                let raw: Vec<f64> = dist_pvalues.iter().map(|(_, p)| *p).collect();
+                let adj = holm_bonferroni(&raw);
+                println!();
+                println!("Holm-Bonferroni adjusted (family-wise α):");
+                for (i, (name, raw_p)) in dist_pvalues.iter().enumerate() {
+                    println!(
+                        "  {name:6}: raw p={raw_p:.4}  → adjusted p={:.4}",
+                        adj[i]
+                    );
+                }
+            }
+        }
     }
 
     if used_bootstrap {
@@ -335,14 +408,15 @@ fn load_export(path: &PathBuf) -> Result<SummaryExport, Box<dyn std::error::Erro
     Ok(export)
 }
 
-/// Given `<dir>/result.json` paths for both sides, look for the
-/// sibling `<dir>/result.histlog` on each. If both load, run KS.
-/// Return `None` on any miss — callers treat KS as opt-in, not
-/// required.
-fn try_ks_from_sibling_histlogs(
+/// Given `<dir>/result.json` paths for both sides, load the sibling
+/// `<dir>/result.histlog` on each and return the two histograms.
+/// Returns `None` when either side lacks a histlog or fails to
+/// parse. Callers treat distribution-level tests as opt-in via
+/// presence of the sidecar.
+fn try_load_sibling_histograms(
     baseline_json: &PathBuf,
     current_json: &PathBuf,
-) -> Option<(f64, f64, u64, u64, Significance)> {
+) -> Option<(hdrhistogram::Histogram<u64>, hdrhistogram::Histogram<u64>)> {
     let a_path = baseline_json.with_file_name("result.histlog");
     let b_path = current_json.with_file_name("result.histlog");
     if !a_path.exists() || !b_path.exists() {
@@ -350,8 +424,7 @@ fn try_ks_from_sibling_histlogs(
     }
     let a = load_histogram_from_histlog(&a_path).ok()?;
     let b = load_histogram_from_histlog(&b_path).ok()?;
-    let r = ks_test(&a, &b);
-    Some((r.d_statistic, r.p_value, r.n_a, r.n_b, r.significance))
+    Some((a, b))
 }
 
 // ---------------------------------------------------------------------------
