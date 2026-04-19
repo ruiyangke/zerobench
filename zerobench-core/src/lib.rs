@@ -2,6 +2,7 @@
 //!
 //! See `docs/design.md` in the repo root for the architectural overview.
 
+pub mod calibrate;
 pub mod histogram;
 pub mod live_snapshot;
 pub mod plan;
@@ -16,6 +17,7 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
+pub use calibrate::{ClientSelfCheck, LoopbackEcho, SelfCheckResult, Verdict};
 pub use histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use plan::{
