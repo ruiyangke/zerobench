@@ -69,7 +69,7 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
-    _tls_config: Option<Arc<ClientConfig>>,
+    tls_config: Option<Arc<ClientConfig>>,
     // Per-session event recording would flood the per-second snapshot
     // with non-latency values during kill/reconnect churn; deferred
     // for a sharper integration that surfaces reconnect_succeeded /
@@ -120,10 +120,19 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
                 let opts = opts.clone();
                 let plan = storm_plan.clone();
                 let stop = Arc::clone(&stop);
+                let tls = tls_config.clone();
                 std::thread::Builder::new()
                     .name("zerobench-sse-storm".into())
                     .spawn(move || {
-                        run_one_subscriber(&target, &opts, &plan, wall_deadline, &stop, kill_rate)
+                        run_one_subscriber(
+                            &target,
+                            &opts,
+                            &plan,
+                            wall_deadline,
+                            &stop,
+                            kill_rate,
+                            tls.as_ref(),
+                        )
                     })
                     .expect("spawn storm subscriber")
             })
@@ -182,6 +191,7 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
 /// Run one subscriber — connect, read events, die at exponential
 /// intervals then reconnect with Last-Event-ID. Returns (stats, ttfb
 /// of first connect, reconnect-gap samples).
+#[allow(clippy::too_many_arguments)]
 fn run_one_subscriber(
     target: &Target,
     opts: &TransportOpts,
@@ -189,6 +199,7 @@ fn run_one_subscriber(
     deadline: Instant,
     stop: &AtomicBool,
     kill_rate: f64,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) -> (SubStats, Option<Duration>, Vec<Duration>) {
     let mut stats = SubStats::new();
     let mut first_ttfb: Option<Duration> = None;
@@ -223,6 +234,7 @@ fn run_one_subscriber(
             session_deadline,
             stop,
             prior_id.as_deref(),
+            tls_config,
         ) {
             Ok(session) => {
                 if first_ttfb.is_none() {
@@ -235,9 +247,21 @@ fn run_one_subscriber(
                 }
                 if !first_connect {
                     stats.reconnects_succeeded += 1;
-                    // C5: Honest reconnect gap = prior-session-end →
-                    // new-session-first-byte. Only recordable when we
-                    // saw a first byte this session.
+                    // C5: reconnect gap = prior-session-end →
+                    // new-session-first-byte. Caveat per the
+                    // post-fix audit item #13: on servers with
+                    // long event intervals, first_byte_at includes
+                    // the HTTP 200 response line + potentially the
+                    // first retry: / comment but NOT the first
+                    // data event — SSE servers that emit response
+                    // headers immediately give a clean
+                    // reconnect-latency signal; servers that only
+                    // flush bytes when they have real events
+                    // inflate the histogram with their own event
+                    // cadence. The histogram label is "chunk_gap"
+                    // in the archive, which is deliberate aliasing
+                    // — a dedicated "reconnect_connect_latency"
+                    // slot is a future SseExtras extension.
                     if let (Some(prior_end), Some(first_byte)) =
                         (prior_session_end, session.first_byte_at)
                     {
@@ -296,6 +320,7 @@ struct SessionOutcome {
     saw_prior_id: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one_session(
     target: &Target,
     opts: &TransportOpts,
@@ -303,6 +328,7 @@ fn run_one_session(
     deadline: Instant,
     stop: &AtomicBool,
     expected_prior_id: Option<&str>,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) -> Result<SessionOutcome, SessionErr> {
     let addr = target.resolve(opts).map_err(|_| SessionErr::Connect)?;
     let mut poll = Poll::new().map_err(|_| SessionErr::Connect)?;
@@ -319,7 +345,27 @@ fn run_one_session(
     if tcp.peer_addr().is_err() {
         return Err(SessionErr::Connect);
     }
-    let mut stream = MioStream::Plain(tcp);
+    let mut stream = if target.tls {
+        let cfg = tls_config.ok_or(SessionErr::Connect)?;
+        let sni = target.sni_name().to_string();
+        let tls = zerobench_http::mio_tls::MioTlsStream::new(tcp, Arc::clone(cfg), &sni)
+            .map_err(|_| SessionErr::Connect)?;
+        let mut s = MioStream::Tls(tls);
+        let hs_start = Instant::now();
+        while s.is_handshaking() {
+            if hs_start.elapsed() > Duration::from_secs(5) {
+                return Err(SessionErr::Connect);
+            }
+            s.drive_tls_io().map_err(|_| SessionErr::Connect)?;
+            if !s.is_handshaking() {
+                break;
+            }
+            let _ = poll.poll(&mut events, Some(Duration::from_millis(200)));
+        }
+        s
+    } else {
+        MioStream::Plain(tcp)
+    };
 
     let request = build_request(target, plan, expected_prior_id);
     let mut write_pos = 0;

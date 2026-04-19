@@ -114,9 +114,12 @@ fn run_one_echo_rtt(
     let mut send_buf: Vec<u8> = Vec::with_capacity(32 + payload_suffix.len());
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        // Intended start time for this send. Skip pacing when
-        // msg_rate_per_conn == 0.
-        if interval_ns > 0 {
+        // Intended start time for this send — the slot the token
+        // bucket allocated us. RTT is measured from THIS instant
+        // (not from when the client actually got around to calling
+        // send_text) so client-side scheduling jitter doesn't
+        // double-count into the RTT histogram. PHILOSOPHY §P6 / §1.
+        let intended_start = if interval_ns > 0 {
             let target_at = base + Duration::from_nanos(intended_ns);
             let now = Instant::now();
             if target_at > now {
@@ -129,7 +132,11 @@ fn run_one_echo_rtt(
                 }
             }
             intended_ns = intended_ns.saturating_add(interval_ns);
-        }
+            target_at
+        } else {
+            // Saturate mode: no pacing. Intended == actual.
+            Instant::now()
+        };
 
         // Build payload: 16 hex chars of monotonic id + '|' + suffix.
         seq = seq.wrapping_add(1);
@@ -138,7 +145,6 @@ fn run_one_echo_rtt(
         write_hex16(id_ns, &mut send_buf);
         send_buf.push(b'|');
         send_buf.extend_from_slice(&payload_suffix);
-        let send_at = Instant::now();
 
         if let Err(_e) = conn.send_text(&send_buf) {
             stats.errors_write += 1;
@@ -152,7 +158,7 @@ fn run_one_echo_rtt(
         let prefix: &[u8] = &send_buf[..16];
         match recv_matching(&mut conn, prefix, deadline, stop) {
             Ok(bytes) => {
-                let rtt = send_at.elapsed();
+                let rtt = Instant::now().saturating_duration_since(intended_start);
                 let _ = stats.rtt.record(duration_to_hist_ns(rtt));
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(bytes as u64);

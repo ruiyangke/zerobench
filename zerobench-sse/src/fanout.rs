@@ -73,7 +73,7 @@ pub fn run_sse_fanout_from_plan_threaded(
     opts: &TransportOpts,
     plan: &Plan,
     duration: Duration,
-    _tls_config: Option<Arc<ClientConfig>>,
+    tls_config: Option<Arc<ClientConfig>>,
     // LiveSnapshot plumbing is accepted for API symmetry but not
     // populated yet — broadcast-RTT is computed post-hoc via
     // trigger/event correlation, and per-event live recording would
@@ -140,10 +140,18 @@ pub fn run_sse_fanout_from_plan_threaded(
                 let opts = opts.clone();
                 let req = request_bytes.clone();
                 let stop = Arc::clone(&stop);
+                let tls = tls_config.clone();
                 std::thread::Builder::new()
                     .name("zerobench-sse-fanout-sub".into())
                     .spawn(move || {
-                        run_one_subscriber(&target, &opts, &req, wall_deadline, &stop)
+                        run_one_subscriber(
+                            &target,
+                            &opts,
+                            &req,
+                            wall_deadline,
+                            &stop,
+                            tls.as_ref(),
+                        )
                     })
                     .expect("spawn subscriber")
             })
@@ -154,12 +162,14 @@ pub fn run_sse_fanout_from_plan_threaded(
 
         // Trigger thread. Owns a Template (not a pre-rendered string)
         // so `{{counter}}` and `{{uuid}}` in the trigger URL advance
-        // per firing — closing M2 from the audit.
+        // per firing — closing M2 from the audit. TLS config flows
+        // through so https:// trigger URLs work.
         let trigger_stop = Arc::clone(&stop);
         let trigger_triggers = Arc::clone(&triggers);
         let trigger_target = target.clone();
         let trigger_opts = opts.clone();
         let trigger_url_tpl = trigger_url.clone();
+        let trigger_tls = tls_config.clone();
         let trigger_handle = std::thread::Builder::new()
             .name("zerobench-sse-fanout-trigger".into())
             .spawn(move || {
@@ -170,6 +180,7 @@ pub fn run_sse_fanout_from_plan_threaded(
                     wall_deadline,
                     &trigger_stop,
                     &trigger_triggers,
+                    trigger_tls.as_ref(),
                 );
             })
             .expect("spawn trigger");
@@ -204,15 +215,26 @@ pub fn run_sse_fanout_from_plan_threaded(
             // multiple consecutive triggers and double-count.
             let mut ev_iter = s.events.iter().peekable();
             for &t_sent in &trigger_times {
+                let mut matched = false;
                 while let Some(&&ev) = ev_iter.peek() {
                     if ev >= t_sent {
                         let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
                             .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         ev_iter.next();
+                        matched = true;
                         break;
                     }
                     ev_iter.next();
+                }
+                if !matched {
+                    // Trigger produced no broadcast for this subscriber
+                    // (subscriber disconnected early, or broadcast was
+                    // lost). Count as a read error so the verdict
+                    // reflects missing data rather than silently
+                    // dropping it — this shows up in errors.read on
+                    // the scenario and in the exit code.
+                    errors_read = errors_read.saturating_add(1);
                 }
             }
         }
@@ -257,6 +279,7 @@ fn run_trigger_loop(
     deadline: Instant,
     stop: &AtomicBool,
     triggers: &Mutex<Vec<Instant>>,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) {
     let interval = Duration::from_millis(TRIGGER_INTERVAL_MS);
     let mut next = Instant::now() + interval;
@@ -280,7 +303,7 @@ fn run_trigger_loop(
         }
         let url_str = String::from_utf8_lossy(&url_buf).to_string();
         let t = Instant::now();
-        if fire_trigger(target, opts, &url_str).is_ok() {
+        if fire_trigger(target, opts, &url_str, tls_config).is_ok() {
             triggers.lock().expect("triggers mutex").push(t);
         }
         next = Instant::now() + interval;
@@ -294,6 +317,7 @@ fn fire_trigger(
     target: &Target,
     opts: &TransportOpts,
     trigger_url: &str,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) -> std::io::Result<()> {
     let path = match trigger_url.find("://").and_then(|i| trigger_url[i + 3..].find('/')) {
         Some(rel) => {
@@ -302,7 +326,7 @@ fn fire_trigger(
         }
         None => "/",
     };
-    zerobench_http::simple_post::fire_http_post(target, opts, path, &[], None)
+    zerobench_http::simple_post::fire_http_post(target, opts, path, &[], tls_config)
 }
 
 /// Render a static template to a String. Fanout triggers can't use
@@ -348,6 +372,7 @@ fn run_one_subscriber(
     request: &[u8],
     deadline: Instant,
     stop: &AtomicBool,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats::new();
     let addr = match target.resolve(opts) {
@@ -381,15 +406,51 @@ fn run_one_subscriber(
         stats.errors_connect += 1;
         return stats;
     }
-    let mut stream = MioStream::Plain(tcp);
 
-    // Wait for connect.
+    // Wait for TCP connect.
     if !wait_event(&mut poll, &mut events, opts.connect_timeout, |e| {
         e.is_writable() && e.token() == POLL_TOKEN
     }) {
         stats.errors_connect += 1;
         return stats;
     }
+
+    // Wrap in TLS when the target is https://. The MioStream enum
+    // hides plain vs TLS from the rest of the subscriber loop.
+    let mut stream = if target.tls {
+        let Some(cfg) = tls_config else {
+            stats.errors_connect += 1;
+            return stats;
+        };
+        let sni = target.sni_name().to_string();
+        let tls = match zerobench_http::mio_tls::MioTlsStream::new(tcp, Arc::clone(cfg), &sni) {
+            Ok(t) => t,
+            Err(_) => {
+                stats.errors_connect += 1;
+                return stats;
+            }
+        };
+        let mut s = MioStream::Tls(tls);
+        // Drive the handshake to completion with a bounded deadline.
+        let hs_start = Instant::now();
+        while s.is_handshaking() {
+            if hs_start.elapsed() > Duration::from_secs(5) {
+                stats.errors_connect += 1;
+                return stats;
+            }
+            if s.drive_tls_io().is_err() {
+                stats.errors_connect += 1;
+                return stats;
+            }
+            if !s.is_handshaking() {
+                break;
+            }
+            let _ = poll.poll(&mut events, Some(Duration::from_millis(200)));
+        }
+        s
+    } else {
+        MioStream::Plain(tcp)
+    };
 
     // Write request.
     let mut write_pos = 0;

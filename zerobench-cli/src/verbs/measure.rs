@@ -519,8 +519,118 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // stats we drop on the floor.
         if !args.warmup.is_zero() && run_idx == 0 {
             eprintln!("[warmup] {} (discarded)...", format_duration(args.warmup));
-            match scenario_protocol {
-                Protocol::Http => {
+            // Dispatch on the FIRST non-Pause step type, not just
+            // Protocol. A SseFanout plan warmed up with run_sse_hold
+            // would measure the wrong backend — and possibly
+            // exhaust the trigger rate budget / poison server
+            // state — before the real run starts.
+            let first_step = plan.scenarios.first().and_then(|s| {
+                s.steps.iter().find(|st| {
+                    !matches!(
+                        st,
+                        zerobench_core::plan::Step::Pause(_)
+                            | zerobench_core::plan::Step::PauseRandom { .. }
+                    )
+                })
+            });
+            match first_step {
+                Some(zerobench_core::plan::Step::HttpColdConnect(_)) => {
+                    let _ = zerobench_http::cold_connect::run_cold_connect_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.connections as u32,
+                        args.warmup,
+                        target_rate,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                #[cfg(feature = "sse")]
+                Some(zerobench_core::plan::Step::SseHold(_)) => {
+                    let _ = zerobench_sse::run_sse_hold_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                    );
+                }
+                #[cfg(feature = "sse")]
+                Some(zerobench_core::plan::Step::SseFanout(_)) => {
+                    let _ = zerobench_sse::run_sse_fanout_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                #[cfg(feature = "sse")]
+                Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => {
+                    let _ = zerobench_sse::run_sse_reconnect_storm_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                #[cfg(feature = "ws")]
+                Some(zerobench_core::plan::Step::WsEchoRtt(_)) => {
+                    let _ = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                    );
+                }
+                #[cfg(feature = "ws")]
+                Some(zerobench_core::plan::Step::WsHold(_)) => {
+                    let _ = zerobench_ws::run_ws_hold_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                #[cfg(feature = "ws")]
+                Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => {
+                    let _ = zerobench_ws::run_ws_server_push_rtt_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                #[cfg(feature = "ws")]
+                Some(zerobench_core::plan::Step::WsFanout(_)) => {
+                    let _ = zerobench_ws::run_ws_fanout_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.warmup,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                // Default (Request / None / other) — HTTP backend.
+                _ => {
                     let _ = zerobench_http::mio_h1::run_mio_threaded(
                         &target,
                         &opts,
@@ -533,40 +643,6 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         None,
                         None,
                     );
-                }
-                Protocol::Sse => {
-                    #[cfg(feature = "sse")]
-                    {
-                        let _ = zerobench_sse::run_sse_hold_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.warmup,
-                            tls_config.clone(),
-                            None,
-                        );
-                    }
-                    #[cfg(not(feature = "sse"))]
-                    {
-                        return Err("SSE scenario requires `--features sse`".into());
-                    }
-                }
-                Protocol::Ws => {
-                    #[cfg(feature = "ws")]
-                    {
-                        let _ = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.warmup,
-                            tls_config.clone(),
-                            None,
-                        );
-                    }
-                    #[cfg(not(feature = "ws"))]
-                    {
-                        return Err("WS scenario requires `--features ws`".into());
-                    }
                 }
             }
         }
@@ -739,10 +815,33 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         //          run_sse_hold_from_plan_threaded which treats each
         //          SSE event as an op per PHILOSOPHY §4.3)
         let run_ops: u64 = stats.iter().map(|s| s.requests).sum();
-        let op_label = match scenario_protocol {
-            Protocol::Http => "requests",
-            Protocol::Sse => "events",
-            Protocol::Ws => "messages",
+        // Op-label picks on the FIRST non-Pause step type, not just
+        // protocol, because the protocol-native variants have
+        // distinct unit semantics (e.g. SseHold's op is "event"
+        // whereas SseFanout's op is "broadcast").
+        let first_step_for_label = plan.scenarios.first().and_then(|s| {
+            s.steps.iter().find(|st| {
+                !matches!(
+                    st,
+                    zerobench_core::plan::Step::Pause(_)
+                        | zerobench_core::plan::Step::PauseRandom { .. }
+                )
+            })
+        });
+        let op_label = match first_step_for_label {
+            Some(zerobench_core::plan::Step::HttpColdConnect(_)) => "cold-connects",
+            Some(zerobench_core::plan::Step::SseFanout(_)) => "broadcasts",
+            Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => "events",
+            Some(zerobench_core::plan::Step::SseHold(_)) => "events",
+            Some(zerobench_core::plan::Step::WsHold(_)) => "frames",
+            Some(zerobench_core::plan::Step::WsFanout(_)) => "broadcasts",
+            Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => "messages",
+            Some(zerobench_core::plan::Step::WsEchoRtt(_)) => "messages",
+            _ => match scenario_protocol {
+                Protocol::Http => "requests",
+                Protocol::Sse => "events",
+                Protocol::Ws => "messages",
+            },
         };
         eprintln!(
             "[run {}/{}] {} {}",

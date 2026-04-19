@@ -56,10 +56,24 @@ ZB_SAMPLES=()
 WRK_SAMPLES=()
 
 for i in $(seq 1 "$RUNS"); do
+    # Extract the throughput from zerobench's terminal output. We
+    # accept either "req/s" (HTTP) or "ops/s" (mixed-protocol); the
+    # number preceding that token is the achieved rate. Commas in
+    # the formatted number are stripped.
     sample=$("$BENCH" "$URL" -d "$DURATION" -c "$CONNS" -t "$THREADS" \
-        --no-calibrate --no-archive 2>&1 | awk '/req\/s/ {for (j=1; j<=NF; j++) if ($j == "req/s") {print $(j-1); exit}}' | tr -d ',')
+        --no-calibrate --no-archive 2>&1 | \
+        awk '/(req|ops)\/s/ {
+            for (j=1; j<=NF; j++) if ($j ~ /^(req|ops)\/s$/) {
+                gsub(/[,]/, "", $(j-1));
+                # Guard: only print if the previous field is numeric.
+                if ($(j-1) ~ /^[0-9]+(\.[0-9]+)?$/) {
+                    print $(j-1);
+                    exit;
+                }
+            }
+        }')
     ZB_SAMPLES+=("${sample:-0}")
-    echo "[gate] zerobench run $i: ${sample:-0} req/s"
+    echo "[gate] zerobench run $i: ${sample:-0} ops/s"
 done
 
 for i in $(seq 1 "$RUNS"); do

@@ -119,6 +119,7 @@ pub fn run_ws_fanout_from_plan_threaded(
         let trigger_target = target.clone();
         let trigger_opts = opts.clone();
         let trigger_url_tpl = trigger_url.clone();
+        let trigger_tls = tls_config.clone();
         let trigger_handle = std::thread::Builder::new()
             .name("zerobench-ws-fanout-trigger".into())
             .spawn(move || {
@@ -129,6 +130,7 @@ pub fn run_ws_fanout_from_plan_threaded(
                     wall_deadline,
                     &trigger_stop,
                     &trigger_triggers,
+                    trigger_tls.as_ref(),
                 );
             })
             .expect("spawn trigger");
@@ -159,15 +161,20 @@ pub fn run_ws_fanout_from_plan_threaded(
             // multiple consecutive triggers).
             let mut frame_iter = s.frames.iter().peekable();
             for &t_sent in &trigger_times {
+                let mut matched = false;
                 while let Some(&&ev) = frame_iter.peek() {
                     if ev >= t_sent {
                         let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
                             .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         frame_iter.next();
+                        matched = true;
                         break;
                     }
                     frame_iter.next();
+                }
+                if !matched {
+                    errors_read = errors_read.saturating_add(1);
                 }
             }
         }
@@ -260,6 +267,7 @@ fn run_trigger_loop(
     deadline: Instant,
     stop: &AtomicBool,
     triggers: &Mutex<Vec<Instant>>,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) {
     let interval = Duration::from_millis(TRIGGER_INTERVAL_MS);
     let mut next = Instant::now() + interval;
@@ -282,7 +290,7 @@ fn run_trigger_loop(
         }
         let url_str = String::from_utf8_lossy(&url_buf).to_string();
         let t = Instant::now();
-        if fire_http_trigger(target, opts, &url_str).is_ok() {
+        if fire_http_trigger(target, opts, &url_str, tls_config).is_ok() {
             triggers.lock().expect("triggers mutex").push(t);
         }
         next = Instant::now() + interval;
@@ -293,6 +301,7 @@ fn fire_http_trigger(
     target: &Target,
     opts: &TransportOpts,
     trigger_url: &str,
+    tls_config: Option<&Arc<ClientConfig>>,
 ) -> std::io::Result<()> {
     // Delegated to zerobench_http::simple_post::fire_http_post — pure
     // mio, no blocking std::net::TcpStream on the client side. The
@@ -306,7 +315,7 @@ fn fire_http_trigger(
         }
         None => "/",
     };
-    zerobench_http::simple_post::fire_http_post(target, opts, path, &[], None)
+    zerobench_http::simple_post::fire_http_post(target, opts, path, &[], tls_config)
 }
 
 fn render_template(tpl: &zerobench_core::Template) -> String {

@@ -530,8 +530,11 @@ fn inject_connection_close(req_buf: &mut Vec<u8>) {
 }
 
 fn has_connection_header(buf: &[u8]) -> bool {
-    // Header lines start after an initial CRLF; we scan every line-
-    // start for "connection:" case-insensitively.
+    // Scan each header-line start for "connection:" case-
+    // insensitively. RFC 7230 §3.2.4 obs-fold (a continuation line
+    // starting with SP/HT) is legacy but still valid wire format,
+    // so skip those — a folded line is part of the PRIOR header
+    // and can never itself be the Connection field name.
     let mut start = 0;
     while let Some(pos) = memchr::memmem::find(&buf[start..], b"\r\n") {
         let line_begin = start + pos + 2;
@@ -541,6 +544,11 @@ fn has_connection_header(buf: &[u8]) -> bool {
         // End-of-headers: empty line.
         if buf[line_begin..].starts_with(b"\r\n") {
             return false;
+        }
+        // Continuation (obs-fold): starts with SP or HT → skip.
+        if matches!(buf[line_begin], b' ' | b'\t') {
+            start = line_begin;
+            continue;
         }
         let prefix = b"connection:";
         if buf.len() - line_begin >= prefix.len() {
