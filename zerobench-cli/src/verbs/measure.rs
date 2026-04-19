@@ -350,6 +350,32 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                  Run is flagged `force_overload=true` and will poison comparisons."
             );
         }
+
+        // P10 / PHILOSOPHY §9.6.2: hard floor on the client's own
+        // scheduler jitter. If the loopback self-check's p99 is above
+        // 5µs, the client's noise floor dominates any real
+        // measurement — percentile comparisons become meaningless.
+        // Refuse unless --force-overload is passed.
+        const JITTER_P99_FLOOR_NS: u64 = 5_000;
+        let jitter_p99 = result.jitter.value_at_percentile(99.0);
+        if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
+            return Err(format!(
+                "client scheduler jitter p99 is {} ns (> {} ns floor). Real \
+                 percentile deltas this run would be indistinguishable from \
+                 client noise. Disable CPU frequency scaling / pin the \
+                 process, pass --no-calibrate to skip, or --force-overload \
+                 to run anyway.",
+                jitter_p99, JITTER_P99_FLOOR_NS
+            )
+            .into());
+        }
+        if jitter_p99 > JITTER_P99_FLOOR_NS {
+            eprintln!(
+                "[calibrate] --force-overload: jitter p99 {} ns > {} ns floor; \
+                 comparison deltas under ~2× that figure are noise.",
+                jitter_p99, JITTER_P99_FLOOR_NS
+            );
+        }
     }
 
     // -------------------------------------------------------------------

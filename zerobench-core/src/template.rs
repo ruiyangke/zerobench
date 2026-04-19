@@ -211,6 +211,77 @@ pub(crate) enum Part {
     /// `{{var:NAME}}` — response-extracted variable. Missing slots expand
     /// to empty bytes.
     VarRef(VarSlot),
+
+    /// `{{line:FILE}}` — round-robin one line per expansion from `FILE`
+    /// (loaded once at compile time). Empty lines are kept verbatim.
+    /// Shared cursor across workers so requests see distinct lines in
+    /// the common case.
+    Line(LineSource),
+}
+
+/// Shared backing for [`Part::Line`]. Lines are loaded once at compile
+/// time; the cursor atomically round-robins across all expansions.
+#[derive(Debug, Clone)]
+pub struct LineSource {
+    /// Origin path — kept for diagnostics and for serde round-trip
+    /// (deserialize re-reads the file).
+    path: String,
+    lines: std::sync::Arc<Vec<Bytes>>,
+    cursor: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LineSource {
+    fn load(path: &str) -> Result<Self, TemplateError> {
+        let bytes = std::fs::read(path).map_err(|e| {
+            TemplateError::NotYetSupported(format!(
+                "line:{path}: read failed: {e}"
+            ))
+        })?;
+        let mut lines: Vec<Bytes> = Vec::new();
+        for line in bytes.split(|&b| b == b'\n') {
+            // Strip trailing CR for CRLF files.
+            let trimmed = if line.last() == Some(&b'\r') {
+                &line[..line.len() - 1]
+            } else {
+                line
+            };
+            lines.push(Bytes::copy_from_slice(trimmed));
+        }
+        // Drop a trailing empty line if the file ended with '\n'.
+        if lines.last().map(|b| b.is_empty()).unwrap_or(false) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return Err(TemplateError::NotYetSupported(format!(
+                "line:{path}: file is empty"
+            )));
+        }
+        Ok(Self {
+            path: path.to_string(),
+            lines: std::sync::Arc::new(lines),
+            cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    fn next(&self) -> &[u8] {
+        let i = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &self.lines[i % self.lines.len()]
+    }
+}
+
+impl Serialize for LineSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.path.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for LineSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let path = String::deserialize(d)?;
+        LineSource::load(&path).map_err(serde::de::Error::custom)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +440,7 @@ fn estimate_dynamic(p: &Part) -> usize {
         Part::RandHex { bytes } => bytes * 2,
         Part::RandStr { len } => *len,
         Part::VarRef(_) => 32,
+        Part::Line(_) => 64,
     }
 }
 
@@ -463,7 +535,13 @@ fn parse_expression(
                 return Ok((Part::VarRef(slot), 32));
             }
             "line" => {
-                return Err(TemplateError::NotYetSupported(format!("line:{tail}")));
+                if tail.is_empty() {
+                    return Err(TemplateError::NotYetSupported(
+                        "line: requires a file path".into(),
+                    ));
+                }
+                let src = LineSource::load(tail)?;
+                return Ok((Part::Line(src), 64));
             }
             _ => {}
         }
@@ -543,6 +621,8 @@ fn expand_part(part: &Part, out: &mut Vec<u8>, ctx: &mut ExpandCtx<'_>) {
             }
             // Unset or out-of-range slot → empty expansion.
         }
+
+        Part::Line(src) => out.extend_from_slice(src.next()),
     }
 }
 

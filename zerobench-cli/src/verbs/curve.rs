@@ -219,6 +219,18 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             )
             .into());
         }
+        // P10 jitter floor — see measure.rs for rationale.
+        const JITTER_P99_FLOOR_NS: u64 = 5_000;
+        let jitter_p99 = cal.jitter.value_at_percentile(99.0);
+        if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
+            return Err(format!(
+                "client scheduler jitter p99 is {} ns (> {} ns floor); curve \
+                 knee detection would chase noise. Disable CPU frequency \
+                 scaling, or pass --force-overload.",
+                jitter_p99, JITTER_P99_FLOOR_NS
+            )
+            .into());
+        }
     }
 
     // -------------------------------------------------------------------
