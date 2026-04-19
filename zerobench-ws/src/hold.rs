@@ -88,6 +88,12 @@ fn run_one_hold(
     };
     stats.handshake = Some(handshake_start.elapsed());
 
+    // M8: heartbeat == 0 is interpreted as "use the default" rather
+    // than "never heartbeat" because a WsHold without heartbeats gets
+    // dropped by proxy idle timeouts within ~30-60s, which poisons
+    // the measurement the verb exists to produce. If a user actually
+    // wants zero heartbeats they should pick a very long interval
+    // (e.g. 9999s) so the intent is explicit in the archived plan.
     let heartbeat_interval = if plan.heartbeat.is_zero() {
         Duration::from_secs(25)
     } else {

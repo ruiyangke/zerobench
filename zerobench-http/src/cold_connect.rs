@@ -183,6 +183,17 @@ fn run_worker(
     let mut events = Events::with_capacity(4);
     let mut req_buf: Vec<u8> = Vec::with_capacity(512);
 
+    // M3: Resolve once per worker thread (cached for the lifetime
+    // of the worker) rather than per-op. Per-op resolve is wrong at
+    // high rates — at 10K+ ops/s DNS becomes the bottleneck and we
+    // measure resolver throughput instead of server cold-connect
+    // latency. Workers still see distinct addresses when the user
+    // passes multiple --resolve overrides because each worker gets
+    // independent Target::resolve sticking (round-robin / family
+    // preference). On rolling-DNS deployments we trade off for the
+    // cache-hit path: 1 DNS call per worker per run, not per op.
+    let cached_addr = target.resolve(opts).ok();
+
     loop {
         let now = Instant::now();
         if stop.load(Ordering::Relaxed) || now >= deadline {
@@ -211,14 +222,9 @@ fn run_worker(
             target_at
         };
 
-        // Resolve per-op so rolling DNS / changing resolve_overrides
-        // can steer each fresh connection.
-        let addr = match target.resolve(opts) {
-            Ok(a) => a,
-            Err(_) => {
-                task.record_error(scenario_id, ErrorKind::Connect);
-                continue;
-            }
+        let Some(addr) = cached_addr else {
+            task.record_error(scenario_id, ErrorKind::Connect);
+            continue;
         };
 
         match do_one_op(

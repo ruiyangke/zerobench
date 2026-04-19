@@ -69,6 +69,7 @@ fn run_one_push(
     live: Option<&LiveSnapshot>,
     scenario_id: u16,
 ) -> PushStats {
+    let session_start = Instant::now();
     let mut stats = PushStats::new();
     let path = extract_path(&plan.url);
     let handshake_start = Instant::now();
@@ -125,9 +126,13 @@ fn run_one_push(
         }
     }
 
-    // Stall detection vs. expected rate.
-    if plan.expected_rate_per_conn > 0.0 && !plan.hold_for.is_zero() {
-        let elapsed_s = plan.hold_for.as_secs_f64().max(f64::EPSILON);
+    // Stall detection vs. expected rate. M1: denominator must be
+    // the actual elapsed time this subscriber ran — if the runner
+    // was cut short by --duration / stop-flag, using plan.hold_for
+    // would under-count the observed rate and false-positive a
+    // stall every time.
+    if plan.expected_rate_per_conn > 0.0 {
+        let elapsed_s = session_start.elapsed().as_secs_f64().max(f64::EPSILON);
         let observed_rate = stats.messages_recv as f64 / elapsed_s;
         if observed_rate < plan.expected_rate_per_conn * 0.5 {
             stats.stalled = true;

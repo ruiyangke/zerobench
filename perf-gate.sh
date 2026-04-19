@@ -77,7 +77,6 @@ echo "[gate] wrk       median: $WRK_MED req/s"
 RATIO=$(awk -v z="$ZB_MED" -v w="$WRK_MED" 'BEGIN { printf "%.3f", z / w }')
 echo "[gate] ratio: ${RATIO}× (floor ${FLOOR}×)"
 
-PASS=$(awk -v r="$RATIO" -v f="$FLOOR" 'BEGIN { exit (r >= f) ? 0 : 1 }')
 if awk -v r="$RATIO" -v f="$FLOOR" 'BEGIN { exit (r >= f) ? 0 : 1 }'; then
     echo "[gate] PASS — zerobench is ${RATIO}× wrk (≥ ${FLOOR}×)"
     exit 0

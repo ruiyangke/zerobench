@@ -674,6 +674,7 @@ pub(crate) struct SseFanoutBuilder {
 }
 pub(crate) struct SseFanoutBuilderState {
     pub url: String,
+    pub headers: Vec<(String, String)>,
     pub subscribers: u32,
     pub hold_for: Duration,
     pub reconnect: bool,
@@ -683,6 +684,7 @@ impl Default for SseFanoutBuilderState {
     fn default() -> Self {
         Self {
             url: String::new(),
+            headers: Vec::new(),
             subscribers: 1,
             hold_for: Duration::from_secs(60),
             reconnect: true,
@@ -695,6 +697,7 @@ impl SseFanoutBuilder {
         Self {
             inner: Arc::new(Mutex::new(SseFanoutBuilderState {
                 url,
+                headers: Vec::new(),
                 subscribers: subs.max(1),
                 hold_for,
                 reconnect: true,
@@ -719,6 +722,7 @@ pub(crate) struct WsFanoutBuilder {
 }
 pub(crate) struct WsFanoutBuilderState {
     pub url: String,
+    pub headers: Vec<(String, String)>,
     pub connections: u32,
     pub hold_for: Duration,
     pub heartbeat: Duration,
@@ -728,6 +732,7 @@ impl Default for WsFanoutBuilderState {
     fn default() -> Self {
         Self {
             url: String::new(),
+            headers: Vec::new(),
             connections: 1,
             hold_for: Duration::from_secs(60),
             heartbeat: Duration::from_secs(25),
@@ -740,6 +745,7 @@ impl WsFanoutBuilder {
         Self {
             inner: Arc::new(Mutex::new(WsFanoutBuilderState {
                 url,
+                headers: Vec::new(),
                 connections: connections.max(1),
                 hold_for,
                 heartbeat: Duration::from_secs(25),
@@ -763,6 +769,7 @@ pub(crate) struct SseReconnectStormBuilder {
 }
 pub(crate) struct SseReconnectStormBuilderState {
     pub url: String,
+    pub headers: Vec<(String, String)>,
     pub subscribers: u32,
     pub hold_for: Duration,
     pub kill_rate_per_s: f64,
@@ -772,6 +779,7 @@ impl Default for SseReconnectStormBuilderState {
     fn default() -> Self {
         Self {
             url: String::new(),
+            headers: Vec::new(),
             subscribers: 1,
             hold_for: Duration::from_secs(60),
             kill_rate_per_s: 0.1,
@@ -784,6 +792,7 @@ impl SseReconnectStormBuilder {
         Self {
             inner: Arc::new(Mutex::new(SseReconnectStormBuilderState {
                 url,
+                headers: Vec::new(),
                 subscribers: subs.max(1),
                 hold_for,
                 kill_rate_per_s: 0.1,
@@ -960,6 +969,7 @@ fn compile_step(
         StepSource::SseFanout(fb) => {
             let SseFanoutBuilderState {
                 url,
+                headers,
                 subscribers,
                 hold_for,
                 reconnect,
@@ -984,10 +994,24 @@ fn compile_step(
                 field: format!("sse_fanout trigger_url {trigger_url:?}"),
                 error: e,
             })?;
+            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
+            for (name, value) in headers {
+                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("sse_fanout header name {name:?}"),
+                    error: e,
+                })?;
+                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("sse_fanout header {name:?} value {value:?}"),
+                    error: e,
+                })?;
+                hdr_out.push((n, v));
+            }
             Ok(Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
                 subscribers: zerobench_core::plan::SseHoldPlan {
                     url: url_tpl,
-                    headers: SmallVec::new(),
+                    headers: hdr_out,
                     subscribers,
                     hold_for,
                     reconnect,
@@ -1002,6 +1026,7 @@ fn compile_step(
         StepSource::SseReconnectStorm(sb) => {
             let SseReconnectStormBuilderState {
                 url,
+                headers,
                 subscribers,
                 hold_for,
                 kill_rate_per_s,
@@ -1012,11 +1037,25 @@ fn compile_step(
                 field: format!("sse_reconnect_storm url {url:?}"),
                 error: e,
             })?;
+            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
+            for (name, value) in headers {
+                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("sse_reconnect_storm header name {name:?}"),
+                    error: e,
+                })?;
+                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("sse_reconnect_storm header {name:?} value {value:?}"),
+                    error: e,
+                })?;
+                hdr_out.push((n, v));
+            }
             Ok(Step::SseReconnectStorm(
                 zerobench_core::plan::SseReconnectStormPlan {
                     subscribers: zerobench_core::plan::SseHoldPlan {
                         url: url_tpl,
-                        headers: SmallVec::new(),
+                        headers: hdr_out,
                         subscribers,
                         hold_for,
                         reconnect: true,
@@ -1029,6 +1068,7 @@ fn compile_step(
         StepSource::WsFanout(fb) => {
             let WsFanoutBuilderState {
                 url,
+                headers,
                 connections,
                 hold_for,
                 heartbeat,
@@ -1053,10 +1093,24 @@ fn compile_step(
                 field: format!("ws_fanout trigger_url {trigger_url:?}"),
                 error: e,
             })?;
+            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
+            for (name, value) in headers {
+                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_fanout header name {name:?}"),
+                    error: e,
+                })?;
+                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_fanout header {name:?} value {value:?}"),
+                    error: e,
+                })?;
+                hdr_out.push((n, v));
+            }
             Ok(Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
                 subscribers: zerobench_core::plan::WsHoldPlan {
                     url: url_tpl,
-                    headers: SmallVec::new(),
+                    headers: hdr_out,
                     connections,
                     heartbeat,
                     heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
@@ -1659,6 +1713,13 @@ fn register_sse_fanout_builders(engine: &mut Engine) {
             b
         },
     );
+    engine.register_fn(
+        "header",
+        move |b: SseFanoutBuilder, name: ImmutableString, value: ImmutableString| {
+            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
+            b
+        },
+    );
 }
 
 fn register_ws_fanout_builders(engine: &mut Engine) {
@@ -1685,6 +1746,13 @@ fn register_ws_fanout_builders(engine: &mut Engine) {
             b
         },
     );
+    engine.register_fn(
+        "header",
+        move |b: WsFanoutBuilder, name: ImmutableString, value: ImmutableString| {
+            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
+            b
+        },
+    );
 }
 
 fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
@@ -1707,6 +1775,13 @@ fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
         "verify_last_event_id",
         move |b: SseReconnectStormBuilder, on: bool| {
             b.with_state(|s| s.verify_last_event_id = on);
+            b
+        },
+    );
+    engine.register_fn(
+        "header",
+        move |b: SseReconnectStormBuilder, name: ImmutableString, value: ImmutableString| {
+            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
             b
         },
     );
