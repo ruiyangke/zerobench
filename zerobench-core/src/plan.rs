@@ -159,16 +159,12 @@ pub enum Mode {
         /// Scheduling between A and B runs.
         schedule: CompareSchedule,
     },
-    /// Long-running regression stream to JSONL. Requires either
-    /// `until` or an explicit `--unbounded` flag.
-    Watch {
-        /// Emit cadence.
-        emit_every: Duration,
-        /// Stop condition.
-        until: WatchUntil,
-    },
     /// Archive-only: compare two stored `result.json` artifacts.
     Diff,
+    // Note: `Mode::Watch` was dropped from v0.1.0 (2026-04-19).
+    // Continuous monitoring belongs in Prometheus/Grafana
+    // (see PHILOSOPHY.md §5 / §13.2); "rerun on schedule" is
+    // cron + measure + compare.
 }
 
 impl Default for Mode {
@@ -217,46 +213,8 @@ impl Default for CompareSchedule {
     }
 }
 
-/// `watch` stop condition. Missing value requires `--unbounded`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WatchUntil {
-    /// Hard upper bound on total watch wall-time.
-    Max { duration: Duration },
-    /// Stop when the named metric stays under `threshold` for at least
-    /// `sustained`, OR when total time reaches `hard_max`.
-    Sustained {
-        /// Metric name (`p99_latency_ns`, `rate`, etc.).
-        metric: String,
-        /// Condition — latency `<`, rate `>=`, etc.
-        op: ComparisonOp,
-        /// Threshold value (same units as the metric).
-        threshold: f64,
-        /// Minimum continuous sustain.
-        sustained: Duration,
-        /// Hard stop regardless of condition.
-        hard_max: Duration,
-    },
-    /// Stop on first statistically-significant regression vs the pinned
-    /// baseline for this `url_fingerprint`.
-    Regression,
-    /// No stop condition — requires explicit `--unbounded` at the CLI.
-    Unbounded,
-}
-
-/// Comparison operator for [`WatchUntil::Sustained`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComparisonOp {
-    /// Metric value less than threshold.
-    Lt,
-    /// Metric value less than or equal to threshold.
-    Le,
-    /// Metric value greater than threshold.
-    Gt,
-    /// Metric value greater than or equal to threshold.
-    Ge,
-}
+// WatchUntil and ComparisonOp were removed 2026-04-19 along with
+// Mode::Watch. See PHILOSOPHY.md §5 for rationale.
 
 /// One named traffic stream — a sequence of steps executed top-to-bottom
 /// per iteration, emitted at the scenario's [`RateProfile`].
