@@ -25,7 +25,7 @@ use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::BenchRng;
 
-use crate::conn::{DataFrame, WsConnection, WsError};
+use crate::conn::{DataFrame, WsConnection};
 
 const TRIGGER_INTERVAL_MS: u64 = 500;
 
@@ -226,17 +226,23 @@ fn run_one_subscriber(
     stats.handshake = Some(handshake_start.elapsed());
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        match conn.recv() {
-            Ok(DataFrame::Text(b)) | Ok(DataFrame::Binary(b)) => {
+        // Bounded recv — must cap the wait so the deadline/stop
+        // check fires even when the server pushes nothing between
+        // triggers. Without this a low-broadcast-rate fanout would
+        // sit inside WsConnection::recv forever (same C2 bug that
+        // WsServerPushRtt had).
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if remaining.is_zero() {
+            break;
+        }
+        match conn.try_recv(remaining) {
+            Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 stats.frames.push(Instant::now());
                 stats.bytes_recv = stats.bytes_recv.saturating_add(b.len() as u64);
             }
-            Err(WsError::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // Loop
-            }
+            Ok(None) => {}
             Err(_) => {
                 stats.errors_read += 1;
                 return stats;

@@ -47,6 +47,7 @@ use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
 use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
+use zerobench_core::report::pick_primary_histogram;
 use zerobench_core::{ColorChoice, Summary, SummaryExport, TaskStats};
 
 // ---------------------------------------------------------------------------
@@ -757,12 +758,26 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // histograms are contiguous u64 arrays; for typical bounds
         // that's ~30 KiB per stat).
         let run_summary = Summary::merge(stats.clone(), args.duration);
+        // The protocol-native primary histogram per §P7 / §6c of
+        // the design. Compare-engine's `--regress-on` reads this
+        // slot when set; pure-HTTP runs leave it empty and the
+        // engine falls through to the generic `latency` field.
+        let proto_hist = pick_primary_histogram(&run_summary, &plan);
+        let proto_latency = if std::ptr::eq(
+            proto_hist as *const _,
+            &run_summary.latency as *const _,
+        ) {
+            LatencyExport::default()
+        } else {
+            LatencyExport::from_hist(proto_hist)
+        };
         per_run.push(PerRunMetrics {
             index: run_idx,
             rate_per_s: run_summary.requests_per_sec(),
             requests: run_summary.requests,
             errors_total: run_summary.errors.total(),
             latency: LatencyExport::from_hist(&run_summary.latency),
+            protocol_latency: proto_latency,
         });
         // Silence unused-import warning when LatencyExport /
         // ErrorCountersExport / PerRunMetrics happen not to be used
@@ -818,9 +833,17 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             args.url,
             id,
         );
+        // PHILOSOPHY §P7 / design §5c: downstream tooling (HDR
+        // plotter, Grafana) consumes the histlog. For HTTP the main
+        // `summary.latency` is the right histogram; for
+        // protocol-native backends it's empty — the real signal
+        // lives in the per-scenario SseExtras / WsExtras slot.
+        // Pick the primary histogram per the same per-protocol
+        // rules as the terminal report.
+        let primary_hist = pick_primary_histogram(&summary, &plan);
         writer.write_histlog(
             "result",
-            &summary.latency,
+            primary_hist,
             run_start_wall,
             total_measured,
             Some(&comment),

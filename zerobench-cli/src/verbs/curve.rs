@@ -415,6 +415,8 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     mean_ns: 0.0,
                     stddev_ns: 0.0,
                 },
+                // Curve is HTTP-only today; protocol_latency unused.
+                protocol_latency: LatencyExport::default(),
             })
             .collect();
 

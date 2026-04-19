@@ -728,17 +728,28 @@ fn pick_latency_source(summary: &Summary, plan: &Plan) -> (&'static str, u64, u6
 }
 
 fn sse_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
-    let mut agg = crate::histogram::new_hist();
+    // Per protocol-native semantics: prefer the dedicated
+    // broadcast_rtt slot for SseFanout scenarios; fall back to
+    // chunk_gap for SseHold / SseReconnectStorm. An SSE scenario
+    // populates exactly one of the two.
+    let mut broadcast = crate::histogram::new_hist();
+    let mut chunk_gap = crate::histogram::new_hist();
     for sc in &summary.per_scenario {
         if let Some(sse) = sc.sse.as_ref() {
-            let _ = agg.add(&sse.chunk_gap);
+            let _ = broadcast.add(&sse.broadcast_rtt);
+            let _ = chunk_gap.add(&sse.chunk_gap);
         }
     }
+    let (label, agg) = if !broadcast.is_empty() {
+        ("broadcast-rtt", broadcast)
+    } else {
+        ("chunk-gap", chunk_gap)
+    };
     if agg.is_empty() {
-        ("chunk-gap", 0, 0, 0, 0, 0)
+        (label, 0, 0, 0, 0, 0)
     } else {
         (
-            "chunk-gap",
+            label,
             agg.value_at_percentile(50.0),
             agg.value_at_percentile(90.0),
             agg.value_at_percentile(99.0),
@@ -749,17 +760,27 @@ fn sse_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64
 }
 
 fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64, u64, u64) {
-    let mut agg = crate::histogram::new_hist();
+    // As with SSE: WsFanout writes broadcast_rtt and leaves rtt
+    // empty; WsEchoRtt / WsServerPushRtt populate rtt. Prefer
+    // broadcast_rtt when non-empty.
+    let mut broadcast = crate::histogram::new_hist();
+    let mut rtt = crate::histogram::new_hist();
     for sc in &summary.per_scenario {
         if let Some(ws) = sc.ws.as_ref() {
-            let _ = agg.add(&ws.rtt);
+            let _ = broadcast.add(&ws.broadcast_rtt);
+            let _ = rtt.add(&ws.rtt);
         }
     }
+    let (label, agg) = if !broadcast.is_empty() {
+        ("broadcast-rtt", broadcast)
+    } else {
+        ("rtt", rtt)
+    };
     if agg.is_empty() {
-        ("rtt", 0, 0, 0, 0, 0)
+        (label, 0, 0, 0, 0, 0)
     } else {
         (
-            "rtt",
+            label,
             agg.value_at_percentile(50.0),
             agg.value_at_percentile(90.0),
             agg.value_at_percentile(99.0),
@@ -767,6 +788,57 @@ fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64,
             agg.max(),
         )
     }
+}
+
+/// Return a borrowed reference to the histogram that carries the
+/// PRIMARY latency signal for this plan — the same slot the terminal
+/// report renders via [`pick_latency_source`], but as a histogram the
+/// caller can feed into `write_histlog`.
+///
+/// HTTP: `summary.latency`. SSE: `broadcast_rtt` if any scenario
+/// populated it, else aggregated `chunk_gap`. WS: `broadcast_rtt` if
+/// any, else aggregated `rtt`. On a mixed plan this falls back to
+/// `summary.latency` (HTTP-centric aggregate) — the per-scenario
+/// sidecars carry the rest.
+pub fn pick_primary_histogram<'a>(
+    summary: &'a Summary,
+    plan: &Plan,
+) -> &'a hdrhistogram::Histogram<u64> {
+    // Single-protocol SSE or WS → return the per-extras histogram
+    // cached on scenario[0]. When the plan has multiple SSE/WS
+    // scenarios, we'd have to allocate a fresh aggregate — that
+    // allocation doesn't fit the borrowed-return signature, so
+    // multi-scenario SSE/WS still writes summary.latency.
+    let protocols: std::collections::HashSet<Protocol> =
+        plan.scenarios.iter().map(|s| s.protocol()).collect();
+    if protocols.len() == 1 && plan.scenarios.len() == 1 {
+        if let Some(sc) = summary.per_scenario.first() {
+            match protocols.iter().next().copied() {
+                Some(Protocol::Sse) => {
+                    if let Some(sse) = sc.sse.as_ref() {
+                        if !sse.broadcast_rtt.is_empty() {
+                            return &sse.broadcast_rtt;
+                        }
+                        if !sse.chunk_gap.is_empty() {
+                            return &sse.chunk_gap;
+                        }
+                    }
+                }
+                Some(Protocol::Ws) => {
+                    if let Some(ws) = sc.ws.as_ref() {
+                        if !ws.broadcast_rtt.is_empty() {
+                            return &ws.broadcast_rtt;
+                        }
+                        if !ws.rtt.is_empty() {
+                            return &ws.rtt;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    &summary.latency
 }
 
 fn ns_to_seconds(ns: u64) -> f64 {

@@ -82,15 +82,27 @@ impl Metric {
     }
 
     /// Pull this metric's value from a single run's metrics.
+    ///
+    /// For latency percentiles, the extractor prefers
+    /// `run.protocol_latency` when non-empty — that slot carries the
+    /// backend's primary latency signal (chunk_gap for SseHold, rtt
+    /// for WsEchoRtt, broadcast_rtt for fanouts, etc.) and is the
+    /// right axis for regression gating on protocol-native runs.
+    /// Falls back to the generic HTTP `run.latency` field otherwise.
     pub fn extract(&self, run: &PerRunMetrics) -> f64 {
+        let lat = if run.protocol_latency.count > 0 {
+            &run.protocol_latency
+        } else {
+            &run.latency
+        };
         match self {
             Metric::Rate => run.rate_per_s,
-            Metric::P50 => run.latency.p50_ns as f64,
-            Metric::P90 => run.latency.p90_ns as f64,
-            Metric::P99 => run.latency.p99_ns as f64,
-            Metric::P99_9 => run.latency.p99_9_ns as f64,
-            Metric::P99_99 => run.latency.p99_99_ns as f64,
-            Metric::Max => run.latency.max_ns as f64,
+            Metric::P50 => lat.p50_ns as f64,
+            Metric::P90 => lat.p90_ns as f64,
+            Metric::P99 => lat.p99_ns as f64,
+            Metric::P99_9 => lat.p99_9_ns as f64,
+            Metric::P99_99 => lat.p99_99_ns as f64,
+            Metric::Max => lat.max_ns as f64,
             Metric::ErrorRate => {
                 if run.requests == 0 {
                     0.0
@@ -869,6 +881,7 @@ mod tests {
                 mean_ns: (p99 as f64) / 8.0,
                 stddev_ns: 100.0,
             },
+            protocol_latency: LatencyExport::default(),
         }
     }
 

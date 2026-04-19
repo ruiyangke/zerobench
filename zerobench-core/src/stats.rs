@@ -570,14 +570,32 @@ pub struct PerRunMetrics {
     pub requests: u64,
     /// Run-level error total (sum across categories).
     pub errors_total: u64,
-    /// Run-level latency percentiles. Extracted from the run's
-    /// HDR histogram before it was folded into the aggregate.
+    /// Run-level HTTP request latency percentiles. Empty for
+    /// protocol-native-only runs (SSE hold / WS echo / fanout /
+    /// storm) — consumers should read the dedicated
+    /// `protocol_latency` slot below instead.
     pub latency: LatencyExport,
+    /// Protocol-native primary-latency percentiles per the same
+    /// per-protocol rules as the terminal report (SseHold →
+    /// chunk_gap; WsEchoRtt / WsServerPushRtt → rtt; fanouts →
+    /// broadcast_rtt; reconnect_storm → reconnect-gap aka
+    /// chunk_gap slot). Empty for pure-HTTP runs. Consumers of
+    /// `--regress-on p99:+5%` should read whichever of
+    /// `latency` / `protocol_latency` is non-empty. Added in
+    /// schema v2; defaults to empty on v1 archives.
+    #[serde(default)]
+    pub protocol_latency: LatencyExport,
 }
 
 impl SummaryExport {
     /// Schema version for `result.json`.
-    pub const SCHEMA_VERSION: u32 = 1;
+    ///
+    /// v1: initial shape.
+    /// v2: added `SseExtrasExport.broadcast_rtt`,
+    ///     `WsExtrasExport.broadcast_rtt`, and
+    ///     `PerRunMetrics.protocol_latency`. All three are
+    ///     `#[serde(default)]` so v1 archives still round-trip.
+    pub const SCHEMA_VERSION: u32 = 2;
 }
 
 /// Percentile breakdown extracted from an HDR histogram.
