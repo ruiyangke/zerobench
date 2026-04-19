@@ -71,9 +71,21 @@ pub enum TemplateError {
     #[error("invalid rand args: {0}")]
     InvalidRandArgs(String),
 
-    /// A not-yet-implemented feature (e.g. `{{line:FILE}}`) was used.
+    /// A not-yet-implemented feature was used.
     #[error("not yet supported: {0}")]
     NotYetSupported(String),
+
+    /// `{{line:FILE}}` could not read or parse the referenced file.
+    /// Distinct from `NotYetSupported` so callers can map IO failures
+    /// to a "fix your file path" error without conflating with
+    /// unimplemented features.
+    #[error("line:{path}: {reason}")]
+    LineFile {
+        /// The path the template pointed at.
+        path: String,
+        /// Human-readable reason (IO error message, empty-file, etc).
+        reason: String,
+    },
 
     /// More than 256 distinct named variables were declared in this plan.
     #[error(transparent)]
@@ -232,10 +244,9 @@ pub struct LineSource {
 
 impl LineSource {
     fn load(path: &str) -> Result<Self, TemplateError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            TemplateError::NotYetSupported(format!(
-                "line:{path}: read failed: {e}"
-            ))
+        let bytes = std::fs::read(path).map_err(|e| TemplateError::LineFile {
+            path: path.to_string(),
+            reason: format!("read failed: {e}"),
         })?;
         let mut lines: Vec<Bytes> = Vec::new();
         for line in bytes.split(|&b| b == b'\n') {
@@ -252,9 +263,10 @@ impl LineSource {
             lines.pop();
         }
         if lines.is_empty() {
-            return Err(TemplateError::NotYetSupported(format!(
-                "line:{path}: file is empty"
-            )));
+            return Err(TemplateError::LineFile {
+                path: path.to_string(),
+                reason: "file is empty".into(),
+            });
         }
         Ok(Self {
             path: path.to_string(),

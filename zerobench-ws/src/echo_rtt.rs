@@ -292,6 +292,7 @@ pub fn run_ws_echo_rtt_from_plan_threaded(
                 messages_recv: rollup.messages_recv,
                 bytes_sent: rollup.bytes_sent,
                 bytes_recv: rollup.bytes_recv,
+                broadcast_rtt: new_hist(),
             };
         }
         out.push(task);

@@ -221,6 +221,13 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         // P10 jitter floor — see measure.rs for rationale.
         const JITTER_P99_FLOOR_NS: u64 = 5_000;
+        if cal.jitter.len() == 0 {
+            return Err(
+                "client self-check produced no jitter samples — calibration \
+                 is broken; cannot verify the scheduler noise floor."
+                    .into(),
+            );
+        }
         let jitter_p99 = cal.jitter.value_at_percentile(99.0);
         if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
             return Err(format!(

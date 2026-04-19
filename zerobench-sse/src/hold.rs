@@ -514,6 +514,7 @@ pub fn run_sse_hold_from_plan_threaded(
                 chunks: per_scenario_stats.events,
                 streams_completed: per_scenario_stats.streams_completed,
                 bytes_received: per_scenario_stats.bytes_received,
+                broadcast_rtt: new_hist(),
             };
         }
         out.push(task);

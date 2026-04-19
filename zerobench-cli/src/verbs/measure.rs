@@ -356,7 +356,19 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // 5µs, the client's noise floor dominates any real
         // measurement — percentile comparisons become meaningless.
         // Refuse unless --force-overload is passed.
+        //
+        // Guard against an empty jitter histogram: HDR returns 0/1
+        // for value_at_percentile on no samples, which would silently
+        // pass the gate. Treat "no samples" as a broken self-check.
         const JITTER_P99_FLOOR_NS: u64 = 5_000;
+        if result.jitter.len() == 0 {
+            return Err(
+                "client self-check produced no jitter samples — calibration \
+                 is broken; cannot verify the scheduler noise floor. Pass \
+                 --no-calibrate to skip the gate."
+                    .into(),
+            );
+        }
         let jitter_p99 = result.jitter.value_at_percentile(99.0);
         if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
             return Err(format!(
@@ -529,17 +541,21 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             scenario_protocol,
         );
         let stop: Option<Arc<AtomicBool>> = None;
-        let first_http_is_cold = plan
-            .scenarios
-            .first()
-            .map(|s| {
-                s.steps.iter().any(|st| {
+        // Route to cold-connect when ANY HTTP scenario contains a
+        // HttpColdConnect step. Strictly correct per-scenario
+        // dispatch would require splitting the plan and driving each
+        // HTTP scenario through its own backend; the single-scenario
+        // measure verb never hits that path (the CLI-built plan has
+        // exactly one scenario), and mixed-cold/hot Rhai plans are
+        // a known limitation documented in the gap audit.
+        let any_http_is_cold = plan.scenarios.iter().any(|s| {
+            s.protocol() == Protocol::Http
+                && s.steps.iter().any(|st| {
                     matches!(st, zerobench_core::plan::Step::HttpColdConnect(_))
                 })
-            })
-            .unwrap_or(false);
+        });
         let stats = match scenario_protocol {
-            Protocol::Http if first_http_is_cold => {
+            Protocol::Http if any_http_is_cold => {
                 zerobench_http::cold_connect::run_cold_connect_from_plan_threaded(
                     &target,
                     &opts,

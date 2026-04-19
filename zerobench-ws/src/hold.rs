@@ -245,6 +245,7 @@ pub fn run_ws_hold_from_plan_threaded(
                 messages_recv: total_frames,
                 bytes_sent: total_sent,
                 bytes_recv: total_recv,
+                broadcast_rtt: new_hist(),
             };
         }
         out.push(task);

@@ -180,11 +180,15 @@ pub fn run_ws_fanout_from_plan_threaded(
             task.errors.read += errors_read;
             *sc.ws_mut() = WsExtras {
                 handshake: handshake_hist,
-                rtt: rtt_hist,
+                // rtt holds echo / inter-message gap for other WS
+                // backends; fanout's broadcast latency lives in its
+                // own slot so result.json readers never have to guess.
+                rtt: new_hist(),
                 messages_sent: 0,
                 messages_recv: total_frames,
                 bytes_sent: 0,
                 bytes_recv: total_bytes,
+                broadcast_rtt: rtt_hist,
             };
         }
         out.push(task);

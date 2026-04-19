@@ -158,6 +158,8 @@ pub struct SseExtras {
     /// completion to the first response byte.
     pub ttfb: Histogram<u64>,
     /// Inter-chunk gap between successive data events within a stream.
+    /// Populated by `SseHold` / `SseReconnectStorm`. Empty histogram
+    /// for `SseFanout` (use `broadcast_rtt` instead).
     pub chunk_gap: Histogram<u64>,
     /// Total number of data events received across all streams.
     pub chunks: u64,
@@ -167,6 +169,11 @@ pub struct SseExtras {
     pub streams_completed: u64,
     /// Payload bytes received on SSE streams (post-chunked-decoding).
     pub bytes_received: u64,
+    /// Broadcast round-trip time — populated by `SseFanout` only.
+    /// Empty for every other SSE backend. Kept as a dedicated slot so
+    /// consumers of `result.json` don't have to know the scenario
+    /// topology to interpret `chunk_gap`.
+    pub broadcast_rtt: Histogram<u64>,
 }
 
 impl Default for SseExtras {
@@ -177,6 +184,7 @@ impl Default for SseExtras {
             chunks: 0,
             streams_completed: 0,
             bytes_received: 0,
+            broadcast_rtt: new_hist(),
         }
     }
 }
@@ -186,6 +194,7 @@ impl SseExtras {
     pub fn merge(&mut self, other: &Self) {
         let _ = self.ttfb.add(&other.ttfb);
         let _ = self.chunk_gap.add(&other.chunk_gap);
+        let _ = self.broadcast_rtt.add(&other.broadcast_rtt);
         self.chunks += other.chunks;
         self.streams_completed += other.streams_completed;
         self.bytes_received += other.bytes_received;
@@ -197,7 +206,10 @@ impl SseExtras {
 pub struct WsExtras {
     /// Handshake time — TCP connect to 101 Switching Protocols.
     pub handshake: Histogram<u64>,
-    /// Per-message round-trip time.
+    /// Per-message round-trip time. Populated by `WsEchoRtt` (echo
+    /// RTT) and `WsServerPushRtt` (inter-message gap).
+    /// Empty for `WsFanout` (use `broadcast_rtt` instead) and
+    /// `WsHold`.
     pub rtt: Histogram<u64>,
     /// Text/Binary frames sent from this client.
     pub messages_sent: u64,
@@ -207,6 +219,9 @@ pub struct WsExtras {
     pub bytes_sent: u64,
     /// Payload bytes received.
     pub bytes_recv: u64,
+    /// Broadcast round-trip time — populated by `WsFanout` only.
+    /// Empty for every other WS backend.
+    pub broadcast_rtt: Histogram<u64>,
 }
 
 impl Default for WsExtras {
@@ -218,6 +233,7 @@ impl Default for WsExtras {
             messages_recv: 0,
             bytes_sent: 0,
             bytes_recv: 0,
+            broadcast_rtt: new_hist(),
         }
     }
 }
@@ -227,6 +243,7 @@ impl WsExtras {
     pub fn merge(&mut self, other: &Self) {
         let _ = self.handshake.add(&other.handshake);
         let _ = self.rtt.add(&other.rtt);
+        let _ = self.broadcast_rtt.add(&other.broadcast_rtt);
         self.messages_sent += other.messages_sent;
         self.messages_recv += other.messages_recv;
         self.bytes_sent += other.bytes_sent;
@@ -570,7 +587,7 @@ impl SummaryExport {
 /// hdrhistogram semantics. Not `Eq` because `mean_ns` / `stddev_ns`
 /// are `f64`; use [`PartialEq`] for exact matching or compare fields
 /// within tolerance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LatencyExport {
     /// Sample count.
     pub count: u64,
@@ -682,6 +699,11 @@ pub struct SseExtrasExport {
     pub streams_completed: u64,
     /// Payload bytes received.
     pub bytes_received: u64,
+    /// Broadcast RTT histogram (SseFanout only). Absent in archives
+    /// produced before this field was added; `#[serde(default)]`
+    /// deserialises the empty form for back-compat.
+    #[serde(default)]
+    pub broadcast_rtt: LatencyExport,
 }
 
 impl SseExtrasExport {
@@ -692,6 +714,7 @@ impl SseExtrasExport {
             chunks: s.chunks,
             streams_completed: s.streams_completed,
             bytes_received: s.bytes_received,
+            broadcast_rtt: LatencyExport::from_hist(&s.broadcast_rtt),
         }
     }
 }
@@ -711,6 +734,10 @@ pub struct WsExtrasExport {
     pub bytes_sent: u64,
     /// Bytes received.
     pub bytes_recv: u64,
+    /// Broadcast RTT histogram (WsFanout only). See
+    /// [`SseExtrasExport::broadcast_rtt`].
+    #[serde(default)]
+    pub broadcast_rtt: LatencyExport,
 }
 
 impl WsExtrasExport {
@@ -722,6 +749,7 @@ impl WsExtrasExport {
             messages_recv: w.messages_recv,
             bytes_sent: w.bytes_sent,
             bytes_recv: w.bytes_recv,
+            broadcast_rtt: LatencyExport::from_hist(&w.broadcast_rtt),
         }
     }
 }

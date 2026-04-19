@@ -354,6 +354,14 @@ fn do_one_op(
     // --- Write request ---
     req_buf.clear();
     build_raw_request(req_plan, ctx, target, req_buf).map_err(|_| ColdErr::Write)?;
+    // S2: Cold-connect semantics require the server to close the
+    // connection after the response. Without `Connection: close`,
+    // servers returning Transfer-Encoding: chunked responses (common
+    // in modern stacks) keep the connection alive and we'd hang
+    // until `request_timeout` for every op. Inject the header into
+    // the request bytes before the final CRLF CRLF if it isn't
+    // already present (case-insensitive check on the header name).
+    inject_connection_close(req_buf);
     let mut write_pos = 0;
     while write_pos < req_buf.len() {
         match stream.write(&req_buf[write_pos..]) {
@@ -467,6 +475,53 @@ fn do_one_op(
         request_bytes,
         response_bytes,
     })
+}
+
+/// If `req_buf` does not already carry a Connection header, insert
+/// `Connection: close\r\n` immediately before the header terminator.
+/// No-op when the request already sets Connection (user override
+/// wins). Case-insensitive match on `connection:`.
+fn inject_connection_close(req_buf: &mut Vec<u8>) {
+    if has_connection_header(req_buf) {
+        return;
+    }
+    let Some(term) = memchr::memmem::find(req_buf, b"\r\n\r\n") else {
+        return;
+    };
+    // Splice "Connection: close\r\n" in before the terminator's
+    // trailing CRLF.
+    let insertion_point = term + 2; // after first CRLF of "\r\n\r\n"
+    let header = b"Connection: close\r\n";
+    req_buf.splice(insertion_point..insertion_point, header.iter().copied());
+}
+
+fn has_connection_header(buf: &[u8]) -> bool {
+    // Header lines start after an initial CRLF; we scan every line-
+    // start for "connection:" case-insensitively.
+    let mut start = 0;
+    while let Some(pos) = memchr::memmem::find(&buf[start..], b"\r\n") {
+        let line_begin = start + pos + 2;
+        if line_begin >= buf.len() {
+            return false;
+        }
+        // End-of-headers: empty line.
+        if buf[line_begin..].starts_with(b"\r\n") {
+            return false;
+        }
+        let prefix = b"connection:";
+        if buf.len() - line_begin >= prefix.len() {
+            let candidate = &buf[line_begin..line_begin + prefix.len()];
+            if candidate
+                .iter()
+                .zip(prefix.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                return true;
+            }
+        }
+        start = line_begin;
+    }
+    false
 }
 
 /// Wait for any event matching `pred` with timeout. Returns Ok if one

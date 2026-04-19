@@ -213,11 +213,12 @@ pub fn run_ws_server_push_rtt_from_plan_threaded(
             task.errors.read += errors_read + stalls;
             *sc.ws_mut() = WsExtras {
                 handshake: rollup_handshake,
-                rtt: rollup_gap, // gap histogram lives in the rtt slot
+                rtt: rollup_gap, // inter-message gap lives in the rtt slot
                 messages_sent: 0,
                 messages_recv: total_recv,
                 bytes_sent: 0,
                 bytes_recv: total_bytes,
+                broadcast_rtt: new_hist(),
             };
         }
         out.push(task);

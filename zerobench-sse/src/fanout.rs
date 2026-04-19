@@ -217,10 +217,16 @@ pub fn run_sse_fanout_from_plan_threaded(
             task.errors.read += errors_read;
             *sc.sse_mut() = SseExtras {
                 ttfb: ttfb_hist,
-                chunk_gap: rtt_hist,
+                // chunk_gap is the "inter-event" slot used by
+                // SseHold / SseReconnectStorm; leave empty here so
+                // consumers don't conflate broadcast latency with
+                // event pacing. broadcast_rtt is the dedicated
+                // fanout slot.
+                chunk_gap: new_hist(),
                 chunks: total_events,
                 streams_completed: trigger_times.len() as u64,
                 bytes_received: total_bytes,
+                broadcast_rtt: rtt_hist,
             };
         }
         out.push(task);

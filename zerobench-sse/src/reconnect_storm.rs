@@ -164,6 +164,7 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
                 chunks: rollup.events,
                 streams_completed: rollup.reconnects_succeeded,
                 bytes_received: rollup.bytes_received,
+                broadcast_rtt: new_hist(),
             };
         }
         out.push(task);
