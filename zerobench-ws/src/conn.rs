@@ -186,9 +186,9 @@ impl WsConnection {
         // --- Optional TLS handshake ---
         //
         // For TLS targets, `MioTlsStream::complete_handshake` handles
-        // both waiting for TCP connect to complete (Phase 1) and driving
-        // the TLS state machine (Phase 2). We skip `wait_for_tcp_connect`
-        // to avoid consuming the mio edge event that Phase 1 needs.
+        // both waiting for TCP connect to complete and driving
+        // the TLS state machine. We skip `wait_for_tcp_connect`
+        // to avoid consuming the mio edge event the connect step needs.
         //
         // For plain TCP, we wait for the connect event ourselves before
         // writing the WS upgrade request.

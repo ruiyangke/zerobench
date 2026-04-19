@@ -159,7 +159,7 @@ pub fn print_terminal(
 
     // -- latency percentiles ---------------------------------------------
     //
-    // Phase 6c: protocol-aware source. For SSE-only plans we report
+    // protocol-aware source. For SSE-only plans we report
     // chunk_gap (inter-event gap) from the scenario extras; for
     // WS-only plans we report rtt. Mixed or HTTP plans use the
     // aggregate `summary.latency` as before.
@@ -958,7 +958,7 @@ fn describe_target_rate(plan: &Plan) -> String {
 }
 
 /// One-line human summary of the assertions in the plan (for the
-/// "assertions" report line). Phase C: just the assertion count.
+/// "assertions" report line). 
 fn describe_assertions(plan: &Plan) -> String {
     use crate::plan::Assertion;
     let mut parts = Vec::new();

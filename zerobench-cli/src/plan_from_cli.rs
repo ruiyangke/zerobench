@@ -55,7 +55,7 @@ pub enum BuildError {
 /// Build a runnable plan + connection target + transport opts.
 ///
 /// Three input modes:
-/// 1. Positional URL — the Phase C path; one scenario, one request.
+/// 1. Positional URL — the main path; one scenario, one request.
 /// 2. `--request-file PATH` — parse a single `.http` file; one scenario.
 /// 3. `--requests DIR` — parse every `.http` file in the directory;
 ///    one scenario per file, weighted per `scenarios.toml`.
@@ -75,10 +75,6 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
             CliHttpVersion::H2 => HttpVersionPref::Http2,
         }
     };
-    // The legacy `--sse` forced HTTP/1 fallback. v0.1.0 SSE goes
-    // through `measure --sse-hold` which uses HTTP/1 by construction;
-    // no special-case here.
-
     let opts = TransportOpts {
         connect_timeout: args.connect_timeout,
         request_timeout: args.request_timeout,
@@ -101,7 +97,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
 }
 
 // ---------------------------------------------------------------------------
-// Single-URL mode (Phase C classic behaviour)
+// Single-URL mode 
 // ---------------------------------------------------------------------------
 
 fn build_from_url(
@@ -342,7 +338,7 @@ fn build_from_request_file(
 // Design choice for `--saturate` + `--requests`:
 //   - Each scenario shares the same connection pool (i.e. every
 //     scenario gets `RateProfile::Saturate { max_concurrency: -c }`).
-//     Workers pick a scenario at random (Phase C uniform selection);
+//     Workers pick a scenario at random (uniform selection);
 //     this means the effective per-scenario share is ~equal across
 //     scenarios, independent of weights.
 //   - The weights matter for open-loop (`-r TOTAL`) mode where each

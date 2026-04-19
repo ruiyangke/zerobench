@@ -32,7 +32,7 @@ use zerobench_core::{ColorChoice, Summary, TaskStats};
 /// Flags accepted by `zerobench probe URL [flags]`.
 #[derive(Debug, Clone, Args)]
 pub struct ProbeArgs {
-    /// Target URL (HTTP/HTTPS). SSE/WS land with Phase 6.
+    /// Target URL (HTTP/HTTPS). SSE/WS land with
     #[arg(value_name = "URL")]
     pub url: String,
 

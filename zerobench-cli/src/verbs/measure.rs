@@ -1,29 +1,26 @@
-//! `zerobench measure URL` — the v0.1.0 headline verb.
+//! `zerobench measure URL` — the headline verb.
 //!
-//! Implements `docs/design-v0.1.0.md` §2.3 and PHILOSOPHY §5. Ties
-//! together Phases 1-5 of the v0.1.0 rollout:
+//! Implements `docs/design-v0.1.0.md` §2.3 and PHILOSOPHY §5. The
+//! flow for every invocation:
 //!
 //! 1. Build a [`Plan`] with `mode = Mode::Measure`, the caller's
 //!    duration / warmup / cooldown / runs.
 //! 2. Compute `plan_hash`, `url_fingerprint`, `target_fingerprint`,
-//!    `run_id` (Phase 3).
-//! 3. Run the [`ClientSelfCheck`] (Phase 2) against loopback — refuse
-//!    the run when the client can't sustain the offered rate, unless
+//!    `run_id`.
+//! 3. Run the [`ClientSelfCheck`] against loopback — refuse the
+//!    run when the client can't sustain the offered rate, unless
 //!    `--force-overload` was passed.
-//! 4. Collect [`MachineFingerprint`] (Phase 4). Refuse when the
-//!    monotonic clock is coarser than 10 µs unless
-//!    `--allow-coarse-clock` was passed.
-//! 5. Open [`ArchiveWriter`] (Phase 5a) and write `plan.json`,
-//!    `machine.json`, `env.json` before the real run starts.
-//! 6. Dispatch `runs` consecutive benchmark runs to the HTTP backend,
-//!    with `cooldown` between runs.
+//! 4. Collect [`MachineFingerprint`]. Refuse when the monotonic
+//!    clock is coarser than 10 µs unless `--allow-coarse-clock`
+//!    was passed.
+//! 5. Open [`ArchiveWriter`] and write `plan.json`, `machine.json`,
+//!    `env.json` before the real run starts.
+//! 6. Dispatch `runs` consecutive benchmark runs to the protocol-
+//!    appropriate backend (HTTP / SseHold / WsEchoRtt / fanout /
+//!    reconnect-storm / ...), with `cooldown` between runs.
 //! 7. Merge per-run stats into a [`Summary`]; print a compact report.
-//! 8. Stamp `env.ended_at_unix`, rewrite `env.json`, finalise
-//!    `INDEX.json`.
-//!
-//! Phase 6 replaces the backend dispatch with protocol-native SSE/WS
-//! paths. Phase 5b adds `result.json` + `.histlog` emission. For now,
-//! the verb proves the Phase 1-5 machinery against HTTP targets.
+//! 8. Emit `result.json` + `.histlog`, stamp `env.ended_at_unix`,
+//!    rewrite `env.json`, finalise `INDEX.json`.
 
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -62,7 +59,9 @@ use zerobench_core::{ColorChoice, Summary, SummaryExport, TaskStats};
 /// who want the knee of the saturation curve use `curve`.
 #[derive(Debug, Clone, Args)]
 pub struct MeasureArgs {
-    /// Target URL (HTTP/HTTPS). SSE/WS targets land in Phase 6.
+    /// Target URL. Scheme selects the protocol: http/https for HTTP,
+    /// and combined with one of the protocol flags for SSE/WS
+    /// (`--sse-hold`, `--ws-echo`, etc.).
     #[arg(value_name = "URL")]
     pub url: String,
 
@@ -159,7 +158,7 @@ pub struct MeasureArgs {
     pub context: Vec<(String, String)>,
 
     // -------------------------------------------------------------------
-    // SSE Hold (Phase 6b)
+    // SSE Hold
     //
     // When `--sse-hold N` is passed, the verb builds a
     // `Step::SseHold` scenario instead of the default HTTP GET.
@@ -169,8 +168,7 @@ pub struct MeasureArgs {
     // -------------------------------------------------------------------
     /// Open N concurrent SSE subscribers and hold them for `--for`.
     /// URL must be an SSE endpoint (`text/event-stream`); measures
-    /// events/s and inter-event gap rather than req/s. Phase 6a
-    /// backend, http:// only (TLS lands in Phase 6b follow-up).
+    /// events/s and inter-event gap rather than req/s.
     #[arg(long = "sse-hold", value_name = "SUBSCRIBERS", help_heading = "SSE")]
     pub sse_hold: Option<u32>,
 
@@ -188,7 +186,7 @@ pub struct MeasureArgs {
     pub sse_reconnect: bool,
 
     // -------------------------------------------------------------------
-    // WebSocket EchoRtt (Phase 6e)
+    // WebSocket EchoRtt
     //
     // When `--ws-echo N` is passed, the verb builds a
     // `Step::WsEchoRtt` scenario. N persistent connections each send
@@ -346,7 +344,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let id = run_id(&plan_h, &target_fp, SystemTime::now());
 
     // -------------------------------------------------------------------
-    // Phase 2: client self-check
+    // client self-check
     // -------------------------------------------------------------------
 
     let calibration_skipped = args.no_calibrate;
@@ -429,7 +427,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     // -------------------------------------------------------------------
-    // Phase 4: machine fingerprint
+    // machine fingerprint
     // -------------------------------------------------------------------
 
     let machine = MachineFingerprint::collect();
@@ -446,7 +444,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     // -------------------------------------------------------------------
-    // Phase 5a: archive setup — writes plan/machine/env before the run.
+    // archive setup — writes plan/machine/env before the run.
     // -------------------------------------------------------------------
 
     let archive_writer = if args.no_archive {
@@ -851,7 +849,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             op_label
         );
 
-        // Phase 8a: capture per-run metrics before merging into the
+        // capture per-run metrics before merging into the
         // aggregate. These are the elementary samples the bootstrap
         // CI resamples over. Cloning TaskStats here is cheap (HDR
         // histograms are contiguous u64 arrays; for typical bounds
@@ -914,14 +912,14 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         env.set_ended();
         writer.write_env(&env)?;
 
-        // Phase 5b: emit result.json with the Summary projection.
+        // emit result.json with the Summary projection.
         let mut export = summary.to_export();
-        // Phase 8a: attach per-run metric vectors so the compare
+        // attach per-run metric vectors so the compare
         // engine can bootstrap CIs from the elementary samples.
         export.per_run = per_run;
         writer.write_result(&export)?;
 
-        // Phase 5c: canonical HDR-V2-compressed-log sidecar. Readable
+        // canonical HDR-V2-compressed-log sidecar. Readable
         // by HdrHistogram Plotter, jHiccup, wrk2 pipeline, any JVM
         // HDR consumer. Carries the raw bucket counts — where
         // result.json carries percentile snapshots.
@@ -1114,7 +1112,7 @@ fn build_measure_plan(
             })],
         }
     } else if let Some(subscribers) = args.sse_hold {
-        // SSE Hold mode (Phase 6b) — build Step::SseHold with
+        // SSE Hold mode — build Step::SseHold with
         // N subscribers held for `hold_for` (defaults to --duration).
         let hold_for = args.hold_for.unwrap_or(args.duration);
         Scenario {

@@ -346,7 +346,7 @@ fn json_body_adds_content_type_and_becomes_template() {
 }
 
 // ---------------------------------------------------------------------------
-// v0.1.0 protocol-native builders (Phase 5d)
+// v0.1.0 protocol-native builders
 // ---------------------------------------------------------------------------
 
 #[test]

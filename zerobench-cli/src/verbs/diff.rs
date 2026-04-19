@@ -200,9 +200,9 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let rows = compute_rows(&baseline, &current);
 
-    // Phase 8a: layer in the compare engine for CI and
-    // bootstrap-aware threshold gating. The raw-row path still
-    // drives display formatting (unchanged for back-compat).
+    // The raw-row path drives the human-readable table; the
+    // compare engine provides bootstrap CI / significance bands
+    // used by --regress-on for CI gating.
     let compare_opts = CompareOptions::default();
     let results = compare_all(&baseline, &current, &compare_opts);
     let used_bootstrap = results
@@ -211,7 +211,7 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     render_table(&baseline, &current, &rows, &args);
 
-    // Phase 8b/8c: if the sibling result.histlog files are present,
+    // In future — when if the sibling result.histlog files are present,
     // run distribution-level tests. AD is tail-sensitive (PHILOSOPHY
     // default for N=1); KS is the classic less-tail-sensitive
     // comparison. --compare-strategy chooses which to show.

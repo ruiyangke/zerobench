@@ -7,7 +7,7 @@
 //!
 //! # Correlation strategy
 //!
-//! Phase 6e ships `MonotonicIdPrepend`: the client prepends a
+//! We ship `MonotonicIdPrepend`: the client prepends a
 //! 16-byte hex-encoded monotonic id to each text-frame payload
 //! (`"<16 hex chars>|<user-payload>"`). The server is expected to
 //! echo the full text verbatim (the common pattern for "echo"

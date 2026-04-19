@@ -358,8 +358,8 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // Chunked transfer-encoding decoder
 //
-// Copied verbatim from lib.rs to keep hold.rs standalone for Phase 6a.
-// Phase 6b refactor will pull the decoder into a shared submodule.
+// Copied verbatim from lib.rs to keep hold.rs standalone for the SseHold backend.
+//  
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ChunkDecoder {
@@ -676,9 +676,9 @@ fn run_hold_scenario(
 }
 
 /// Build the HTTP/1.1 request bytes for an SSE Hold subscriber.
-/// Templates aren't expanded for Phase 6a — the URL must be a static
+/// Templates aren't expanded for the URL must be a static
 /// literal. Templated URLs land when the shared scenario-context path
-/// is wired in Phase 6b.
+/// is wired in a follow-up.
 fn build_hold_request(target: &Target, plan: &SseHoldPlan) -> Vec<u8> {
     let path = extract_path(&plan.url);
     let host = if (target.tls && target.port == 443) || (!target.tls && target.port == 80) {
@@ -698,7 +698,7 @@ fn build_hold_request(target: &Target, plan: &SseHoldPlan) -> Vec<u8> {
 }
 
 /// Extract the path+query from a compiled [`zerobench_core::Template`].
-/// For Phase 6a we expect a fully-static template; templated URLs
+/// We expect a fully-static template; templated URLs
 /// yield an empty expansion (falls back to `"/"`).
 fn extract_path(url: &zerobench_core::Template) -> String {
     let mut buf = Vec::with_capacity(256);

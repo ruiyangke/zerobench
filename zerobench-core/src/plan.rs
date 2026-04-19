@@ -1,8 +1,8 @@
-//! The Phase 1 data model.
+//! The plan data model.
 //!
 //! A [`Plan`] is the frozen, thread-shareable description of what the engine
 //! should execute. CLI, request-file, and Rhai front-ends all compile down
-//! to this type. Phase 2 (rate scheduler → dispatcher → transport) consumes
+//! to this type. The rate scheduler → dispatcher → transport pipeline consumes
 //! a `Plan` and never inspects the original source.
 //!
 //! See `docs/design-v0.1.0.md` §3 for the full data model.
@@ -39,7 +39,7 @@ pub struct Plan {
     pub duration: Duration,
     /// Warmup phase — requests are fired but stats are discarded. Zero
     /// disables warmup entirely.
-    #[serde(default, with = "humanduration")]
+    #[serde(default)]
     pub warmup: Duration,
     /// Inter-run cooldown, observed between each of `runs` runs. Lets
     /// TIME_WAIT drain, SYN-retransmit timers settle, TCP
@@ -74,21 +74,6 @@ fn default_threads() -> usize {
 
 fn default_runs() -> u32 {
     1
-}
-
-// Duration serde wrapper — `{secs, nanos}` struct form matching the
-// serde default for `Duration`.
-mod humanduration {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        d.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        Duration::deserialize(d)
-    }
 }
 
 impl Plan {
@@ -153,10 +138,6 @@ pub enum Mode {
     },
     /// Archive-only: compare two stored `result.json` artifacts.
     Diff,
-    // Note: `Mode::Watch` was dropped from v0.1.0 (2026-04-19).
-    // Continuous monitoring belongs in Prometheus/Grafana
-    // (see PHILOSOPHY.md §5 / §13.2); "rerun on schedule" is
-    // cron + measure + compare.
 }
 
 impl Default for Mode {
@@ -202,9 +183,6 @@ impl Default for CompareSchedule {
         Self::Interleaved
     }
 }
-
-// WatchUntil and ComparisonOp were removed 2026-04-19 along with
-// Mode::Watch. See PHILOSOPHY.md §5 for rationale.
 
 /// One named traffic stream — a sequence of steps executed top-to-bottom
 /// per iteration, emitted at the scenario's [`RateProfile`].
@@ -720,7 +698,7 @@ pub enum Assertion {
 //
 // `http::Method` and `http::HeaderName` don't implement serde by default.
 // Instead of pulling the whole `http-serde` crate, we inline the narrow
-// helpers we need. Phase 1 plans only ever round-trip through JSON for
+// helpers we need. Plans only ever round-trip through JSON for
 // the diff tool (Task 13) and debug logging; this is adequate.
 
 mod http_serde {

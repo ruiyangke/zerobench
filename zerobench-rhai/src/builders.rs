@@ -464,7 +464,7 @@ impl RequestBuilder {
 // ---------------------------------------------------------------------------
 // Protocol-native builders
 //
-// SseHoldBuilder / WsEchoRttBuilder wrap the Phase 1 SseHoldPlan /
+// SseHoldBuilder / WsEchoRttBuilder wrap the SseHoldPlan /
 // WsEchoRttPlan state. Construction is one-shot — users pass the
 // essential parameters at call time (sse_hold(url, n, for)) instead
 // of chained setters.
@@ -1582,7 +1582,7 @@ fn register_request_builders(engine: &mut Engine) {
 }
 
 fn register_sse_hold_builders(engine: &mut Engine) {
-    // sse_hold(url, subscribers, hold_for) — Phase 6a hold semantics.
+    // sse_hold(url, subscribers, hold_for).
     engine.register_fn(
         "sse_hold",
         move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {

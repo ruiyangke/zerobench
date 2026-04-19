@@ -1,4 +1,4 @@
-//! Statistical comparison engine — Phase 8a.
+//! Statistical comparison engine
 //!
 //! Implements the run-level percentile bootstrap from
 //! `docs/PHILOSOPHY.md` §9.3 / `docs/design-v0.1.0.md` §8. Given two
@@ -18,7 +18,7 @@
 //! Anderson-Darling and Kolmogorov-Smirnov strategies (PHILOSOPHY
 //! §9.3 `ad-distribution` / `ks-distribution`) operate on HDR
 //! histogram ECDFs and require the canonical `.histlog` sidecar —
-//! land with Phase 8b after Phase 5c ships the log writer.
+//! operate on HDR histogram ECDFs via the canonical `.histlog` sidecar.
 //!
 //! # Determinism
 //!
@@ -431,7 +431,7 @@ fn mean_resample(values: &[f64], rng: &mut Xoshiro) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Two-sample Kolmogorov–Smirnov distribution test (Phase 8b)
+// Two-sample Kolmogorov–Smirnov distribution test
 //
 // Tests the hypothesis "these two latency distributions were drawn
 // from the same population." Uses the classical two-sample KS D
@@ -444,7 +444,7 @@ fn mean_resample(values: &[f64], rng: &mut Xoshiro) -> f64 {
 // the "large N" regime we always operate in (>>100 samples per side).
 //
 // KS is less tail-sensitive than Anderson-Darling. AD lands in
-// Phase 8c along with Holm-Bonferroni correction and a
+// alongside Holm-Bonferroni correction and a
 // `--compare-strategy` CLI flag.
 // ---------------------------------------------------------------------------
 
@@ -590,7 +590,7 @@ fn kolmogorov_p_value(lambda: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Two-sample Anderson–Darling distribution test (Phase 8c)
+// Two-sample Anderson–Darling distribution test
 //
 // AD is more tail-sensitive than KS — its integrand weights
 // F(x)(1-F(x)) in the denominator so differences at the extreme
@@ -778,7 +778,7 @@ fn ad_p_value(t: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Holm-Bonferroni correction (Phase 8c)
+// Holm-Bonferroni correction
 //
 // Family-wise error-rate control for multi-metric p-values. Given
 // p_1..p_m (unordered), sort ascending. Reject H_(i) when

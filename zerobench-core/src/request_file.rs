@@ -81,7 +81,7 @@ pub enum RequestFileError {
     /// the source name, line number, and offending text.
     #[error("invalid request line: {0}")]
     InvalidRequestLine(String),
-    /// `HTTP/2` or later in the request line. Phase D only speaks HTTP/1.x.
+    /// `HTTP/2` or later in the request line. only speaks HTTP/1.x.
     #[error("unsupported HTTP version: {0}")]
     UnsupportedVersion(String),
     /// A header line did not contain a `:` separator. The inner string

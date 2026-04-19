@@ -3,8 +3,8 @@
 //! The unit tests inside `state.rs` exercise basic construction and
 //! ingest bookkeeping. This file focuses on the derived-value APIs
 //! the render layer depends on: rolling histogram merges, sparkline
-//! windowing, delta indicator, bounded-ring eviction, and the v0.0.2
-//! additions — tab switching, peak/min tracking, cumulative bytes.
+//! windowing, delta indicator, bounded-ring eviction, tab switching,
+//! peak/min tracking, and cumulative bytes.
 
 use std::time::Duration;
 

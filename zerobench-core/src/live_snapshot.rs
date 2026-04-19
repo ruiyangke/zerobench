@@ -23,7 +23,7 @@
 //!
 //! If per-sample mutex contention ever shows up in profiling we can
 //! switch to a sharded `Vec<Mutex<Histogram>>` keyed by worker thread
-//! id, but that's a Phase-E optimisation, not Phase D.
+//! id, but that's a future optimisation.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

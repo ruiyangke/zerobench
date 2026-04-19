@@ -84,7 +84,7 @@ impl MioTlsStream {
     ) -> io::Result<()> {
         let mut events = mio::Events::with_capacity(64);
 
-        // Phase 1: wait for TCP connect to complete.
+        // wait for TCP connect to complete.
         // mio signals the socket as writable when connect() finishes.
         // Check for connect errors via `peer_addr()` or `take_error()`.
         loop {
@@ -120,7 +120,7 @@ impl MioTlsStream {
             }
         }
 
-        // Phase 2: drive TLS handshake.
+        // drive TLS handshake.
         let mut rounds = 0u32;
         loop {
             rounds += 1;

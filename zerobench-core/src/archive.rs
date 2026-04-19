@@ -4,7 +4,7 @@
 //! §8.1. Every `measure` / `compare` / `curve` / `soak` / `watch` run
 //! (and `calibrate` for its own archival path) writes a set of
 //! sidecars into a deterministic directory whose name is derived from
-//! the plan + target fingerprints (§Phase 3) and the run timestamp.
+//! the plan + target fingerprints () and the run timestamp.
 //!
 //! # Layout
 //!
@@ -14,9 +14,9 @@
 //!     <url_fingerprint>/
 //!       <run_id>/
 //!         plan.json         — deterministic compile of source
-//!         result.json       — full Summary + metadata (Phase 5b)
-//!         result.histlog    — HDR V2 compressed log (Phase 5b)
-//!         warmup.histlog    — warmup-phase histogram (Phase 5b)
+//!         result.json       — full Summary + metadata
+//!         result.histlog    — HDR V2 compressed log
+//!         warmup.histlog    — warmup-phase histogram
 //!         machine.json      — full machine fingerprint
 //!         env.json          — tool version + flags + context + timestamps
 //!         INDEX.json        — schema_versions + grouping metadata
@@ -133,7 +133,7 @@ pub struct Index {
     /// `"result"` when present). A reader rejects unknown major
     /// versions per §8.1.
     pub schema_versions: SchemaVersions,
-    /// SHA-256 hex of the canonical plan JSON (§Phase 3 fingerprint).
+    /// SHA-256 hex of the canonical plan JSON ( fingerprint).
     pub plan_hash: String,
     /// SHA-256 hex of the url+resolved-IPs+plan_hash bundle.
     pub target_fingerprint: String,
@@ -158,7 +158,7 @@ pub struct SchemaVersions {
     /// `INDEX.json` schema version.
     pub index: u32,
     /// `result.json` schema version — present when the run completed
-    /// and the summary was serialised (Phase 5b).
+    /// and the summary was serialised.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<u32>,
 }

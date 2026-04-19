@@ -16,10 +16,12 @@
 //! - `field:` introduces a field; `field: value` (single-space trim) is
 //!   the preferred form. Lines starting with `:` are comments.
 //! - Multiple `data:` fields within one event concatenate with `\n`.
-//! - We recognise `data`, `event`, `id`, `retry`, and comments; v0.0.1
-//!   only records `data` — everything else reports as [`SseEvent::Ignored`]
-//!   for a counter so users can see if their stream has unexpected
-//!   fields.
+//! - We recognise `data`, `event`, `id`, `retry`, and comments; only
+//!   `data` produces a [`SseEvent::Data`] — `event` / `retry` /
+//!   comments surface as [`SseEvent::Ignored`] for a counter so
+//!   users can see if their stream has unexpected fields. `id:` is
+//!   tracked separately by `SseReconnectStorm` for Last-Event-ID
+//!   propagation checks.
 //!
 //! `data: [DONE]` is *not* in the SSE spec — it's OpenAI's convention
 //! for signalling logical stream end. We surface it as

@@ -517,8 +517,8 @@ fn duration_to_hist_ns(d: Duration) -> u64 {
 //
 // HDR histograms don't implement Serialize; the canonical archival
 // format is an `.histlog` V2 compressed log (§PHILOSOPHY P3). For
-// Phase 5b we emit JSON-friendly percentiles + counts — sufficient
-// for the diff / replay fast paths. Phase 5c will add the .histlog
+// We emit JSON-friendly percentiles + counts — sufficient
+// for the diff / replay fast paths. The `.histlog` sidecar adds the .histlog
 // alongside (both derived from the same Histogram source of truth).
 // ---------------------------------------------------------------------------
 
