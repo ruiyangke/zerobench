@@ -566,14 +566,45 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Protocol::Sse => {
                 #[cfg(feature = "sse")]
                 {
-                    zerobench_sse::run_sse_hold_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.duration,
-                        tls_config.clone(),
-                        stop,
-                    )
+                    let first_sse_step = plan.scenarios.first().and_then(|s| {
+                        s.steps.iter().find(|st| {
+                            !matches!(
+                                st,
+                                zerobench_core::plan::Step::Pause(_)
+                                    | zerobench_core::plan::Step::PauseRandom { .. }
+                            )
+                        })
+                    });
+                    match first_sse_step {
+                        Some(zerobench_core::plan::Step::SseFanout(_)) => {
+                            zerobench_sse::run_sse_fanout_from_plan_threaded(
+                                &target,
+                                &opts,
+                                &plan,
+                                args.duration,
+                                tls_config.clone(),
+                                stop,
+                            )
+                        }
+                        Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => {
+                            zerobench_sse::run_sse_reconnect_storm_from_plan_threaded(
+                                &target,
+                                &opts,
+                                &plan,
+                                args.duration,
+                                tls_config.clone(),
+                                stop,
+                            )
+                        }
+                        _ => zerobench_sse::run_sse_hold_from_plan_threaded(
+                            &target,
+                            &opts,
+                            &plan,
+                            args.duration,
+                            tls_config.clone(),
+                            stop,
+                        ),
+                    }
                 }
                 #[cfg(not(feature = "sse"))]
                 {
@@ -583,8 +614,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Protocol::Ws => {
                 #[cfg(feature = "ws")]
                 {
-                    // Sub-dispatch within WS: WsHold / WsServerPushRtt /
-                    // WsEchoRtt are three different backends.
+                    // Sub-dispatch within WS.
                     let first_ws_step = plan
                         .scenarios
                         .first()
@@ -608,6 +638,16 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         }
                         Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => {
                             zerobench_ws::run_ws_server_push_rtt_from_plan_threaded(
+                                &target,
+                                &opts,
+                                &plan,
+                                args.duration,
+                                tls_config.clone(),
+                                stop,
+                            )
+                        }
+                        Some(zerobench_core::plan::Step::WsFanout(_)) => {
+                            zerobench_ws::run_ws_fanout_from_plan_threaded(
                                 &target,
                                 &opts,
                                 &plan,

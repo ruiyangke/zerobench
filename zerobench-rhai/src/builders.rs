@@ -666,6 +666,140 @@ impl WsServerPushBuilder {
     }
 }
 
+/// Returned by `sse_fanout(url, subs, hold_for)`. Compiles to
+/// [`Step::SseFanout`] at finalize. Requires `.trigger_url(...)`.
+#[derive(Clone)]
+pub(crate) struct SseFanoutBuilder {
+    inner: Arc<Mutex<SseFanoutBuilderState>>,
+}
+pub(crate) struct SseFanoutBuilderState {
+    pub url: String,
+    pub subscribers: u32,
+    pub hold_for: Duration,
+    pub reconnect: bool,
+    pub trigger_url: String,
+}
+impl Default for SseFanoutBuilderState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            subscribers: 1,
+            hold_for: Duration::from_secs(60),
+            reconnect: true,
+            trigger_url: String::new(),
+        }
+    }
+}
+impl SseFanoutBuilder {
+    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SseFanoutBuilderState {
+                url,
+                subscribers: subs.max(1),
+                hold_for,
+                reconnect: true,
+                trigger_url: String::new(),
+            })),
+        }
+    }
+    fn with_state<R>(&self, f: impl FnOnce(&mut SseFanoutBuilderState) -> R) -> R {
+        let mut g = self.inner.lock().expect("sse_fanout builder mutex poisoned");
+        f(&mut g)
+    }
+    fn take_state(&self) -> SseFanoutBuilderState {
+        self.with_state(std::mem::take)
+    }
+}
+
+/// Returned by `ws_fanout(url, conns, hold_for)`. Compiles to
+/// [`Step::WsFanout`] at finalize.
+#[derive(Clone)]
+pub(crate) struct WsFanoutBuilder {
+    inner: Arc<Mutex<WsFanoutBuilderState>>,
+}
+pub(crate) struct WsFanoutBuilderState {
+    pub url: String,
+    pub connections: u32,
+    pub hold_for: Duration,
+    pub heartbeat: Duration,
+    pub trigger_url: String,
+}
+impl Default for WsFanoutBuilderState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            connections: 1,
+            hold_for: Duration::from_secs(60),
+            heartbeat: Duration::from_secs(25),
+            trigger_url: String::new(),
+        }
+    }
+}
+impl WsFanoutBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(WsFanoutBuilderState {
+                url,
+                connections: connections.max(1),
+                hold_for,
+                heartbeat: Duration::from_secs(25),
+                trigger_url: String::new(),
+            })),
+        }
+    }
+    fn with_state<R>(&self, f: impl FnOnce(&mut WsFanoutBuilderState) -> R) -> R {
+        let mut g = self.inner.lock().expect("ws_fanout builder mutex poisoned");
+        f(&mut g)
+    }
+    fn take_state(&self) -> WsFanoutBuilderState {
+        self.with_state(std::mem::take)
+    }
+}
+
+/// Returned by `sse_reconnect_storm(url, subs, hold_for)`.
+#[derive(Clone)]
+pub(crate) struct SseReconnectStormBuilder {
+    inner: Arc<Mutex<SseReconnectStormBuilderState>>,
+}
+pub(crate) struct SseReconnectStormBuilderState {
+    pub url: String,
+    pub subscribers: u32,
+    pub hold_for: Duration,
+    pub kill_rate_per_s: f64,
+    pub verify_last_event_id: bool,
+}
+impl Default for SseReconnectStormBuilderState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            subscribers: 1,
+            hold_for: Duration::from_secs(60),
+            kill_rate_per_s: 0.1,
+            verify_last_event_id: true,
+        }
+    }
+}
+impl SseReconnectStormBuilder {
+    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SseReconnectStormBuilderState {
+                url,
+                subscribers: subs.max(1),
+                hold_for,
+                kill_rate_per_s: 0.1,
+                verify_last_event_id: true,
+            })),
+        }
+    }
+    fn with_state<R>(&self, f: impl FnOnce(&mut SseReconnectStormBuilderState) -> R) -> R {
+        let mut g = self.inner.lock().expect("sse_reconnect_storm builder mutex poisoned");
+        f(&mut g)
+    }
+    fn take_state(&self) -> SseReconnectStormBuilderState {
+        self.with_state(std::mem::take)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StepSource — intermediate form before template compilation
 // ---------------------------------------------------------------------------
@@ -682,9 +816,12 @@ impl WsServerPushBuilder {
 pub(crate) enum StepSource {
     Request(RequestBuilder),
     SseHold(SseHoldBuilder),
+    SseFanout(SseFanoutBuilder),
+    SseReconnectStorm(SseReconnectStormBuilder),
     WsEchoRtt(WsEchoRttBuilder),
     WsHold(WsHoldBuilder),
     WsServerPush(WsServerPushBuilder),
+    WsFanout(WsFanoutBuilder),
     Pause(Duration),
     PauseRandom { min: Duration, max: Duration },
 }
@@ -820,6 +957,118 @@ fn compile_step(
                 hold_for,
             }))
         }
+        StepSource::SseFanout(fb) => {
+            let SseFanoutBuilderState {
+                url,
+                subscribers,
+                hold_for,
+                reconnect,
+                trigger_url,
+            } = fb.take_state();
+            if trigger_url.is_empty() {
+                return Err(ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: "sse_fanout trigger_url".into(),
+                    error: zerobench_core::template::TemplateError::NotYetSupported(
+                        "sse_fanout requires .trigger_url(...)".into(),
+                    ),
+                });
+            }
+            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("sse_fanout url {url:?}"),
+                error: e,
+            })?;
+            let trig_tpl = Template::compile(&trigger_url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("sse_fanout trigger_url {trigger_url:?}"),
+                error: e,
+            })?;
+            Ok(Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
+                subscribers: zerobench_core::plan::SseHoldPlan {
+                    url: url_tpl,
+                    headers: SmallVec::new(),
+                    subscribers,
+                    hold_for,
+                    reconnect,
+                },
+                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+                    url: trig_tpl,
+                    body: None,
+                },
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+            }))
+        }
+        StepSource::SseReconnectStorm(sb) => {
+            let SseReconnectStormBuilderState {
+                url,
+                subscribers,
+                hold_for,
+                kill_rate_per_s,
+                verify_last_event_id,
+            } = sb.take_state();
+            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("sse_reconnect_storm url {url:?}"),
+                error: e,
+            })?;
+            Ok(Step::SseReconnectStorm(
+                zerobench_core::plan::SseReconnectStormPlan {
+                    subscribers: zerobench_core::plan::SseHoldPlan {
+                        url: url_tpl,
+                        headers: SmallVec::new(),
+                        subscribers,
+                        hold_for,
+                        reconnect: true,
+                    },
+                    kill_rate_per_s,
+                    verify_last_event_id,
+                },
+            ))
+        }
+        StepSource::WsFanout(fb) => {
+            let WsFanoutBuilderState {
+                url,
+                connections,
+                hold_for,
+                heartbeat,
+                trigger_url,
+            } = fb.take_state();
+            if trigger_url.is_empty() {
+                return Err(ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: "ws_fanout trigger_url".into(),
+                    error: zerobench_core::template::TemplateError::NotYetSupported(
+                        "ws_fanout requires .trigger_url(...)".into(),
+                    ),
+                });
+            }
+            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("ws_fanout url {url:?}"),
+                error: e,
+            })?;
+            let trig_tpl = Template::compile(&trigger_url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("ws_fanout trigger_url {trigger_url:?}"),
+                error: e,
+            })?;
+            Ok(Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
+                subscribers: zerobench_core::plan::WsHoldPlan {
+                    url: url_tpl,
+                    headers: SmallVec::new(),
+                    connections,
+                    heartbeat,
+                    heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                    hold_for,
+                },
+                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+                    url: trig_tpl,
+                    body: None,
+                },
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+            }))
+        }
         StepSource::WsServerPush(pb) => {
             let WsServerPushBuilderState {
                 url,
@@ -947,6 +1196,9 @@ pub fn register(engine: &mut Engine, root: PlanBuilder) {
     register_ws_echo_rtt_builders(engine);
     register_ws_hold_builders(engine);
     register_ws_server_push_builders(engine);
+    register_sse_fanout_builders(engine);
+    register_ws_fanout_builders(engine);
+    register_sse_reconnect_storm_builders(engine);
     register_scenario_builder(engine);
     register_pause_helpers(engine);
 }
@@ -960,6 +1212,9 @@ fn register_types(engine: &mut Engine) {
     engine.register_type_with_name::<WsEchoRttBuilder>("WsEchoRttBuilder");
     engine.register_type_with_name::<WsHoldBuilder>("WsHoldBuilder");
     engine.register_type_with_name::<WsServerPushBuilder>("WsServerPushBuilder");
+    engine.register_type_with_name::<SseFanoutBuilder>("SseFanoutBuilder");
+    engine.register_type_with_name::<SseReconnectStormBuilder>("SseReconnectStormBuilder");
+    engine.register_type_with_name::<WsFanoutBuilder>("WsFanoutBuilder");
     engine.register_type_with_name::<VarSlotHandle>("VarSlot");
     engine.register_type_with_name::<StepSource>("Step");
 }
@@ -1381,6 +1636,82 @@ fn register_ws_hold_builders(engine: &mut Engine) {
     );
 }
 
+fn register_sse_fanout_builders(engine: &mut Engine) {
+    engine.register_fn(
+        "sse_fanout",
+        move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {
+            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
+            let s: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
+            SseFanoutBuilder::new(url.to_string(), s, secs)
+        },
+    );
+    engine.register_fn(
+        "trigger_url",
+        move |b: SseFanoutBuilder, url: ImmutableString| {
+            b.with_state(|s| s.trigger_url = url.to_string());
+            b
+        },
+    );
+    engine.register_fn(
+        "reconnect",
+        move |b: SseFanoutBuilder, on: bool| {
+            b.with_state(|s| s.reconnect = on);
+            b
+        },
+    );
+}
+
+fn register_ws_fanout_builders(engine: &mut Engine) {
+    engine.register_fn(
+        "ws_fanout",
+        move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
+            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
+            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            WsFanoutBuilder::new(url.to_string(), c, secs)
+        },
+    );
+    engine.register_fn(
+        "trigger_url",
+        move |b: WsFanoutBuilder, url: ImmutableString| {
+            b.with_state(|s| s.trigger_url = url.to_string());
+            b
+        },
+    );
+    engine.register_fn(
+        "heartbeat",
+        move |b: WsFanoutBuilder, interval: ImmutableString| {
+            let d = parse_duration_str(&interval).unwrap_or(Duration::from_secs(25));
+            b.with_state(|s| s.heartbeat = d);
+            b
+        },
+    );
+}
+
+fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
+    engine.register_fn(
+        "sse_reconnect_storm",
+        move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {
+            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
+            let s: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
+            SseReconnectStormBuilder::new(url.to_string(), s, secs)
+        },
+    );
+    engine.register_fn(
+        "kill_rate",
+        move |b: SseReconnectStormBuilder, rate: f64| {
+            b.with_state(|s| s.kill_rate_per_s = rate);
+            b
+        },
+    );
+    engine.register_fn(
+        "verify_last_event_id",
+        move |b: SseReconnectStormBuilder, on: bool| {
+            b.with_state(|s| s.verify_last_event_id = on);
+            b
+        },
+    );
+}
+
 fn register_ws_server_push_builders(engine: &mut Engine) {
     // ws_server_push(url, connections, hold_for) — read-only RTT.
     engine.register_fn(
@@ -1470,6 +1801,24 @@ fn register_scenario_builder(engine: &mut Engine) {
         "step",
         move |s: ScenarioBuilder, b: WsServerPushBuilder| {
             s.with_state(|st| st.steps.push(StepSource::WsServerPush(b)));
+        },
+    );
+    engine.register_fn(
+        "step",
+        move |s: ScenarioBuilder, b: SseFanoutBuilder| {
+            s.with_state(|st| st.steps.push(StepSource::SseFanout(b)));
+        },
+    );
+    engine.register_fn(
+        "step",
+        move |s: ScenarioBuilder, b: SseReconnectStormBuilder| {
+            s.with_state(|st| st.steps.push(StepSource::SseReconnectStorm(b)));
+        },
+    );
+    engine.register_fn(
+        "step",
+        move |s: ScenarioBuilder, b: WsFanoutBuilder| {
+            s.with_state(|st| st.steps.push(StepSource::WsFanout(b)));
         },
     );
 

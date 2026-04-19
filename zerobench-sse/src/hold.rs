@@ -362,7 +362,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 // Phase 6b refactor will pull the decoder into a shared submodule.
 // ---------------------------------------------------------------------------
 
-struct ChunkDecoder {
+pub(crate) struct ChunkDecoder {
     state: ChunkState,
     size_buf: Vec<u8>,
 }
@@ -377,14 +377,14 @@ enum ChunkState {
 }
 
 impl ChunkDecoder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: ChunkState::Size,
             size_buf: Vec::with_capacity(16),
         }
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+    pub(crate) fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
         let mut i = 0;
         while i < input.len() {
             match self.state {
