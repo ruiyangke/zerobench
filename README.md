@@ -1,85 +1,223 @@
 # zerobench
 
-Fast, correct, modern HTTP benchmarking — open-loop by default, HDR-precise
-(nanosecond), compio/io_uring-native, HTTP/1/2/3 + WebSocket + SSE, with
-compile-time Rhai scenario DSL.
+Fast, correct, modern benchmarking for HTTP, SSE, and WebSocket —
+mio/epoll-native, HDR-precise (nanosecond), protocol-native metrics,
+baseline-compare-first workflow.
 
-> **Status: v0.0.1 — pre-alpha.** Design is locked (see [`docs/design.md`](docs/design.md)); implementation is in progress.
+> **Status: v0.1.0-impl** — implementation tree on branch
+> `v0.1.0-impl`. Core verbs (`probe`, `measure`, `calibrate`,
+> `curve`, `compare`, `diff`) work end-to-end with archive, bootstrap
+> CI, KS/AD distribution tests, HDR V2 log interop. SSE hold mode and
+> WS echo-rtt mode are wired. Remaining: SseFanout /
+> SseReconnectStorm / WsHold / WsServerPushRtt / WsFanout backends,
+> then v0.1.0-beta.
+>
+> For the design rationale see [`docs/PHILOSOPHY.md`](docs/PHILOSOPHY.md)
+> and [`docs/design-v0.1.0.md`](docs/design-v0.1.0.md).
 
 ## Why another benchmark tool?
 
-`wrk` is great but measurement-model dated (closed-loop service-time latency,
-no open-loop / constant-rate mode → coordinated omission under load). `wrk2`
-fixed the measurement model but never really caught on. `k6` is full-featured
-but heavy and JS-per-request bleeds throughput. `oha` is friendly but limited.
+zerobench is a **measurement apparatus**, not a load generator.
+Every number it emits carries enough context (machine, plan,
+commit, duration, flags, resolved IPs, TLS, …) that it survives a
+screenshot, PR comment, or regression investigation. Bare numbers
+are banned.
 
-zerobench aims at a specific point in the design space:
+The tool ships ≥1.2× wrk's throughput against canonical loopback
+echo — "invisible tool" is a hard constraint, not an aspiration.
 
-- **Open-loop by default.** Constant-rate scheduler, coordinated-omission-free latency. Closed-loop (`--saturate`) opt-in.
-- **Pure-Rust hot path.** Scenarios described in Rhai (or CLI) get compiled to a `Plan` data structure; the engine executes in 100% Rust with zero interpreter on the critical path.
-- **Multi-protocol, one engine.** H1/H2/H3/WS/SSE all ride the same dispatcher, rate controller, and recorder.
-- **Low-level hyper, not reqwest.** We own the connection pool, measure TTFB, count wire bytes exactly.
-- **HDR histograms in nanoseconds.** No information loss at sub-millisecond tail.
+- **Open-loop by default**: constant-rate scheduler, coordinated-omission-free latency.
+- **Tail latency is the product**: HDR histograms end-to-end; p50/p90/p99/p99.9/p99.99/max on every report.
+- **Protocols are different, treated differently**: HTTP is client-driven short sessions, SSE is server-driven long sessions, WS is bidirectional long sessions. Each gets protocol-native metrics.
+- **Comparison is first-class**: every run auto-archives; `compare` runs bootstrap CI + Anderson-Darling + Kolmogorov-Smirnov against a baseline.
+- **No cache** for client self-check: fresh calibration per run via an in-process loopback echo; refuses to run when the client can't sustain the requested rate.
 
-## Quick start
-
-*(when v0.0.1 lands)*
+## Install
 
 ```bash
-# Closed-loop (wrk-like): saturate with 300 conns for 30s
-zerobench --saturate -c 300 -d 30s http://api/events
-
-# Open-loop: constant 10k req/s for 30s
-zerobench -r 10k -d 30s http://api/events
-
-# Scripted multi-scenario with independent rates
-zerobench run ./bench.rhai
+cargo install zerobench                                       # h1 + default
+cargo install zerobench --features "sse ws script tui"        # all protocols + Rhai + TUI
+cargo install zerobench --features full                       # everything
 ```
 
-## Architecture
-
-```
-      Phase 1 — compile (once)        Phase 2 — execute (hot path)
-      ┌─────────────────────┐         ┌──────────────────────────┐
-      │  CLI / Rhai / .http │         │  RateScheduler per        │
-      │           ↓          │         │    scenario → tokens →   │
-      │  Plan { scenarios,   │   ─→    │  Worker pool → Transport │
-      │   templates, rates,  │         │    (H1/H2/H3/WS/SSE) →   │
-      │   vars, checks }     │         │  Extract + Check →       │
-      │                     │         │  Recorder → Report       │
-      └─────────────────────┘         └──────────────────────────┘
-                                         100% Rust, no interpreter
-```
-
-See [`docs/design.md`](docs/design.md) for the full spec.
-
-## Features
-
+Feature flags:
 - `h1` (default) — HTTP/1.1
 - `h2` — HTTP/2
-- `h3` — HTTP/3 / QUIC
-- `ws` (default) — WebSocket
-- `sse` (default) — Server-Sent Events
-- `tui` — live dashboard via ratatui
+- `sse` — Server-Sent Events (with `SseHold` semantics)
+- `ws` — WebSocket (with `WsEchoRtt` correlation)
 - `script` — Rhai scenario DSL
-- `all` — enable everything
+- `tui` — live dashboard (ratatui)
+- `full` — all of the above
+
+## Six verbs
+
+Each verb answers one question. No overlap.
+
+| Verb | Question | Archives? |
+|------|----------|-----------|
+| `probe URL` | Does it respond, roughly how fast? (5s smoke) | no |
+| `measure URL` | Steady-state throughput + tail at a given rate? | yes |
+| `calibrate` | What's my machine's client-side ceiling? | no |
+| `curve URL` | Where's the saturation knee? | yes |
+| `compare A.json B.json` | Is B a regression against A? | — |
+| `diff A.json B.json` | (v0.0.1 JSON format) | — |
+
+### Quick tour
 
 ```bash
-cargo install zerobench                                   # H1 + WS + SSE
-cargo install zerobench --features "h2 h3 tui script"     # everything
+# Smoke test — 5s, 1 run, no archive
+zerobench probe http://api/events
+
+# Rigorous measurement — 60s × 3 runs, calibrate-gated, archived
+zerobench measure http://api/events --rate 10k --runs 3 --name api-events
+
+# Client ceiling — how fast can my laptop push?
+zerobench calibrate --rate 100k --duration 5s
+
+# Saturation curve — ramp 1k..100k/s over 2 minutes; find the knee
+zerobench curve http://api/events --from 1k --to 100k --over 2m --steps 10
+
+# Compare against a saved baseline with bootstrap CI + AD/KS
+zerobench compare baseline/result.json current/result.json --regress-on p99:+5%
 ```
+
+### SSE — N persistent subscribers, "event is the op"
+
+```bash
+zerobench measure http://api/stream --sse-hold 1000 --for 60s --runs 3 --name api-stream
+```
+
+Reports events/s (not streams/s) and inter-event gap p50/p99/p99.9. Matches
+production SSE workload questions: "how many concurrent subscribers at what
+chunk-gap tail?"
+
+### WebSocket — persistent connections, echo-RTT
+
+```bash
+zerobench measure ws://api/chat --ws-echo 100 --msg-rate 50 --runs 3 --name chat-rtt
+```
+
+Each connection sends at `--msg-rate` msg/s, measures RTT to the correlated
+echo. Uses a 16-char monotonic-id prefix for correlation (works with any
+verbatim-echo server). RTT histogram, not handshake latency — matches
+PHILOSOPHY §4.4.
+
+### Rhai DSL — multi-scenario, multi-protocol
+
+```rhai
+// bench.rhai — mix HTTP, SSE, and WS in one run
+scenario("http-ping", |s| {
+    s.step(GET("http://api/ping"));
+});
+scenario("sse-events", |s| {
+    s.step(sse_hold("http://api/events", 1000, "60s"));
+});
+scenario("ws-chat", |s| {
+    s.step(ws_echo_rtt("ws://api/chat", 100, 50));
+});
+rate("10k/s");
+duration("60s");
+```
+
+```bash
+zerobench run bench.rhai -c 200 -t 32
+```
+
+## Archive layout
+
+Every `measure` / `compare` / `curve` run writes to
+`$ZEROBENCH_HOME/runs/<url_fingerprint>/<run_id>/`:
+
+```
+plan.json       — compiled Plan (deterministic, sha256-hashed)
+machine.json    — CPU / kernel / NUMA / cgroup / TLS / clock-resolution
+env.json        — tool version, flags, --context pairs, timestamps
+result.json     — full percentile ladder + per-run metrics
+result.histlog  — HDR V2 compressed log (reads in HdrHistogram Plotter,
+                  jHiccup, wrk2 pipeline)
+INDEX.json      — schema versions + plan_hash + fingerprints
+```
+
+`run_id = <ISO8601>-<plan_hash[:8]>-<target_fp[:8]>` — copy-paste-able,
+filesystem-safe, globally unique. `INDEX.json` acts as a
+completion marker: its absence signals a partial / crashed run.
+
+## Statistical compare
+
+```bash
+$ zerobench compare baseline/result.json current/result.json --compare-strategy auto
+
+compare
+  baseline          reqs  rate    p50    p99   p99.9   errors
+  A                8,996  2999/s  528µs  1.10ms 1.16ms  0
+  B                8,997  2999/s  552µs  1.11ms 1.14ms  0
+
+    metric               A               B           Δ
+      rate         2999.0/s        2999.0/s      +0.01%
+       p99          1.10ms          1.11ms      +0.75%
+       ...
+
+AD two-sample: A²=6.252  T=4.549  p=0.0052  N=2999/3000  → differ (p < 0.05)
+KS two-sample: D=0.0358  p=0.0426  N=2999/3000  → differ (p < 0.05)
+
+bootstrap: 10000 resamples, seed 0xa5a5..., per-run N = A:3 / B:3
+    metric           95% CI on Δ
+      rate  [-1.00/s, +1.67/s]
+       p99  [-4.1µs, +21.2µs]
+```
+
+- **Bootstrap CI** (N ≥ 3 runs per side): 10k resamples at the
+  run level, 95 % percentile CI on the absolute delta. Seed is
+  derived from the plan+target so runs are byte-reproducible.
+- **Anderson-Darling** (PHILOSOPHY default): tail-sensitive
+  distribution test. Scholz-Stephens 1987.
+- **Kolmogorov-Smirnov**: classic ECDF max-gap test on HDR
+  histograms.
+- **Holm-Bonferroni**: family-wise p-value correction when gating
+  on multiple metrics (opt-in: `--holm-bonferroni`).
+
+Pick a strategy with `--compare-strategy {auto,ad,ks,none}`.
+
+## Self-refusal gate
+
+Per PHILOSOPHY §9.6.2, the tool refuses to run when it can't
+sustain the offered rate against a loopback echo — because "the
+tool is the instrument" and its ceiling must be above the signals
+it measures.
+
+```bash
+$ zerobench measure http://api --rate 1M
+[calibrate] self-check at 1_000_000 req/s against loopback (~2s)...
+[calibrate] achieved 237_000/1_000_000 req/s (23.7%) — verdict: Refuse
+error: client cannot sustain 1_000_000 req/s on this machine (achieved 237000).
+       Lower --rate, pass --no-calibrate, or --force-overload.
+```
+
+`--force-overload` stamps the result archive with
+`force_overload: true` — any `compare` against a non-overloaded
+baseline fails loudly.
 
 ## Crate layout
 
 ```
-zerobench-core/    Plan, Template, Transport, Dispatcher, Recorder
-zerobench-http/    H1/H2/H3 via hyper + cyper-core
-zerobench-ws/      RFC 6455 client on compio
-zerobench-sse/     SSE line framing on zerobench-http
-zerobench-rhai/    Compile-time scenario DSL
+zerobench-core/    Plan, Template, stats, compare, fingerprint,
+                   archive, calibrate, machine
+zerobench-http/    HTTP/1.1 + HTTP/2 (hyper + mio + rustls)
+zerobench-sse/     SSE hold (new) + stream (legacy deprecated)
+zerobench-ws/      WS echo-rtt (new) + round (legacy deprecated)
+zerobench-rhai/    Rhai scenario DSL (compile-time; drops before Phase 2)
 zerobench-tui/     ratatui dashboard
 zerobench-cli/     binary (installs as `zerobench`)
 ```
+
+## Status + contributing
+
+v0.1.0 is still in-tree on `v0.1.0-impl`. Merge to main once the
+remaining backends (SseFanout / ReconnectStorm / WsHold /
+ServerPushRtt / Fanout) land.
+
+See `docs/PHILOSOPHY.md` for the design principles and
+`docs/design-v0.1.0.md` for the type-level spec.
 
 ## License
 
