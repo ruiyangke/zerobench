@@ -344,3 +344,137 @@ fn json_body_adds_content_type_and_becomes_template() {
         other => panic!("expected Request, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.1.0 protocol-native builders (Phase 5d)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sse_hold_builder_compiles_to_step() {
+    let src = r#"
+        scenario("sse-events", |s| {
+            s.step(sse_hold("http://api/stream", 100, "30s"));
+        });
+        duration("30s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.scenarios.len(), 1);
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert_eq!(p.subscribers, 100);
+            assert_eq!(p.hold_for, std::time::Duration::from_secs(30));
+        }
+        other => panic!("expected SseHold, got {other:?}"),
+    }
+}
+
+#[test]
+fn sse_hold_builder_accepts_integer_seconds() {
+    let src = r#"
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/stream", 10, 5));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert_eq!(p.subscribers, 10);
+            assert_eq!(p.hold_for, std::time::Duration::from_secs(5));
+        }
+        _ => panic!("expected SseHold"),
+    }
+}
+
+#[test]
+fn sse_hold_reconnect_setter() {
+    let src = r#"
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/stream", 1, "1s").reconnect(false));
+        });
+        duration("1s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseHold(p) => {
+            assert!(!p.reconnect, "reconnect(false) should disable reconnect");
+        }
+        _ => panic!("expected SseHold"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_builder_compiles_to_step() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 50, 100));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            assert_eq!(p.connections, 50);
+            assert!((p.msg_rate_per_conn - 100.0).abs() < 1e-9);
+            assert!(matches!(
+                p.correlate,
+                zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend
+            ));
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_payload_setter() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).payload("hello"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            // Payload compiled to a static Template; check via expansion.
+            let mut buf = Vec::new();
+            let mut rng = zerobench_core::rng::from_entropy();
+            let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut ctx = zerobench_core::ExpandCtx {
+                rng: &mut rng,
+                counter: &counter,
+                scenario_vars: &[],
+            };
+            p.payload.expand_into(&mut buf, &mut ctx);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), "hello");
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn mixed_protocol_plan_from_rhai() {
+    let src = r#"
+        scenario("http", |s| {
+            s.step(GET("http://api/ping"));
+        });
+        scenario("sse", |s| {
+            s.step(sse_hold("http://api/events", 5, "10s"));
+        });
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 2, 50));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.scenarios.len(), 3);
+
+    use zerobench_core::plan::Protocol;
+    let protocols: Vec<Protocol> = loaded
+        .plan
+        .scenarios
+        .iter()
+        .map(|s| s.protocol())
+        .collect();
+    assert_eq!(protocols, vec![Protocol::Http, Protocol::Sse, Protocol::Ws]);
+}

@@ -189,10 +189,23 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     // compilation. Protocol-agnostic because multi-protocol plans are
     // now first-class citizens.
     debug_assert!(plan.scenarios.iter().any(|s| s.steps.iter().any(|st| {
-        matches!(
-            st,
-            Step::Request(_) | Step::SseStream(_) | Step::WsRound(_)
-        )
+        #[allow(deprecated)]
+        {
+            matches!(
+                st,
+                Step::Request(_)
+                    | Step::SseStream(_)
+                    | Step::WsRound(_)
+                    | Step::SseHold(_)
+                    | Step::WsEchoRtt(_)
+                    | Step::HttpColdConnect(_)
+                    | Step::SseFanout(_)
+                    | Step::SseReconnectStorm(_)
+                    | Step::WsHold(_)
+                    | Step::WsServerPushRtt(_)
+                    | Step::WsFanout(_)
+            )
+        }
     })));
 
     Ok(LoadedScript {
