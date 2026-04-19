@@ -215,7 +215,6 @@ fn run_worker(
             }
         };
 
-        let op_start = Instant::now();
         match do_one_op(
             &mut poll,
             &mut events,
@@ -228,7 +227,16 @@ fn run_worker(
             tls_config,
         ) {
             Ok(outcome) => {
-                let total = outcome.completed_at.duration_since(op_start);
+                // PHILOSOPHY §1 / P6: measure from the intended start
+                // of the op — the token-bucket slot we reserved, not
+                // when we actually began executing after the pacing
+                // sleep. This keeps the histogram CO-free under
+                // open-loop pacing. In saturate mode intended_start ==
+                // now-at-top-of-iteration, so the numbers are
+                // equivalent.
+                let total = outcome
+                    .completed_at
+                    .saturating_duration_since(intended_start);
                 // Record the "full-cold" TTFB = handshake + wait-for-first-byte.
                 // This is the meaningful signal for cold-connect: the server's
                 // accept + TLS + first-write latency together.
@@ -249,8 +257,6 @@ fn run_worker(
             }
             Err(e) => task.record_error(scenario_id, classify_err(e)),
         }
-
-        let _ = intended_start; // Unused if pacing disabled.
     }
 
     task

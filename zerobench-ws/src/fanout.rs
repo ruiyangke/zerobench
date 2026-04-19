@@ -152,6 +152,9 @@ pub fn run_ws_fanout_from_plan_threaded(
             if let Some(h) = s.handshake {
                 let _ = handshake_hist.record(duration_to_hist_ns(h));
             }
+            // See the SseFanout version for the consume-after-match
+            // rationale (prevents a single frame being credited to
+            // multiple consecutive triggers).
             let mut frame_iter = s.frames.iter().peekable();
             for &t_sent in &trigger_times {
                 while let Some(&&ev) = frame_iter.peek() {
@@ -159,6 +162,7 @@ pub fn run_ws_fanout_from_plan_threaded(
                         let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
                             .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
+                        frame_iter.next();
                         break;
                     }
                     frame_iter.next();

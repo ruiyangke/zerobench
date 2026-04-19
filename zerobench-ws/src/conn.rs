@@ -29,7 +29,7 @@
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use mio::net::TcpStream;
@@ -332,6 +332,46 @@ impl WsConnection {
         }
     }
 
+    /// Like [`recv`] but returns `Ok(None)` once `timeout` elapses with
+    /// no data frame arriving. Control frames (Ping/Pong/Close) are
+    /// still handled transparently, so this also keeps auto-Pong alive
+    /// for callers that need bounded waits (e.g. `WsHold` between
+    /// heartbeats; `WsServerPushRtt` deadline polling).
+    pub fn try_recv(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<DataFrame>, WsError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match frame::decode_frame(&self.recv_buf) {
+                Ok(hdr) => {
+                    let frame_bytes = self.recv_buf.split_to(hdr.total_len);
+                    match self.handle_frame(hdr, frame_bytes.freeze())? {
+                        Some(f) => return Ok(Some(f)),
+                        None => continue,
+                    }
+                }
+                Err(frame::WsError::NeedMore { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            match read_some_timed(
+                &mut self.stream,
+                &mut self.recv_buf,
+                &mut self.poll,
+                &mut self.events,
+                deadline - now,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Dispatch a single decoded frame.
     fn handle_frame(
         &mut self,
@@ -568,6 +608,45 @@ fn read_some_bytes_into(
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let _ = poll.poll(events, Some(Duration::from_millis(100)));
+                stream.flush_tls();
+            }
+            Err(e) => return Err(WsError::Io(e)),
+        }
+    }
+}
+
+/// Like [`read_some_bytes_into`] but bounded by a caller-supplied
+/// timeout. Returns `Ok(true)` when some bytes were read, `Ok(false)`
+/// on timeout, and `Err` on EOF or hard I/O failure.
+fn read_some_timed(
+    stream: &mut MioStream,
+    buf: &mut BytesMut,
+    poll: &mut Poll,
+    events: &mut Events,
+    timeout: Duration,
+) -> Result<bool, WsError> {
+    let deadline = Instant::now() + timeout;
+    let mut tmp = [0u8; 4096];
+    loop {
+        stream.flush_tls();
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                return Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed before frame completed",
+                )));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                return Ok(true);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                let wait = (deadline - now).min(Duration::from_millis(100));
+                let _ = poll.poll(events, Some(wait));
                 stream.flush_tls();
             }
             Err(e) => return Err(WsError::Io(e)),

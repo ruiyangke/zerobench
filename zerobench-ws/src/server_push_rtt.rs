@@ -30,7 +30,7 @@ use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::BenchRng;
 
-use crate::conn::{DataFrame, WsConnection, WsError};
+use crate::conn::{DataFrame, WsConnection};
 
 /// Per-connection rollup.
 #[derive(Debug, Clone)]
@@ -81,8 +81,19 @@ fn run_one_push(
 
     let mut last_at: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        match conn.recv() {
-            Ok(DataFrame::Text(b)) | Ok(DataFrame::Binary(b)) => {
+        // Bounded recv — must cap the wait so the deadline/stop check
+        // above fires even when the server pushes nothing. Without
+        // this, a low-rate push scenario would sit inside recv()
+        // forever because WsConnection::recv loops internally on
+        // WouldBlock with no external timeout.
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if remaining.is_zero() {
+            break;
+        }
+        match conn.try_recv(remaining) {
+            Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 let now = Instant::now();
                 if let Some(prev) = last_at {
                     let gap =
@@ -94,12 +105,8 @@ fn run_one_push(
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(b.len() as u64);
             }
-            Err(WsError::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // Keep looping — deadline/stop check above handles
-                // bounded waits.
+            Ok(None) => {
+                // Timeout — loop back to check deadline/stop.
             }
             Err(_) => {
                 stats.errors_read += 1;

@@ -185,7 +185,12 @@ pub fn run_sse_fanout_from_plan_threaded(
             if let Some(ttfb) = s.ttfb {
                 let _ = ttfb_hist.record(duration_to_hist_ns(ttfb));
             }
-            // For each trigger, find the first event after it.
+            // For each trigger, the first event observed by this
+            // subscriber at or after the trigger's send-instant is the
+            // broadcast response. CONSUME that event after recording so
+            // the next trigger matches a LATER event — otherwise a
+            // slow-firing subscriber would map the same event to
+            // multiple consecutive triggers and double-count.
             let mut ev_iter = s.events.iter().peekable();
             for &t_sent in &trigger_times {
                 while let Some(&&ev) = ev_iter.peek() {
@@ -193,6 +198,7 @@ pub fn run_sse_fanout_from_plan_threaded(
                         let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
                             .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
+                        ev_iter.next();
                         break;
                     }
                     ev_iter.next();

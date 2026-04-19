@@ -97,9 +97,30 @@ fn run_one_hold(
         let now = Instant::now();
         let sleep_until = next_hb.min(deadline);
         if sleep_until > now {
-            let nap = sleep_until - now;
-            // Cap naps at 250ms so stop-flag / deadline updates propagate.
-            std::thread::sleep(nap.min(Duration::from_millis(250)));
+            // Between heartbeats we call the bounded try_recv instead
+            // of sleeping. Two reasons:
+            // 1. WsConnection::try_recv transparently auto-pongs
+            //    inbound Pings — required so RFC 6455 servers that
+            //    expect timely Pong responses don't drop the
+            //    connection. Plain sleep would starve the control
+            //    frame path entirely.
+            // 2. Pure blocking sleep was the previous behaviour and
+            //    broke the hold semantics (the whole point of
+            //    WsHold is idle-capacity: if servers drop us due to
+            //    our own missed Pongs the measurement is poisoned).
+            let nap = (sleep_until - now).min(Duration::from_millis(500));
+            match conn.try_recv(nap) {
+                Ok(Some(frame)) => {
+                    stats.frames_recv += 1;
+                    stats.bytes_recv =
+                        stats.bytes_recv.saturating_add(frame.len() as u64);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    stats.errors_read += 1;
+                    return stats;
+                }
+            }
             continue;
         }
         let send_result = match plan.heartbeat_frame {
