@@ -424,7 +424,8 @@ fn mio_tls_stream_low_level() {
     };
     let config = zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]);
     let mut tls = zerobench_http::mio_tls::MioTlsStream::new(tcp, config, "localhost").unwrap();
-    tls.complete_handshake(&mut poll, token).unwrap();
+    tls.complete_handshake(&mut poll, token, std::time::Duration::from_secs(10))
+        .unwrap();
 
     // Write HTTP request
     let req = b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";

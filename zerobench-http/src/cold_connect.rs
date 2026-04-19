@@ -37,7 +37,7 @@ use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::LiveSnapshot;
 
 use crate::mio_tls::{MioStream, MioTlsStream};
-use crate::raw_h1_common::build_raw_request;
+use crate::raw_h1_common::{build_raw_request, ConnectionMode};
 
 const POLL_TOKEN: Token = Token(0);
 
@@ -284,7 +284,7 @@ fn run_worker(
                 }
             }
             Err(e) => {
-                let kind = classify_err(e);
+                let kind = classify_err(&e);
                 task.record_error(scenario_id, kind);
                 if let Some(live) = live {
                     live.record_error(kind);
@@ -306,20 +306,95 @@ struct OpOutcome {
     response_bytes: u64,
 }
 
+/// Categorised errors from a single cold-connect op.
+///
+/// Each hard-failure variant carries enough context (the underlying
+/// `io::Error` for transport failures, a free-form TLS message) that a
+/// downstream error-classification dashboard can tell "connection
+/// refused" from "DNS timeout" from "SNI mismatch" without guessing.
+/// Today only the ErrorKind category is surfaced upstream via
+/// `TaskStats`, but `Display` is implemented so dropped-op diagnostics
+/// can log the detail.
 #[derive(Debug)]
 enum ColdErr {
-    Connect,
-    Write,
-    Read,
+    /// TCP connect failed (refused, unreachable, socket error).
+    ConnectIo(io::Error),
+    /// TLS construction or handshake failed. Carries a message rather
+    /// than a typed rustls error so callers don't take a dep on
+    /// rustls just to match.
+    Tls(String),
+    /// Raw socket write failed mid-request.
+    Write(io::Error),
+    /// Raw socket read failed mid-response.
+    Read(io::Error),
+    /// Response headers didn't parse as HTTP/1.
+    BadResponse(&'static str),
+    /// Wall-clock deadline elapsed waiting for connect / handshake /
+    /// read / write.
     Timeout,
 }
 
-fn classify_err(e: ColdErr) -> ErrorKind {
+impl std::fmt::Display for ColdErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColdErr::ConnectIo(e) => write!(f, "connect: {e}"),
+            ColdErr::Tls(m) => write!(f, "tls: {m}"),
+            ColdErr::Write(e) => write!(f, "write: {e}"),
+            ColdErr::Read(e) => write!(f, "read: {e}"),
+            ColdErr::BadResponse(m) => write!(f, "bad response: {m}"),
+            ColdErr::Timeout => write!(f, "timeout"),
+        }
+    }
+}
+
+fn classify_err(e: &ColdErr) -> ErrorKind {
     match e {
-        ColdErr::Connect => ErrorKind::Connect,
-        ColdErr::Write => ErrorKind::Write,
-        ColdErr::Read => ErrorKind::Read,
+        // TLS failures are client-visible "I couldn't establish the
+        // connection" events, i.e. connect-class for ErrorCounters.
+        ColdErr::ConnectIo(_) | ColdErr::Tls(_) => ErrorKind::Connect,
+        ColdErr::Write(_) => ErrorKind::Write,
+        ColdErr::Read(_) | ColdErr::BadResponse(_) => ErrorKind::Read,
         ColdErr::Timeout => ErrorKind::Timeout,
+    }
+}
+
+/// RAII guard that deregisters a stream from mio's registry on drop.
+///
+/// Protects against dangling registrations when an op's error path
+/// abandons the stream mid-loop. `armed` lets callers opt into the
+/// deregister only after a successful `register` call — if
+/// registration never happened, dropping is a no-op.
+///
+/// Holds the `Registry` by owned clone (`try_clone`) rather than a
+/// borrow so the guard doesn't pin `poll` for its entire lifetime —
+/// the op body needs `&mut Poll` for `wait_for` and handshake driving.
+struct StreamGuard {
+    registry: mio::Registry,
+    stream: MioStream,
+    armed: bool,
+}
+
+impl StreamGuard {
+    fn new(registry: mio::Registry, stream: MioStream) -> Self {
+        Self { registry, stream, armed: false }
+    }
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+    fn register(&mut self, token: Token, interest: Interest) -> io::Result<()> {
+        self.registry
+            .register(self.stream.tcp_stream_mut(), token, interest)
+    }
+    fn stream_mut(&mut self) -> &mut MioStream {
+        &mut self.stream
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.registry.deregister(self.stream.tcp_stream_mut());
+        }
     }
 }
 
@@ -337,12 +412,46 @@ fn do_one_op(
 ) -> Result<OpOutcome, ColdErr> {
     let connect_start = Instant::now();
 
-    // --- TCP connect ---
-    let mut tcp = MioTcp::connect(addr).map_err(|_| ColdErr::Connect)?;
+    // --- TCP connect (no registration yet) ---
+    let tcp = MioTcp::connect(addr).map_err(ColdErr::ConnectIo)?;
     let _ = tcp.set_nodelay(true);
-    poll.registry()
-        .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
-        .map_err(|_| ColdErr::Connect)?;
+
+    // --- TLS wrap BEFORE registration ---
+    // Building `MioTlsStream` does no I/O — it just constructs the
+    // rustls state machine — so doing it here is safe. On wrap failure
+    // `tcp` is dropped and its fd is closed; there is no registration
+    // to leak. This ordering guarantees: if the function returns Err
+    // before the guard arms, no mio registration exists.
+    let stream = if target.tls {
+        let config = tls_config.ok_or_else(|| {
+            ColdErr::Tls(
+                "https:// target but no TLS config was provided by the caller"
+                    .into(),
+            )
+        })?;
+        let sni = target.sni_name().to_string();
+        let tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
+            .map_err(|e| ColdErr::Tls(format!("init: {e}")))?;
+        MioStream::Tls(tls)
+    } else {
+        MioStream::Plain(tcp)
+    };
+
+    // --- Register under a drop guard ---
+    // From here onward, any return path — success, error, panic —
+    // drops `guard` which deregisters automatically. No manual
+    // deregister calls needed inside the op body. The cloned
+    // registry detaches guard's lifetime from `poll` so `wait_for`
+    // and `poll.poll(...)` can take `&mut poll` freely below.
+    let registry = poll
+        .registry()
+        .try_clone()
+        .map_err(ColdErr::ConnectIo)?;
+    let mut guard = StreamGuard::new(registry, stream);
+    guard
+        .register(POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
+        .map_err(ColdErr::ConnectIo)?;
+    guard.arm();
 
     // Wait for writable (TCP connect done).
     wait_for(
@@ -351,55 +460,51 @@ fn do_one_op(
         opts.connect_timeout,
         |ev| ev.token() == POLL_TOKEN && ev.is_writable(),
     )
-    .map_err(|_| ColdErr::Connect)?;
-    match tcp.peer_addr() {
-        Ok(_) => {}
-        Err(_) => return Err(ColdErr::Connect),
+    .map_err(ColdErr::ConnectIo)?;
+    if let Err(e) = guard.stream_mut().tcp_stream_mut().peer_addr() {
+        return Err(ColdErr::ConnectIo(e));
     }
 
-    // --- TLS wrap (optional) ---
-    let mut stream = if target.tls {
-        let config = tls_config.ok_or(ColdErr::Connect)?;
-        let sni = target.sni_name().to_string();
-        let tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
-            .map_err(|_| ColdErr::Connect)?;
-        MioStream::Tls(tls)
-    } else {
-        MioStream::Plain(tcp)
-    };
-
     // Drive TLS handshake to completion.
-    if stream.is_handshaking() {
+    if guard.stream_mut().is_handshaking() {
         let hs_deadline = Duration::from_millis(5_000);
         let hs_start = Instant::now();
-        while stream.is_handshaking() {
+        while guard.stream_mut().is_handshaking() {
             if hs_start.elapsed() > hs_deadline {
                 return Err(ColdErr::Timeout);
             }
-            stream.drive_tls_io().map_err(|_| ColdErr::Connect)?;
-            if !stream.is_handshaking() {
+            guard
+                .stream_mut()
+                .drive_tls_io()
+                .map_err(|e| ColdErr::Tls(format!("handshake: {e}")))?;
+            if !guard.stream_mut().is_handshaking() {
                 break;
             }
             poll.poll(events, Some(Duration::from_millis(200)))
-                .map_err(|_| ColdErr::Connect)?;
+                .map_err(ColdErr::ConnectIo)?;
         }
     }
 
     // --- Write request ---
     req_buf.clear();
-    build_raw_request(req_plan, ctx, target, req_buf).map_err(|_| ColdErr::Write)?;
-    // S2: Cold-connect semantics require the server to close the
+    // Cold-connect semantics require the server to close the
     // connection after the response. Without `Connection: close`,
     // servers returning Transfer-Encoding: chunked responses (common
     // in modern stacks) keep the connection alive and we'd hang
-    // until `request_timeout` for every op. Inject the header into
-    // the request bytes before the final CRLF CRLF if it isn't
-    // already present (case-insensitive check on the header name).
-    inject_connection_close(req_buf);
+    // until `request_timeout` for every op. The builder emits
+    // `Connection: close` directly; a user-provided Connection
+    // header (e.g. `upgrade` for WS handshakes) wins.
+    build_raw_request(req_plan, ctx, target, ConnectionMode::Close, req_buf)
+        .map_err(|e| ColdErr::Write(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
     let mut write_pos = 0;
     while write_pos < req_buf.len() {
-        match stream.write(&req_buf[write_pos..]) {
-            Ok(0) => return Err(ColdErr::Write),
+        match guard.stream_mut().write(&req_buf[write_pos..]) {
+            Ok(0) => {
+                return Err(ColdErr::Write(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "peer closed during request write",
+                )))
+            }
             Ok(n) => write_pos += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 wait_for(poll, events, opts.request_timeout, |ev| {
@@ -407,7 +512,7 @@ fn do_one_op(
                 })
                 .map_err(|_| ColdErr::Timeout)?;
             }
-            Err(_) => return Err(ColdErr::Write),
+            Err(e) => return Err(ColdErr::Write(e)),
         }
     }
     let request_bytes = req_buf.len() as u64;
@@ -428,11 +533,13 @@ fn do_one_op(
         if Instant::now() >= read_deadline {
             return Err(ColdErr::Timeout);
         }
-        match stream.read(&mut scratch) {
+        match guard.stream_mut().read(&mut scratch) {
             Ok(0) => {
                 // EOF — if we haven't parsed headers, that's a read error.
                 if header_end.is_none() {
-                    return Err(ColdErr::Read);
+                    return Err(ColdErr::BadResponse(
+                        "EOF before response headers received",
+                    ));
                 }
                 // Otherwise EOF after headers is valid Connection: close.
                 break;
@@ -464,7 +571,11 @@ fn do_one_op(
                                     }
                                 }
                             }
-                            _ => return Err(ColdErr::Read),
+                            _ => {
+                                return Err(ColdErr::BadResponse(
+                                    "malformed HTTP/1 response headers",
+                                ))
+                            }
                         }
                     }
                 }
@@ -487,7 +598,7 @@ fn do_one_op(
                 })
                 .map_err(|_| ColdErr::Timeout)?;
             }
-            Err(_) => return Err(ColdErr::Read),
+            Err(e) => return Err(ColdErr::Read(e)),
         }
     }
 
@@ -497,9 +608,7 @@ fn do_one_op(
         .duration_since(write_done);
     let response_bytes = read_buf.len() as u64;
 
-    // Deregister before the stream goes out of scope.
-    let _ = poll.registry().deregister(stream.tcp_stream_mut());
-    drop(stream); // explicit close (TCP RST / FIN).
+    // `guard` drops here: deregister then close the underlying fd.
 
     Ok(OpOutcome {
         handshake,
@@ -509,61 +618,6 @@ fn do_one_op(
         request_bytes,
         response_bytes,
     })
-}
-
-/// If `req_buf` does not already carry a Connection header, insert
-/// `Connection: close\r\n` immediately before the header terminator.
-/// No-op when the request already sets Connection (user override
-/// wins). Case-insensitive match on `connection:`.
-fn inject_connection_close(req_buf: &mut Vec<u8>) {
-    if has_connection_header(req_buf) {
-        return;
-    }
-    let Some(term) = memchr::memmem::find(req_buf, b"\r\n\r\n") else {
-        return;
-    };
-    // Splice "Connection: close\r\n" in before the terminator's
-    // trailing CRLF.
-    let insertion_point = term + 2; // after first CRLF of "\r\n\r\n"
-    let header = b"Connection: close\r\n";
-    req_buf.splice(insertion_point..insertion_point, header.iter().copied());
-}
-
-fn has_connection_header(buf: &[u8]) -> bool {
-    // Scan each header-line start for "connection:" case-
-    // insensitively. RFC 7230 §3.2.4 obs-fold (a continuation line
-    // starting with SP/HT) is legacy but still valid wire format,
-    // so skip those — a folded line is part of the PRIOR header
-    // and can never itself be the Connection field name.
-    let mut start = 0;
-    while let Some(pos) = memchr::memmem::find(&buf[start..], b"\r\n") {
-        let line_begin = start + pos + 2;
-        if line_begin >= buf.len() {
-            return false;
-        }
-        // End-of-headers: empty line.
-        if buf[line_begin..].starts_with(b"\r\n") {
-            return false;
-        }
-        // Continuation (obs-fold): starts with SP or HT → skip.
-        if matches!(buf[line_begin], b' ' | b'\t') {
-            start = line_begin;
-            continue;
-        }
-        let prefix = b"connection:";
-        if buf.len() - line_begin >= prefix.len() {
-            let candidate = &buf[line_begin..line_begin + prefix.len()];
-            if candidate
-                .iter()
-                .zip(prefix.iter())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-            {
-                return true;
-            }
-        }
-        start = line_begin;
-    }
-    false
 }
 
 /// Wait for any event matching `pred` with timeout. Returns Ok if one

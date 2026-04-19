@@ -5,7 +5,7 @@
 //! shape (client-encode → server-unmask → server-echo → client-decode)
 //! plus the edge cases around extended payload lengths.
 
-use zerobench_ws::frame::{decode_frame, encode_close, encode_frame, parse_close_payload, Opcode, WsError};
+use zerobench_ws::frame::{decode_frame, encode_close, encode_frame, parse_close_payload, Opcode, FrameError};
 
 /// Simulate a server receiving a client frame: strip the MASK bit,
 /// unmask the payload in place, and drop the 4-byte mask so
@@ -94,7 +94,7 @@ fn round_trip_64_bit_length_payload() {
 fn decode_rejects_masked_server_frame() {
     let bad = [0x81u8, 0x82, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00];
     let err = decode_frame(&bad).unwrap_err();
-    assert!(matches!(err, WsError::ServerFrameMasked));
+    assert!(matches!(err, FrameError::ServerFrameMasked));
 }
 
 /// Empty payload round-trip. Edge case — 0-length text frames are legal

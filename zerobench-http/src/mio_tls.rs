@@ -81,14 +81,23 @@ impl MioTlsStream {
         &mut self,
         poll: &mut mio::Poll,
         token: mio::Token,
+        timeout: std::time::Duration,
     ) -> io::Result<()> {
         let mut events = mio::Events::with_capacity(64);
+        let deadline = std::time::Instant::now() + timeout;
 
         // wait for TCP connect to complete.
         // mio signals the socket as writable when connect() finishes.
         // Check for connect errors via `peer_addr()` or `take_error()`.
         loop {
-            poll.poll(&mut events, Some(std::time::Duration::from_secs(5)))?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tcp connect timed out",
+                ));
+            }
+            poll.poll(&mut events, Some(deadline - now))?;
             let mut connected = false;
             for event in events.iter() {
                 if event.token() == token {
@@ -120,10 +129,13 @@ impl MioTlsStream {
             }
         }
 
-        // drive TLS handshake.
-        let mut rounds = 0u32;
+        // drive TLS handshake — wall-clock bounded by the same deadline.
+        // The loop exits either on handshake completion, on an error, or
+        // when the deadline elapses. A prior round-count bound (>200)
+        // was removed: on slow servers a valid handshake legitimately
+        // takes many I/O rounds, and on fast servers 200 rounds is
+        // orders of magnitude past when the deadline itself would fire.
         loop {
-            rounds += 1;
             if !self.tls.is_handshaking() {
                 return Ok(());
             }
@@ -176,14 +188,20 @@ impl MioTlsStream {
             if !self.tls.is_handshaking() {
                 return Ok(());
             }
-            if rounds > 200 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tls handshake timed out",
                 ));
             }
-            // Wait for socket readiness
-            poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
+            // Bound the individual poll to at most 100ms so the outer
+            // loop still reacts to external signals (the thread may
+            // need to observe stop flags), but never past the deadline.
+            let remaining = deadline - now;
+            let poll_budget =
+                remaining.min(std::time::Duration::from_millis(100));
+            poll.poll(&mut events, Some(poll_budget))?;
         }
     }
 

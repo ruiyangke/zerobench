@@ -28,7 +28,9 @@
 //!
 //! # Limitations
 //!
-//! - **No TLS**: plain-text h2c only. Pass `https://` and it panics.
+//! - **TLS**: supported via `MioTlsStream` when the target is `https://`
+//!   and an ALPN-configured `ClientConfig` is passed. Plain `h2c` is
+//!   used on `http://` — the plain socket skips the handshake entirely.
 //! - **No per-request template expansion**: request metadata is built once.
 //! - **Single scenario only**: uses `plan.scenarios[0].steps[0]`.
 //! - **No tokio runtime**: only tokio's `io-util` traits are used (via h2).
@@ -225,6 +227,13 @@ struct H2Stream {
     body: Option<RecvStream>,
     /// Which scenario this stream belongs to — for per-scenario stats.
     scenario_id: u16,
+    /// Approximate wire-size of the request: method + path + pseudo-
+    /// headers + user headers. The HPACK encoder compresses this on
+    /// the wire, but we track the pre-compression size so the report
+    /// remains comparable with HTTP/1 (which doesn't have HPACK).
+    request_bytes: u64,
+    /// Sum of DATA-frame payloads received on this stream.
+    response_bytes: u64,
 }
 
 /// State for a single H2 connection (one per worker thread).
@@ -292,15 +301,21 @@ impl H2Conn {
                 }
             }
 
-            // Drain the response body (DATA frames).
+            // Drain the response body (DATA frames). Each successful
+            // chunk contributes its length to `response_bytes` so the
+            // end-of-stream record carries an accurate byte count
+            // rather than hard-coded 0 (which lied in the report).
             let body = stream.body.as_mut().unwrap();
             let body_done = loop {
                 match body.poll_data(cx) {
                     Poll::Ready(Some(Ok(chunk))) => {
+                        let n = chunk.len();
+                        stream.response_bytes =
+                            stream.response_bytes.saturating_add(n as u64);
                         // Release flow-control capacity so the sender can
                         // continue. Without this, the connection stalls once
                         // the window fills up.
-                        let _ = body.flow_control().release_capacity(chunk.len());
+                        let _ = body.flow_control().release_capacity(n);
                     }
                     Poll::Ready(Some(Err(_))) => {
                         break false; // error
@@ -320,10 +335,13 @@ impl H2Conn {
                 let co_free_latency = now.duration_since(stream.intended_start);
                 let ttfb = now.duration_since(stream.t0);
                 let sid = stream.scenario_id;
-                stats.record(sid, co_free_latency, ttfb, 0, 0);
+                let bs = stream.request_bytes;
+                let br = stream.response_bytes;
+                stats.record(sid, co_free_latency, ttfb, bs, br);
                 if let Some(l) = live {
-                    l.record(co_free_latency.as_nanos() as u64, 0, 0);
-                    l.record_scenario(sid, co_free_latency.as_nanos() as u64, 0, 0);
+                    let lat_ns = co_free_latency.as_nanos() as u64;
+                    l.record(lat_ns, bs, br);
+                    l.record_scenario(sid, lat_ns, bs, br);
                 }
                 self.idle_slots += 1;
                 // Don't increment i — swap_remove moved the last element here.
@@ -354,6 +372,13 @@ impl H2Conn {
         // Clone the request — http::Request<()> is cheap.
         let req = request.clone();
 
+        // Estimate the request's logical wire size (method + path +
+        // authority + headers, with 2 bytes of separator accounting).
+        // HPACK compresses this on the actual wire, but the estimate
+        // gives the report a non-zero bytes_sent figure that's in the
+        // same units as the HTTP/1 backend reports.
+        let request_bytes = estimate_request_bytes(&req);
+
         // `send_request` returns a `ResponseFuture` and a `SendStream`.
         // `true` = end of stream (no body to send for benchmarks).
         match self.send_request.send_request(req, true) {
@@ -364,6 +389,8 @@ impl H2Conn {
                     intended_start,
                     body: None,
                     scenario_id,
+                    request_bytes,
+                    response_bytes: 0,
                 });
                 self.idle_slots -= 1;
                 true
@@ -482,7 +509,10 @@ pub fn run_mio_h2_worker(
                 return stats;
             }
         };
-        if let Err(_) = tls_stream.complete_handshake(&mut poll, token) {
+        if tls_stream
+            .complete_handshake(&mut poll, token, opts.connect_timeout)
+            .is_err()
+        {
             err(&mut stats, live, 0, ErrorKind::Connect);
             return stats;
         }
@@ -778,6 +808,38 @@ fn build_h2_request_from_plan(
     ctx.return_header_bufs(hdr_name, hdr_val);
 
     builder.body(()).expect("failed to build H2 request")
+}
+
+/// Best-effort pre-HPACK wire-size estimate for an `http::Request<()>`.
+///
+/// Used by the per-stream stats so `bytes_sent` in the final report
+/// is not hard-coded 0. Accounts for method, authority, path, scheme,
+/// and user headers; ignores HPACK dynamic-table dedup savings and
+/// frame framing overhead. The result is an upper bound that stays
+/// comparable with the HTTP/1 backend's request-size reporting.
+fn estimate_request_bytes(req: &http::Request<()>) -> u64 {
+    let mut n: u64 = 0;
+    // Method + space + path.
+    n = n.saturating_add(req.method().as_str().len() as u64);
+    n = n.saturating_add(1);
+    n = n.saturating_add(
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str().len())
+            .unwrap_or(1) as u64,
+    );
+    // Authority (":authority" pseudo-header).
+    if let Some(a) = req.uri().authority() {
+        n = n.saturating_add(a.as_str().len() as u64);
+    }
+    // Each header contributes `name + ": " + value + CRLF`.
+    for (name, value) in req.headers() {
+        n = n.saturating_add(name.as_str().len() as u64);
+        n = n.saturating_add(2);
+        n = n.saturating_add(value.as_bytes().len() as u64);
+        n = n.saturating_add(2);
+    }
+    n
 }
 
 /// Extract origin-form path+query from a potentially absolute URL.

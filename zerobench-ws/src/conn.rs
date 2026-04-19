@@ -58,7 +58,7 @@ pub enum WsError {
     /// A frame decode problem — bad RSV bits, masked server frame,
     /// oversized control frame, etc. Connection is fatal after this.
     #[error("frame: {0}")]
-    Frame(#[from] frame::WsError),
+    Frame(#[from] frame::FrameError),
 
     /// A close frame arrived. Not really an error — the caller decides
     /// whether to count it, but the variant exists so the recv loop
@@ -199,7 +199,7 @@ impl WsConnection {
             let sni = target.sni_name().to_string();
             let mut tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
                 .map_err(|e| WsError::Tls(format!("tls init: {e}")))?;
-            tls.complete_handshake(&mut poll, token)
+            tls.complete_handshake(&mut poll, token, opts.connect_timeout)
                 .map_err(|e| WsError::Tls(format!("tls handshake: {e}")))?;
             poll.registry()
                 .reregister(tls.tcp_stream_mut(), token, Interest::READABLE | Interest::WRITABLE)
@@ -291,6 +291,11 @@ impl WsConnection {
 
     /// Send a Pong frame with the given payload.
     fn send_pong(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Frame(frame::FrameError::ControlFrameTooLarge(
+                payload.len(),
+            )));
+        }
         self.send_frame(Opcode::Pong, payload)
     }
 
@@ -298,7 +303,18 @@ impl WsConnection {
     /// Compliant servers auto-reply with Pong. Used by `WsHold`
     /// heartbeats where the client wants to keep a proxy's idle
     /// timeout at bay.
+    ///
+    /// RFC 6455 §5.5 caps control-frame payloads at 125 bytes. An
+    /// oversized ping is rejected locally rather than put on the wire:
+    /// any RFC 6455 server that read it would tear the connection down
+    /// on the client's behalf, producing a hard-to-diagnose "transport
+    /// closed" error on the next recv.
     pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Frame(frame::FrameError::ControlFrameTooLarge(
+                payload.len(),
+            )));
+        }
         self.send_frame(Opcode::Ping, payload)
     }
 
@@ -324,7 +340,7 @@ impl WsConnection {
                         None => continue,
                     }
                 }
-                Err(frame::WsError::NeedMore { needed }) => {
+                Err(frame::FrameError::NeedMore { needed }) => {
                     self.fill_recv_buf(needed)?;
                 }
                 Err(e) => return Err(e.into()),
@@ -351,7 +367,7 @@ impl WsConnection {
                         None => continue,
                     }
                 }
-                Err(frame::WsError::NeedMore { .. }) => {}
+                Err(frame::FrameError::NeedMore { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
             let now = Instant::now();
@@ -386,7 +402,7 @@ impl WsConnection {
         match hdr.opcode {
             Opcode::Text | Opcode::Binary => {
                 if self.fragment.is_some() {
-                    return Err(WsError::Frame(frame::WsError::ProtocolOther(
+                    return Err(WsError::Frame(frame::FrameError::ProtocolOther(
                         "new data frame without finishing previous fragment".into(),
                     )));
                 }
@@ -404,7 +420,7 @@ impl WsConnection {
                 let (opcode, buf) = match self.fragment.as_mut() {
                     Some(f) => f,
                     None => {
-                        return Err(WsError::Frame(frame::WsError::ProtocolOther(
+                        return Err(WsError::Frame(frame::FrameError::ProtocolOther(
                             "continuation frame without preceding text/binary".into(),
                         )));
                     }
