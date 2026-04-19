@@ -2,6 +2,7 @@
 //!
 //! See `docs/design.md` in the repo root for the architectural overview.
 
+pub mod archive;
 pub mod calibrate;
 pub mod fingerprint;
 pub mod histogram;
@@ -19,6 +20,7 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
+pub use archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
 pub use calibrate::{ClientSelfCheck, LoopbackEcho, SelfCheckResult, Verdict};
 pub use fingerprint::{
     canonical_sha256, plan_hash, run_id, target_fingerprint, url_fingerprint,
