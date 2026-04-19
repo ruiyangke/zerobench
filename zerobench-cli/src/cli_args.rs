@@ -12,7 +12,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 
 /// Return the number of available CPU cores, falling back to 1 if the
 /// query fails (e.g. inside a restricted container).
-fn num_cpus() -> usize {
+pub fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -365,6 +365,12 @@ pub enum Subcommand {
     /// benchmark runs as pure Rust.
     #[cfg(feature = "script")]
     Run(RunArgs),
+    /// Rigorous steady-state measurement (v0.1.0). Runs N consecutive
+    /// benchmark runs against `URL` with warmup + cooldown, ships
+    /// through the client self-check gate, and archives the result
+    /// under `$ZEROBENCH_HOME/runs/<url_fp>/<run_id>/`. Default
+    /// 60s × 3 runs with 15s warmup and 10s cooldown.
+    Measure(crate::verbs::measure::MeasureArgs),
 }
 
 /// Arguments for `zerobench run <script.rhai>`.
@@ -779,6 +785,7 @@ mod tests {
             }
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
+            Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
         }
     }
 
@@ -798,6 +805,7 @@ mod tests {
             }
             #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
+            Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
         }
     }
 

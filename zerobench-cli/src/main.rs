@@ -18,6 +18,7 @@ use zerobench_core::{
 mod cli_args;
 mod diff;
 mod plan_from_cli;
+mod verbs;
 
 use cli_args::{CliArgs, CliColor, CliFormat, Subcommand};
 
@@ -42,6 +43,13 @@ fn main() -> ExitCode {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            },
+            Subcommand::Measure(ma) => match verbs::measure::run(ma) {
+                Ok(code) => code,
+                Err(e) => {
+                    print_error_with_hint(&*e);
                     ExitCode::from(2)
                 }
             },
