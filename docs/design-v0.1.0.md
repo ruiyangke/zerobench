@@ -84,9 +84,12 @@ pub enum Mode {
     Measure,
     Curve { from_rate: f64, to_rate: f64, knee_criterion: KneeCriterion },
     Compare { other: Arc<Plan>, schedule: CompareSchedule },
-    Watch { emit_every: Duration, until: WatchUntil },
     Soak,                           // long-duration measure
     Diff,                           // archive-only, no execution
+    // Note: `Watch` variant dropped from v0.1.0 (2026-04-19).
+    // See PHILOSOPHY.md §5 — continuous monitoring is
+    // Prometheus/Grafana territory, not a verb in the measurement
+    // apparatus.
 }
 
 pub struct Scenario {
@@ -135,7 +138,7 @@ fn main() -> ExitCode {
         Mode::Measure | Mode::Soak => measure::run(&plan),
         Mode::Curve {..} => curve::run(&plan),
         Mode::Compare {..} => compare::run(&plan),
-        Mode::Watch {..} => watch::run(&plan),
+        // Mode::Watch removed 2026-04-19; see PHILOSOPHY.md §5.
         Mode::Diff      => diff::run(&args),
     }
 }
@@ -195,16 +198,15 @@ lives in `zerobench-core`.
 - After completion: statistical diff per-metric (§8) between
   A and B histograms at the same run index, then aggregated.
 
-### 2.6. `watch`
+### 2.6. `watch` — **dropped (2026-04-19)**
 
-- Long-running; requires `--until COND` or `--unbounded`.
-- Per-emit-window aggregation (default 60s), each written as its
-  own archived run.
-- `--until "p99<5ms,duration=10min"`: wait for condition
-  sustained.
-- `--until regression`: diff against pinned baseline every emit
-  boundary; exit 1 on first regression.
-- Progress line updates per emit boundary.
+The original design had a long-running verb for continuous
+measurement with stop conditions. Dropped from v0.1.0 —
+continuous monitoring is Prometheus/Grafana territory
+(`zerobench-prom-adapter`); "rerun on schedule" is cron +
+`measure` + `compare`. See PHILOSOPHY §5 for the rationale.
+No `verbs/watch.rs`; `Mode::Watch` removed from the Plan enum;
+`WatchUntil` / `ComparisonOp` types deleted.
 
 ### 2.7. `diff`
 
@@ -668,7 +670,7 @@ pub trait Layout {
 pub struct MeasureLayout { /* throughput + latency + errors + baseline-delta */ }
 pub struct CurveLayout   { /* 2D rate-vs-p99 scatter (ratatui::Chart) */ }
 pub struct CompareLayout { /* split-screen A | B, live side-by-side */ }
-pub struct WatchLayout   { /* compressed historical strip chart */ }
+// WatchLayout removed 2026-04-19 with the Watch verb.
 ```
 
 Mode-aware dispatch in `TuiApp::new`:
@@ -678,7 +680,7 @@ let layout: Box<dyn Layout> = match plan.mode {
     Mode::Measure | Mode::Soak => Box::new(MeasureLayout::new(baseline)),
     Mode::Curve {..}           => Box::new(CurveLayout::new()),
     Mode::Compare {..}         => Box::new(CompareLayout::new()),
-    Mode::Watch {..}           => Box::new(WatchLayout::new()),
+    // Mode::Watch removed 2026-04-19.
     Mode::Probe | Mode::Calibrate => Box::new(MeasureLayout::new(None)),
     Mode::Diff                 => unreachable!(),  // no TUI for diff
 };
@@ -701,7 +703,7 @@ zerobench calibrate             → calibrate (no URL; loopback)
 zerobench measure URL           → measure
 zerobench curve URL             → curve
 zerobench compare URL1 URL2     → compare
-zerobench watch URL --until ... → watch
+                                     # zerobench watch removed 2026-04-19
 zerobench soak URL              → soak (long-duration measure)
 zerobench diff A B              → diff
 zerobench run script.rhai       → (existing) Rhai entry point
@@ -850,7 +852,7 @@ zerobench-rhai/                # DSL
 zerobench-tui/                 # Live view
   state.rs
   layouts/ (NEW — one module per Mode)
-    measure.rs, curve.rs, compare.rs, watch.rs
+    measure.rs, curve.rs, compare.rs
   widgets/ (existing — latency, throughput, errors)
 
 zerobench-cli/                 # Binary entry
@@ -858,7 +860,7 @@ zerobench-cli/                 # Binary entry
   plan_from_cli.rs, plan_from_rhai.rs (NEW), plan_from_http_file.rs
   verbs/ (NEW)
     probe.rs, calibrate.rs, measure.rs, curve.rs
-    compare.rs, watch.rs, diff.rs, replay.rs
+    compare.rs, diff.rs, replay.rs
 
 zerobench-bench/               # NEW — self-benchmark crate
   src/

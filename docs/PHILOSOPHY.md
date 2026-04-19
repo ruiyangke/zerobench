@@ -521,8 +521,7 @@ Scope commitments for v0.1.0:
 - **Mode-aware layouts.** `measure` gets throughput + latency +
   errors with baseline-delta overlay. `curve` gets a 2D
   rate-vs-p99 scatter (ratatui Chart widget). `compare` gets
-  split-screen, both targets live. `watch` gets a compressed
-  historical strip chart.
+  split-screen, both targets live.
 - **Causality visible, not hidden.** Drop the current tab system —
   error, latency, and throughput render on one screen so spike
   correlation is visible without tab-switching. Tabs become
@@ -878,12 +877,23 @@ Seven verbs. Each answers a specific question. They do not overlap.
 | `measure URL` | Steady-state numbers at a given rate? | server (checked against calibrate) | 60s + 15s warmup + 10s cooldown between runs | 3 (CI) |
 | `curve URL` | Where's **the server's** saturation knee? | server | ramp 2min | 1 |
 | `compare URL1 URL2` | Is A faster than B? | server (both) | measure, **interleaved** round-robin with 10s cooldown every run (§5.3) | 3 each |
-| `watch URL` | Continuous regression stream to JSONL | server | `--until` or `--unbounded` required | n/a |
 | `diff a.json b.json` | Regression vs saved baseline? | N/A (archival) | n/a | n/a |
 
 `measure` is the new default. `probe` is what today's `zerobench URL`
 does. `saturate` and `rate` become flags on `measure` / `probe`, not
 top-level verbs.
+
+**Dropped from v0.1.0**: `watch`. The original design had a
+long-running verb that emitted JSONL per window and archived each
+window as a separate run, with stop conditions (`--until
+regression`, `--until p99<Xms sustained`). Rejected on scope:
+continuous monitoring is what Prometheus/Grafana are for (§13.2
+names `zerobench-prom-adapter` as the documented path), and
+"rerun on schedule" is cron + `measure` + `compare` — three
+standard Unix tools doing what they do. Reintroducing `watch`
+later is cheap if users ask; it wasn't earning its complexity
+(~300 LOC of verb + stop-condition DSL + per-window archive
+rotation + compare-engine coupling) against the alternative.
 
 ### 5.1. `calibrate` vs `curve` — explicit disambiguation
 
@@ -967,44 +977,13 @@ runs exposed to the same local drift, same for B.
 `--compare-cooldown 0` skips cooldowns (not recommended;
 measurable TIME_WAIT contamination).
 
-### 5.4. `watch` interaction with `diff` / `compare`
+<!-- §5.2 / §5.4: `watch` verb dropped from v0.1.0 (2026-04-19).
+     Continuous monitoring belongs in Prometheus + zerobench-prom-
+     adapter (§13.2); "rerun on schedule" is cron + measure + compare.
+     Reintroduction left as an open question if users ask. -->
 
-`watch` is a long-running verb; `diff` and `compare` are single-
-shot against archived results. The interaction:
-
-- `watch URL --emit-every 60s` emits a JSONL record every 60s
-  with the steady-state stats of that 60s window.
-- Each **window** is archived as a distinct `run_id`
-  (`<watch_start>-window-<N>-<plan_hash[:8]>`). Makes individual
-  windows independently replayable and diffable.
-- `diff window-42.json window-41.json` diffs adjacent windows.
-  `compare URL_a URL_b --watch` is **disallowed** (error:
-  "compare requires bounded runs; watch is unbounded. Run
-  measure --runs 3 for statistically-powered comparison.").
-- `watch --until regression` internally calls the `diff` path
-  each emit boundary against the pinned baseline.
-
-### 5.2. `watch` stop conditions
-
-`watch` without a `--until` clause requires an explicit
-`--unbounded` flag — otherwise it refuses to run. This prevents
-accidental infinite loops in CI. With conditions:
-
-- `--until "p99<5ms,duration=10min"` — stop when p99 has been under
-  5ms for ≥10min continuous, or hard-stop at 10× the duration.
-- `--until "regression"` — stop on first regression vs baseline.
-  **Baseline selection order**: (1) pinned baseline for this
-  url_fingerprint (`zerobench archive pin <run_id>`), if any;
-  (2) most recent non-replay run with the same url_fingerprint
-  in the last 30 days. If no baseline is found, `watch --until
-  regression` errors at start ("no baseline for
-  <url_fp>; run `zerobench measure` first or pin one").
-- `--until "max=1h"` — hard upper bound regardless of condition.
-- `--emit-every 1s` — JSONL emission cadence; defaults to 1s.
-  (Single knob; no double-spec.)
-
-<!-- Added in round 1: addressing MINOR #16 — watch stop conditions -->
-<!-- Added in round 2: addressing CRITICAL #5 — require --unbounded to run without stop-cond; addressing MINOR #17 — consolidate --emit to single flag -->
+<!-- Added in round 1: addressing MINOR #16 — obsolete after watch drop -->
+<!-- Added in round 2: addressing CRITICAL #5 — obsolete after watch drop -->
 
 ---
 
@@ -2141,7 +2120,7 @@ During a measurement window (between warmup end and cooldown start):
 
 | Add | Why |
 |-----|-----|
-| `calibrate`, `measure`, `curve`, `compare`, `watch` subcommands | Each answers a specific question today done by awkward flag combos or shell loops. |
+| `calibrate`, `measure`, `curve`, `compare` subcommands | Each answers a specific question today done by awkward flag combos or shell loops. |
 | `SseHold`, `SseFanout` (two submodes), `SseReconnectStorm` Step variants | Real SSE questions. |
 | `WsHold`, `WsEchoRtt`, `WsServerPushRtt`, `WsFanout` Step variants | Real WS questions, precisely named. |
 | `HttpColdConnect` Step variant | Measures accept + handshake separately from pool reuse. |
@@ -2393,9 +2372,7 @@ Concrete, falsifiable. Shipped means:
    — `ws_echo_rtt.correlate=ping_pong`, `sse_fanout.mode=
    timestamp`, etc. Test: grep any WS/SSE result for absence of
    mode declaration; count must be zero.
-9. **No infinite CI loops**: `watch` without `--until` and
-   without `--unbounded` exits non-zero immediately with a clear
-   error. Test: run in a container with no TTY, expect exit 1.
+<!-- 9. No-infinite-CI-loops test obsolete after watch drop (2026-04-19). -->
 11. **Rhai script crash handling**: a Rhai panic during a run
     is caught at the scenario boundary. The scenario's
     histogram and error counters up to the point of panic are
