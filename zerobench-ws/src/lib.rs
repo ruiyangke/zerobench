@@ -17,5 +17,9 @@ pub mod conn;
 pub mod echo_rtt;
 pub mod frame;
 pub mod handshake;
+pub mod hold;
+pub mod server_push_rtt;
 
 pub use echo_rtt::run_ws_echo_rtt_from_plan_threaded;
+pub use hold::run_ws_hold_from_plan_threaded;
+pub use server_push_rtt::run_ws_server_push_rtt_from_plan_threaded;

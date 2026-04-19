@@ -570,6 +570,102 @@ impl WsEchoRttBuilder {
     }
 }
 
+/// Returned by `ws_hold(url, connections, hold_for)`. Finalised into
+/// [`Step::WsHold`] during plan finalization.
+#[derive(Clone)]
+pub(crate) struct WsHoldBuilder {
+    inner: Arc<Mutex<WsHoldBuilderState>>,
+}
+
+pub(crate) struct WsHoldBuilderState {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub connections: u32,
+    pub heartbeat: Duration,
+    pub hold_for: Duration,
+}
+
+impl Default for WsHoldBuilderState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            headers: Vec::new(),
+            connections: 1,
+            heartbeat: Duration::from_secs(25),
+            hold_for: Duration::from_secs(60),
+        }
+    }
+}
+
+impl WsHoldBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(WsHoldBuilderState {
+                url,
+                headers: Vec::new(),
+                connections: connections.max(1),
+                heartbeat: Duration::from_secs(25),
+                hold_for,
+            })),
+        }
+    }
+    fn with_state<R>(&self, f: impl FnOnce(&mut WsHoldBuilderState) -> R) -> R {
+        let mut g = self.inner.lock().expect("ws_hold builder mutex poisoned");
+        f(&mut g)
+    }
+    fn take_state(&self) -> WsHoldBuilderState {
+        self.with_state(std::mem::take)
+    }
+}
+
+/// Returned by `ws_server_push(url, connections, hold_for)`. Finalised
+/// into [`Step::WsServerPushRtt`] during plan finalization.
+#[derive(Clone)]
+pub(crate) struct WsServerPushBuilder {
+    inner: Arc<Mutex<WsServerPushBuilderState>>,
+}
+
+pub(crate) struct WsServerPushBuilderState {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub connections: u32,
+    pub expected_rate_per_conn: f64,
+    pub hold_for: Duration,
+}
+
+impl Default for WsServerPushBuilderState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            headers: Vec::new(),
+            connections: 1,
+            expected_rate_per_conn: 0.0,
+            hold_for: Duration::from_secs(60),
+        }
+    }
+}
+
+impl WsServerPushBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(WsServerPushBuilderState {
+                url,
+                headers: Vec::new(),
+                connections: connections.max(1),
+                expected_rate_per_conn: 0.0,
+                hold_for,
+            })),
+        }
+    }
+    fn with_state<R>(&self, f: impl FnOnce(&mut WsServerPushBuilderState) -> R) -> R {
+        let mut g = self.inner.lock().expect("ws_server_push builder mutex poisoned");
+        f(&mut g)
+    }
+    fn take_state(&self) -> WsServerPushBuilderState {
+        self.with_state(std::mem::take)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StepSource — intermediate form before template compilation
 // ---------------------------------------------------------------------------
@@ -587,6 +683,8 @@ pub(crate) enum StepSource {
     Request(RequestBuilder),
     SseHold(SseHoldBuilder),
     WsEchoRtt(WsEchoRttBuilder),
+    WsHold(WsHoldBuilder),
+    WsServerPush(WsServerPushBuilder),
     Pause(Duration),
     PauseRandom { min: Duration, max: Duration },
 }
@@ -686,6 +784,79 @@ fn compile_step(
                 payload: payload_tpl,
             }))
         }
+        StepSource::WsHold(hb) => {
+            let WsHoldBuilderState {
+                url,
+                headers,
+                connections,
+                heartbeat,
+                hold_for,
+            } = hb.take_state();
+            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("ws_hold url {url:?}"),
+                error: e,
+            })?;
+            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
+            for (name, value) in headers {
+                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_hold header name {name:?}"),
+                    error: e,
+                })?;
+                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_hold header {name:?} value {value:?}"),
+                    error: e,
+                })?;
+                hdr_out.push((n, v));
+            }
+            Ok(Step::WsHold(zerobench_core::plan::WsHoldPlan {
+                url: url_tpl,
+                headers: hdr_out,
+                connections,
+                heartbeat,
+                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                hold_for,
+            }))
+        }
+        StepSource::WsServerPush(pb) => {
+            let WsServerPushBuilderState {
+                url,
+                headers,
+                connections,
+                expected_rate_per_conn,
+                hold_for,
+            } = pb.take_state();
+            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
+                scenario: scenario_name.to_string(),
+                field: format!("ws_server_push url {url:?}"),
+                error: e,
+            })?;
+            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
+            for (name, value) in headers {
+                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_server_push header name {name:?}"),
+                    error: e,
+                })?;
+                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
+                    scenario: scenario_name.to_string(),
+                    field: format!("ws_server_push header {name:?} value {value:?}"),
+                    error: e,
+                })?;
+                hdr_out.push((n, v));
+            }
+            Ok(Step::WsServerPushRtt(
+                zerobench_core::plan::WsServerPushRttPlan {
+                    url: url_tpl,
+                    headers: hdr_out,
+                    connections,
+                    expected_rate_per_conn,
+                    hold_for,
+                },
+            ))
+        }
         StepSource::Request(rb) => {
             let state = rb.take_state();
             let RequestBuilderState {
@@ -774,6 +945,8 @@ pub fn register(engine: &mut Engine, root: PlanBuilder) {
     register_request_builders(engine);
     register_sse_hold_builders(engine);
     register_ws_echo_rtt_builders(engine);
+    register_ws_hold_builders(engine);
+    register_ws_server_push_builders(engine);
     register_scenario_builder(engine);
     register_pause_helpers(engine);
 }
@@ -785,6 +958,8 @@ fn register_types(engine: &mut Engine) {
     engine.register_type_with_name::<RequestBuilder>("RequestBuilder");
     engine.register_type_with_name::<SseHoldBuilder>("SseHoldBuilder");
     engine.register_type_with_name::<WsEchoRttBuilder>("WsEchoRttBuilder");
+    engine.register_type_with_name::<WsHoldBuilder>("WsHoldBuilder");
+    engine.register_type_with_name::<WsServerPushBuilder>("WsServerPushBuilder");
     engine.register_type_with_name::<VarSlotHandle>("VarSlot");
     engine.register_type_with_name::<StepSource>("Step");
 }
@@ -1171,6 +1346,75 @@ fn register_ws_echo_rtt_builders(engine: &mut Engine) {
     );
 }
 
+fn register_ws_hold_builders(engine: &mut Engine) {
+    // ws_hold(url, connections, hold_for) — idle-capacity test.
+    engine.register_fn(
+        "ws_hold",
+        move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
+            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
+            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            WsHoldBuilder::new(url.to_string(), c, secs)
+        },
+    );
+    engine.register_fn(
+        "ws_hold",
+        move |url: ImmutableString, conns: i64, hold_for_secs: i64| {
+            let secs = if hold_for_secs <= 0 { 60 } else { hold_for_secs as u64 };
+            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            WsHoldBuilder::new(url.to_string(), c, Duration::from_secs(secs))
+        },
+    );
+    engine.register_fn(
+        "heartbeat",
+        move |b: WsHoldBuilder, interval: ImmutableString| {
+            let d = parse_duration_str(&interval).unwrap_or(Duration::from_secs(25));
+            b.with_state(|s| s.heartbeat = d);
+            b
+        },
+    );
+    engine.register_fn(
+        "header",
+        move |b: WsHoldBuilder, name: ImmutableString, value: ImmutableString| {
+            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
+            b
+        },
+    );
+}
+
+fn register_ws_server_push_builders(engine: &mut Engine) {
+    // ws_server_push(url, connections, hold_for) — read-only RTT.
+    engine.register_fn(
+        "ws_server_push",
+        move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
+            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
+            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            WsServerPushBuilder::new(url.to_string(), c, secs)
+        },
+    );
+    engine.register_fn(
+        "ws_server_push",
+        move |url: ImmutableString, conns: i64, hold_for_secs: i64| {
+            let secs = if hold_for_secs <= 0 { 60 } else { hold_for_secs as u64 };
+            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            WsServerPushBuilder::new(url.to_string(), c, Duration::from_secs(secs))
+        },
+    );
+    engine.register_fn(
+        "expected_rate",
+        move |b: WsServerPushBuilder, rate: f64| {
+            b.with_state(|s| s.expected_rate_per_conn = rate);
+            b
+        },
+    );
+    engine.register_fn(
+        "header",
+        move |b: WsServerPushBuilder, name: ImmutableString, value: ImmutableString| {
+            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
+            b
+        },
+    );
+}
+
 /// Parse a human duration like "60s", "5m", "500ms", or fall back to
 /// seconds when bare. `None` if unparseable.
 fn parse_duration_str(s: &str) -> Option<Duration> {
@@ -1214,6 +1458,18 @@ fn register_scenario_builder(engine: &mut Engine) {
         "step",
         move |s: ScenarioBuilder, b: WsEchoRttBuilder| {
             s.with_state(|st| st.steps.push(StepSource::WsEchoRtt(b)));
+        },
+    );
+    engine.register_fn(
+        "step",
+        move |s: ScenarioBuilder, b: WsHoldBuilder| {
+            s.with_state(|st| st.steps.push(StepSource::WsHold(b)));
+        },
+    );
+    engine.register_fn(
+        "step",
+        move |s: ScenarioBuilder, b: WsServerPushBuilder| {
+            s.with_state(|st| st.steps.push(StepSource::WsServerPush(b)));
         },
     );
 

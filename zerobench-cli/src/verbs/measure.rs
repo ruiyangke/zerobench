@@ -225,6 +225,38 @@ pub struct MeasureArgs {
     /// meaningful only for HTTP targets.
     #[arg(long = "cold-connect", action = ArgAction::SetTrue, help_heading = "HTTP")]
     pub cold_connect: bool,
+
+    // -------------------------------------------------------------------
+    // WsHold — idle-capacity test
+    // -------------------------------------------------------------------
+    /// Open N persistent WS connections and hold them open with
+    /// periodic heartbeats — measures idle-capacity / conn-drop rate.
+    #[arg(long = "ws-hold", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    pub ws_hold: Option<u32>,
+
+    /// Heartbeat interval for `--ws-hold`. Default 25s (margin
+    /// against common 30/60s proxy idle timeouts).
+    #[arg(long = "ws-heartbeat", value_name = "DURATION",
+          value_parser = super::super::cli_args::parse_duration_flag,
+          help_heading = "WebSocket")]
+    pub ws_heartbeat: Option<Duration>,
+
+    // -------------------------------------------------------------------
+    // WsServerPushRtt — read-only inter-message gap
+    // -------------------------------------------------------------------
+    /// Open N persistent WS connections and only read inbound frames.
+    /// Records the inter-message gap distribution; flags a stall if
+    /// observed rate < 50% of `--ws-expected-rate`.
+    #[arg(long = "ws-push", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    pub ws_push: Option<u32>,
+
+    /// Expected server-push rate per connection (msg/s). When set,
+    /// drives the stall-detection gate for `--ws-push`.
+    #[arg(long = "ws-expected-rate", value_name = "RATE",
+          value_parser = super::super::cli_args::parse_rate_flag,
+          default_value = "0",
+          help_heading = "WebSocket")]
+    pub ws_expected_rate: f64,
 }
 
 fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
@@ -525,14 +557,48 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Protocol::Ws => {
                 #[cfg(feature = "ws")]
                 {
-                    zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.duration,
-                        tls_config.clone(),
-                        stop,
-                    )
+                    // Sub-dispatch within WS: WsHold / WsServerPushRtt /
+                    // WsEchoRtt are three different backends.
+                    let first_ws_step = plan
+                        .scenarios
+                        .first()
+                        .and_then(|s| s.steps.iter().find(|st| {
+                            !matches!(
+                                st,
+                                zerobench_core::plan::Step::Pause(_)
+                                    | zerobench_core::plan::Step::PauseRandom { .. }
+                            )
+                        }));
+                    match first_ws_step {
+                        Some(zerobench_core::plan::Step::WsHold(_)) => {
+                            zerobench_ws::run_ws_hold_from_plan_threaded(
+                                &target,
+                                &opts,
+                                &plan,
+                                args.duration,
+                                tls_config.clone(),
+                                stop,
+                            )
+                        }
+                        Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => {
+                            zerobench_ws::run_ws_server_push_rtt_from_plan_threaded(
+                                &target,
+                                &opts,
+                                &plan,
+                                args.duration,
+                                tls_config.clone(),
+                                stop,
+                            )
+                        }
+                        _ => zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                            &target,
+                            &opts,
+                            &plan,
+                            args.duration,
+                            tls_config.clone(),
+                            stop,
+                        ),
+                    }
                 }
                 #[cfg(not(feature = "ws"))]
                 {
@@ -672,8 +738,44 @@ fn build_measure_plan(
     let mut vars = VarRegistry::new();
     let url = Template::compile(&args.url, &mut vars)?;
 
-    let scenario = if let Some(connections) = args.ws_echo {
-        // WS Echo RTT mode (Phase 6e) — build Step::WsEchoRtt with
+    let scenario = if let Some(connections) = args.ws_hold {
+        // WsHold — N persistent connections + heartbeat.
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        let heartbeat = args.ws_heartbeat.unwrap_or(Duration::from_secs(25));
+        Scenario {
+            name: "ws-hold".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: connections as usize,
+            },
+            steps: vec![Step::WsHold(zerobench_core::plan::WsHoldPlan {
+                url,
+                headers: SmallVec::new(),
+                connections,
+                heartbeat,
+                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                hold_for,
+            })],
+        }
+    } else if let Some(connections) = args.ws_push {
+        // WsServerPushRtt — read-only, measure inter-message gap.
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        Scenario {
+            name: "ws-push".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: connections as usize,
+            },
+            steps: vec![Step::WsServerPushRtt(
+                zerobench_core::plan::WsServerPushRttPlan {
+                    url,
+                    headers: SmallVec::new(),
+                    connections,
+                    expected_rate_per_conn: args.ws_expected_rate,
+                    hold_for,
+                },
+            )],
+        }
+    } else if let Some(connections) = args.ws_echo {
+        // WS Echo RTT mode — build Step::WsEchoRtt with
         // N persistent connections at msg_rate/conn.
         let payload = Template::compile(&args.ws_payload, &mut vars)?;
         Scenario {
@@ -835,6 +937,10 @@ mod tests {
             ws_msg_rate: 100.0,
             ws_payload: "ping".to_string(),
             cold_connect: false,
+            ws_hold: None,
+            ws_heartbeat: None,
+            ws_push: None,
+            ws_expected_rate: 0.0,
         }
     }
 

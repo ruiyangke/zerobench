@@ -294,6 +294,14 @@ impl WsConnection {
         self.send_frame(Opcode::Pong, payload)
     }
 
+    /// Send a Ping frame (RFC 6455 §5.5.2) with the given payload.
+    /// Compliant servers auto-reply with Pong. Used by `WsHold`
+    /// heartbeats where the client wants to keep a proxy's idle
+    /// timeout at bay.
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.send_frame(Opcode::Ping, payload)
+    }
+
     /// Wait for the next data message.
     ///
     /// Handles control frames transparently:
