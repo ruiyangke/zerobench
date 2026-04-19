@@ -28,6 +28,7 @@
 //! [`BootstrapOptions::seed`] (defaults to a hash of the two
 //! run_ids).
 
+use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
 use crate::stats::{PerRunMetrics, SummaryExport};
@@ -418,6 +419,165 @@ fn mean_resample(values: &[f64], rng: &mut Xoshiro) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Two-sample Kolmogorov–Smirnov distribution test (Phase 8b)
+//
+// Tests the hypothesis "these two latency distributions were drawn
+// from the same population." Uses the classical two-sample KS D
+// statistic computed directly from HDR bucket counts:
+//
+//     D = max |F_A(v) - F_B(v)|  over all v
+//
+// where F_A, F_B are the empirical CDFs of the two histograms.
+// p-value from the asymptotic Kolmogorov distribution, suitable for
+// the "large N" regime we always operate in (>>100 samples per side).
+//
+// KS is less tail-sensitive than Anderson-Darling. AD lands in
+// Phase 8c along with Holm-Bonferroni correction and a
+// `--compare-strategy` CLI flag.
+// ---------------------------------------------------------------------------
+
+/// Result of a two-sample KS test between two HDR histograms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KsResult {
+    /// The D statistic — max absolute difference between the two
+    /// empirical CDFs. Range [0.0, 1.0].
+    pub d_statistic: f64,
+    /// Asymptotic p-value under H₀ that the two samples are from
+    /// the same distribution. Low values reject H₀.
+    pub p_value: f64,
+    /// Sample count side A.
+    pub n_a: u64,
+    /// Sample count side B.
+    pub n_b: u64,
+    /// Significance at conventional α=0.05. `NotApplicable` when
+    /// either histogram is empty.
+    pub significance: Significance,
+}
+
+/// Two-sample Kolmogorov–Smirnov on two HDR histograms.
+///
+/// Empty histograms yield a result with `d_statistic = 0.0`,
+/// `p_value = 1.0`, and `significance = NotApplicable`.
+pub fn ks_test(a: &Histogram<u64>, b: &Histogram<u64>) -> KsResult {
+    let n_a = a.len();
+    let n_b = b.len();
+
+    if n_a == 0 || n_b == 0 {
+        return KsResult {
+            d_statistic: 0.0,
+            p_value: 1.0,
+            n_a,
+            n_b,
+            significance: Significance::NotApplicable,
+        };
+    }
+
+    let d = ks_d_statistic(a, b);
+
+    // Asymptotic p-value from the Kolmogorov distribution:
+    //   λ = D · sqrt(n·m / (n+m))
+    //   p ≈ 2 · Σ_{k=1..∞} (-1)^{k-1} · exp(-2 · k² · λ²)
+    let n = n_a as f64;
+    let m = n_b as f64;
+    let en = (n * m / (n + m)).sqrt();
+    let lambda = d * en;
+    let p = kolmogorov_p_value(lambda);
+
+    let significance = if p < 0.05 {
+        Significance::Significant
+    } else {
+        Significance::NotSignificant
+    };
+
+    KsResult {
+        d_statistic: d,
+        p_value: p,
+        n_a,
+        n_b,
+        significance,
+    }
+}
+
+/// Compute the D statistic — max |F_A(v) - F_B(v)| — via merge-step
+/// over the two histograms' recorded buckets.
+fn ks_d_statistic(a: &Histogram<u64>, b: &Histogram<u64>) -> f64 {
+    let n_a = a.len() as f64;
+    let n_b = b.len() as f64;
+
+    let a_pairs: Vec<(u64, u64)> = a
+        .iter_recorded()
+        .map(|iv| (iv.value_iterated_to(), iv.count_at_value()))
+        .collect();
+    let b_pairs: Vec<(u64, u64)> = b
+        .iter_recorded()
+        .map(|iv| (iv.value_iterated_to(), iv.count_at_value()))
+        .collect();
+
+    // Merge-walk. At each distinct value v in the union, compare
+    // cumulative F_A(v) and F_B(v).
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    let mut cum_a: u64 = 0;
+    let mut cum_b: u64 = 0;
+    let mut max_d: f64 = 0.0;
+
+    while ia < a_pairs.len() || ib < b_pairs.len() {
+        let va = a_pairs.get(ia).map(|p| p.0);
+        let vb = b_pairs.get(ib).map(|p| p.0);
+
+        let step_value = match (va, vb) {
+            (Some(x), Some(y)) => x.min(y),
+            (Some(x), None) => x,
+            (None, Some(y)) => y,
+            (None, None) => break,
+        };
+
+        // Advance every index whose value equals step_value so we
+        // observe the full jump at this step before comparing.
+        while ia < a_pairs.len() && a_pairs[ia].0 == step_value {
+            cum_a += a_pairs[ia].1;
+            ia += 1;
+        }
+        while ib < b_pairs.len() && b_pairs[ib].0 == step_value {
+            cum_b += b_pairs[ib].1;
+            ib += 1;
+        }
+
+        let f_a = cum_a as f64 / n_a;
+        let f_b = cum_b as f64 / n_b;
+        let d = (f_a - f_b).abs();
+        if d > max_d {
+            max_d = d;
+        }
+    }
+
+    max_d
+}
+
+/// Asymptotic Kolmogorov distribution p-value: the probability that
+/// sqrt(n·m/(n+m)) · D exceeds `lambda` under H₀ of equal
+/// distributions. Series converges rapidly for `lambda > ~0.3`.
+fn kolmogorov_p_value(lambda: f64) -> f64 {
+    if lambda <= 0.0 {
+        return 1.0;
+    }
+    // Q(λ) = 2 · Σ_{k=1..∞} (-1)^{k-1} · exp(-2·k²·λ²)
+    // Truncate when the term falls below f64 epsilon × running sum.
+    let mut sum = 0.0;
+    let lambda_sq = lambda * lambda;
+    let mut sign = 1.0;
+    for k in 1..=100 {
+        let term = sign * (-2.0 * (k as f64) * (k as f64) * lambda_sq).exp();
+        sum += term;
+        if term.abs() < 1e-12 {
+            break;
+        }
+        sign = -sign;
+    }
+    (2.0 * sum).clamp(0.0, 1.0)
+}
+
+// ---------------------------------------------------------------------------
 // Tiny deterministic PRNG — xoshiro256++.
 //
 // Kept inline instead of pulling `rand_xoshiro` as a public dep for
@@ -669,5 +829,117 @@ mod tests {
         assert!(Metric::P99.increase_is_bad());
         assert!(Metric::ErrorRate.increase_is_bad());
         assert!(!Metric::Rate.increase_is_bad());
+    }
+
+    // -----------------------------------------------------------------
+    // KS test
+    // -----------------------------------------------------------------
+
+    fn mk_hist() -> Histogram<u64> {
+        Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap()
+    }
+
+    #[test]
+    fn ks_identical_histograms_are_not_significant() {
+        let mut a = mk_hist();
+        let mut b = mk_hist();
+        // Same samples into each.
+        for v in [100u64, 200, 500, 1_000, 2_000, 5_000].iter().cycle().take(1000) {
+            a.record(*v).unwrap();
+            b.record(*v).unwrap();
+        }
+        let result = ks_test(&a, &b);
+        assert_eq!(result.n_a, 1000);
+        assert_eq!(result.n_b, 1000);
+        assert!(result.d_statistic < 1e-9, "D={}", result.d_statistic);
+        assert!(result.p_value > 0.99, "p={}", result.p_value);
+        assert_eq!(result.significance, Significance::NotSignificant);
+    }
+
+    #[test]
+    fn ks_shifted_histograms_are_significant() {
+        let mut a = mk_hist();
+        let mut b = mk_hist();
+        // A centred ~1k ns, B centred ~10k ns — clearly different.
+        for v in (500u64..=1500).step_by(10) {
+            a.record(v).unwrap();
+        }
+        for v in (5_000u64..=15_000).step_by(100) {
+            b.record(v).unwrap();
+        }
+        let result = ks_test(&a, &b);
+        assert_eq!(result.significance, Significance::Significant);
+        assert!(result.p_value < 0.01, "p={}", result.p_value);
+        assert!(result.d_statistic > 0.5, "D={}", result.d_statistic);
+    }
+
+    #[test]
+    fn ks_empty_histograms_yield_not_applicable() {
+        let a = mk_hist();
+        let b = mk_hist();
+        let result = ks_test(&a, &b);
+        assert_eq!(result.significance, Significance::NotApplicable);
+        assert_eq!(result.d_statistic, 0.0);
+        assert!(result.p_value >= 1.0 - 1e-9);
+    }
+
+    #[test]
+    fn ks_one_empty_one_populated_returns_not_applicable() {
+        let a = mk_hist();
+        let mut b = mk_hist();
+        for v in 1..=100u64 {
+            b.record(v * 100).unwrap();
+        }
+        let result = ks_test(&a, &b);
+        assert_eq!(result.significance, Significance::NotApplicable);
+    }
+
+    #[test]
+    fn ks_small_shift_might_not_be_significant() {
+        // Two histograms with nearly-identical spread but slight
+        // offset — at small N the KS test should not reject H₀.
+        let mut a = mk_hist();
+        let mut b = mk_hist();
+        for v in 500u64..=1500 {
+            a.record(v).unwrap();
+            b.record(v + 10).unwrap(); // tiny shift
+        }
+        let result = ks_test(&a, &b);
+        // We don't assert either way on significance — the exact
+        // threshold depends on sample size. But the test must at
+        // least produce a valid [0,1] p-value.
+        assert!(result.p_value >= 0.0 && result.p_value <= 1.0);
+        assert!(result.d_statistic >= 0.0 && result.d_statistic <= 1.0);
+    }
+
+    #[test]
+    fn ks_is_deterministic() {
+        let mut a = mk_hist();
+        let mut b = mk_hist();
+        for v in 100u64..=500 {
+            a.record(v).unwrap();
+            b.record(v + 5).unwrap();
+        }
+        let r1 = ks_test(&a, &b);
+        let r2 = ks_test(&a, &b);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn kolmogorov_p_value_monotonic_in_lambda() {
+        let small = kolmogorov_p_value(0.1);
+        let medium = kolmogorov_p_value(0.5);
+        let large = kolmogorov_p_value(2.0);
+        assert!(small >= medium);
+        assert!(medium >= large);
+        assert!(large < 0.001, "p={large}");
+    }
+
+    #[test]
+    fn kolmogorov_p_value_bounds() {
+        // λ = 0 → p = 1
+        assert!((kolmogorov_p_value(0.0) - 1.0).abs() < 1e-9);
+        // Large λ → p → 0
+        assert!(kolmogorov_p_value(10.0) < 1e-6);
     }
 }

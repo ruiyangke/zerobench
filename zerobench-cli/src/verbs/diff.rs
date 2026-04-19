@@ -23,8 +23,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Args;
-use zerobench_core::compare::{compare_all, CompareOptions, Metric, StrategyUsed};
-use zerobench_core::{LatencyExport, SummaryExport};
+use zerobench_core::archive::load_histogram_from_histlog;
+use zerobench_core::compare::{compare_all, ks_test, CompareOptions, Metric, StrategyUsed};
+use zerobench_core::{LatencyExport, Significance, SummaryExport};
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -186,6 +187,25 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     render_table(&baseline, &current, &rows, &args);
 
+    // Phase 8b: if the sibling result.histlog exists on both sides,
+    // run a two-sample Kolmogorov–Smirnov distribution test and
+    // report it as a one-line verdict alongside the per-metric CI
+    // table. Distribution-level test complements the metric-level
+    // bootstrap: KS answers "are these two populations the same at
+    // all?", bootstrap gives "by how much does each percentile differ?"
+    let ks_line = try_ks_from_sibling_histlogs(&args.baseline, &args.current);
+    if let Some((d, p, n_a, n_b, sig)) = ks_line {
+        println!();
+        let verdict = match sig {
+            Significance::Significant => "differ (p < 0.05)",
+            Significance::NotSignificant => "consistent (p ≥ 0.05)",
+            Significance::NotApplicable => "n/a (empty histogram)",
+        };
+        println!(
+            "KS two-sample: D={d:.4}  p={p:.4}  N={n_a}/{n_b}  → distributions {verdict}",
+        );
+    }
+
     if used_bootstrap {
         println!();
         println!(
@@ -313,6 +333,25 @@ fn load_export(path: &PathBuf) -> Result<SummaryExport, Box<dyn std::error::Erro
     let export: SummaryExport = serde_json::from_slice(&bytes)
         .map_err(|e| format!("cannot parse {} as result.json: {e}", path.display()))?;
     Ok(export)
+}
+
+/// Given `<dir>/result.json` paths for both sides, look for the
+/// sibling `<dir>/result.histlog` on each. If both load, run KS.
+/// Return `None` on any miss — callers treat KS as opt-in, not
+/// required.
+fn try_ks_from_sibling_histlogs(
+    baseline_json: &PathBuf,
+    current_json: &PathBuf,
+) -> Option<(f64, f64, u64, u64, Significance)> {
+    let a_path = baseline_json.with_file_name("result.histlog");
+    let b_path = current_json.with_file_name("result.histlog");
+    if !a_path.exists() || !b_path.exists() {
+        return None;
+    }
+    let a = load_histogram_from_histlog(&a_path).ok()?;
+    let b = load_histogram_from_histlog(&b_path).ok()?;
+    let r = ks_test(&a, &b);
+    Some((r.d_statistic, r.p_value, r.n_a, r.n_b, r.significance))
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,9 @@ pub mod tls;
 pub mod transport;
 pub mod var;
 
-pub use archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
+pub use archive::{
+    load_histogram_from_histlog, Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions,
+};
 pub use calibrate::{ClientSelfCheck, LoopbackEcho, SelfCheckResult, Verdict};
 pub use fingerprint::{
     canonical_sha256, plan_hash, run_id, target_fingerprint, url_fingerprint,
@@ -44,8 +46,8 @@ pub use request_file::{
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
 pub use compare::{
-    compare_all, compare_metric, CompareOptions, ComparisonResult, Metric, Significance,
-    StrategyUsed,
+    compare_all, compare_metric, ks_test, CompareOptions, ComparisonResult, KsResult, Metric,
+    Significance, StrategyUsed,
 };
 pub use stats::{
     ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, PerRunMetrics, ScenarioExport,

@@ -41,8 +41,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use hdrhistogram::serialization::interval_log::IntervalLogWriterBuilder;
-use hdrhistogram::serialization::V2DeflateSerializer;
+use hdrhistogram::serialization::interval_log::{
+    IntervalLogIterator, IntervalLogWriterBuilder, LogEntry,
+};
+use hdrhistogram::serialization::{Deserializer, V2DeflateSerializer};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
@@ -415,6 +417,55 @@ impl ArchiveWriter {
         }
         fs::rename(&tmp, &final_)
     }
+}
+
+/// Load the first histogram record from a `.histlog` file.
+///
+/// Companion to [`ArchiveWriter::write_histlog`] — reads the V2
+/// compressed-log format and returns the contained `Histogram<u64>`.
+///
+/// Our emission writes a single interval record per file, so "first
+/// record" is the whole histogram. Files produced by other tools
+/// (wrk2, jHiccup) that carry multiple interval records would need
+/// a merging variant — future addition.
+///
+/// # Errors
+///
+/// Fails when the file can't be read, the format is invalid, or no
+/// interval records are found.
+pub fn load_histogram_from_histlog(path: &Path) -> io::Result<Histogram<u64>> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let bytes = fs::read(path)?;
+    let mut iter = IntervalLogIterator::new(&bytes);
+    let mut deserializer = Deserializer::new();
+
+    while let Some(entry) = iter.next() {
+        let entry = entry.map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("histlog parse: {e:?}"))
+        })?;
+        if let LogEntry::Interval(ilh) = entry {
+            let encoded = ilh.encoded_histogram();
+            let raw = B64.decode(encoded.as_bytes()).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("histlog base64: {e}"))
+            })?;
+            let hist: Histogram<u64> = deserializer
+                .deserialize(&mut std::io::Cursor::new(&raw[..]))
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("histlog deserialize: {e:?}"),
+                    )
+                })?;
+            return Ok(hist);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "histlog contains no interval records",
+    ))
 }
 
 // ---------------------------------------------------------------------------
