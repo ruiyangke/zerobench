@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -491,6 +492,246 @@ fn duration_to_hist_ns(d: Duration) -> u64 {
         HIST_HI_NS
     } else {
         ns as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Export — serde-compatible projection of Summary for result.json.
+//
+// HDR histograms don't implement Serialize; the canonical archival
+// format is an `.histlog` V2 compressed log (§PHILOSOPHY P3). For
+// Phase 5b we emit JSON-friendly percentiles + counts — sufficient
+// for the diff / replay fast paths. Phase 5c will add the .histlog
+// alongside (both derived from the same Histogram source of truth).
+// ---------------------------------------------------------------------------
+
+/// Serialisable projection of [`Summary`] — the content of
+/// `result.json` in the archive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryExport {
+    /// Schema version — bumps on rename / retype / remove.
+    pub schema_version: u32,
+    /// Measurement duration in nanoseconds. Excludes warmup.
+    pub duration_ns: u64,
+    /// Completed operations count (HTTP req/resp, SSE stream, WS
+    /// round). See protocol-specific meaning on [`ScenarioStats`].
+    pub requests: u64,
+    /// Average rate over the measurement window (req/s).
+    pub rate_per_s: f64,
+    /// Bytes written across all connections.
+    pub bytes_sent: u64,
+    /// Bytes read across all connections.
+    pub bytes_recv: u64,
+    /// Overall latency percentile breakdown.
+    pub latency: LatencyExport,
+    /// Overall TTFB percentile breakdown (HTTP only — zeros for
+    /// non-HTTP runs).
+    pub ttfb: LatencyExport,
+    /// Error category counts.
+    pub errors: ErrorCountersExport,
+    /// Per-scenario breakdown.
+    pub scenarios: Vec<ScenarioExport>,
+}
+
+impl SummaryExport {
+    /// Schema version for `result.json`.
+    pub const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Percentile breakdown extracted from an HDR histogram.
+///
+/// All values are in nanoseconds. Zero means "no samples recorded" —
+/// a histogram with zero samples returns zero at every percentile per
+/// hdrhistogram semantics. Not `Eq` because `mean_ns` / `stddev_ns`
+/// are `f64`; use [`PartialEq`] for exact matching or compare fields
+/// within tolerance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencyExport {
+    /// Sample count.
+    pub count: u64,
+    /// Minimum observed.
+    pub min_ns: u64,
+    /// 50th percentile.
+    pub p50_ns: u64,
+    /// 90th percentile.
+    pub p90_ns: u64,
+    /// 99th percentile.
+    pub p99_ns: u64,
+    /// 99.9th percentile.
+    pub p99_9_ns: u64,
+    /// 99.99th percentile.
+    pub p99_99_ns: u64,
+    /// Maximum observed.
+    pub max_ns: u64,
+    /// Arithmetic mean.
+    pub mean_ns: f64,
+    /// Standard deviation.
+    pub stddev_ns: f64,
+}
+
+impl LatencyExport {
+    /// Extract percentiles from an HDR histogram. An empty histogram
+    /// yields zeros across the board.
+    pub fn from_hist(h: &Histogram<u64>) -> Self {
+        Self {
+            count: h.len(),
+            min_ns: h.min(),
+            p50_ns: h.value_at_percentile(50.0),
+            p90_ns: h.value_at_percentile(90.0),
+            p99_ns: h.value_at_percentile(99.0),
+            p99_9_ns: h.value_at_percentile(99.9),
+            p99_99_ns: h.value_at_percentile(99.99),
+            max_ns: h.max(),
+            mean_ns: h.mean(),
+            stddev_ns: h.stdev(),
+        }
+    }
+}
+
+/// Flat error-counter snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorCountersExport {
+    /// TCP connect failures.
+    pub connect: u64,
+    /// Read failures.
+    pub read: u64,
+    /// Write failures.
+    pub write: u64,
+    /// Per-request deadline exceeded.
+    pub timeout: u64,
+    /// Scheduler couldn't keep up (token dropped).
+    pub keepup: u64,
+    /// Status 4xx.
+    pub status_4xx: u64,
+    /// Status 5xx.
+    pub status_5xx: u64,
+    /// Assertion failures.
+    pub assertion_failed: u64,
+}
+
+impl ErrorCountersExport {
+    /// Project an [`ErrorCounters`] into the serialisable form.
+    pub fn from_counters(e: &ErrorCounters) -> Self {
+        Self {
+            connect: e.connect,
+            read: e.read,
+            write: e.write,
+            timeout: e.timeout,
+            keepup: e.keepup,
+            status_4xx: e.status_4xx,
+            status_5xx: e.status_5xx,
+            assertion_failed: e.assertion_failed,
+        }
+    }
+}
+
+/// Per-scenario row in `result.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioExport {
+    /// Index into `Plan::scenarios`.
+    pub scenario_id: u16,
+    /// Completed operations attributed to this scenario.
+    pub requests: u64,
+    /// Latency breakdown.
+    pub latency: LatencyExport,
+    /// Errors attributed here.
+    pub errors: ErrorCountersExport,
+    /// SSE-specific metrics, present iff the scenario speaks SSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse: Option<SseExtrasExport>,
+    /// WS-specific metrics, present iff the scenario speaks WS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsExtrasExport>,
+}
+
+/// SSE extras in serialisable form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SseExtrasExport {
+    /// Time-to-first-byte histogram.
+    pub ttfb: LatencyExport,
+    /// Inter-chunk gap histogram.
+    pub chunk_gap: LatencyExport,
+    /// Total data events received.
+    pub chunks: u64,
+    /// Streams that saw a clean close / `[DONE]`.
+    pub streams_completed: u64,
+    /// Payload bytes received.
+    pub bytes_received: u64,
+}
+
+impl SseExtrasExport {
+    fn from(s: &SseExtras) -> Self {
+        Self {
+            ttfb: LatencyExport::from_hist(&s.ttfb),
+            chunk_gap: LatencyExport::from_hist(&s.chunk_gap),
+            chunks: s.chunks,
+            streams_completed: s.streams_completed,
+            bytes_received: s.bytes_received,
+        }
+    }
+}
+
+/// WS extras in serialisable form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WsExtrasExport {
+    /// Handshake latency histogram.
+    pub handshake: LatencyExport,
+    /// Round-trip histogram.
+    pub rtt: LatencyExport,
+    /// Messages sent.
+    pub messages_sent: u64,
+    /// Messages received.
+    pub messages_recv: u64,
+    /// Bytes sent.
+    pub bytes_sent: u64,
+    /// Bytes received.
+    pub bytes_recv: u64,
+}
+
+impl WsExtrasExport {
+    fn from(w: &WsExtras) -> Self {
+        Self {
+            handshake: LatencyExport::from_hist(&w.handshake),
+            rtt: LatencyExport::from_hist(&w.rtt),
+            messages_sent: w.messages_sent,
+            messages_recv: w.messages_recv,
+            bytes_sent: w.bytes_sent,
+            bytes_recv: w.bytes_recv,
+        }
+    }
+}
+
+impl Summary {
+    /// Project this summary into the archive-ready JSON shape.
+    ///
+    /// Percentiles are sampled at the standard ladder
+    /// `[min, p50, p90, p99, p99.9, p99.99, max]` plus mean + stddev.
+    /// Per-scenario extras (SSE / WS) are included when the underlying
+    /// `ScenarioStats` carries them.
+    pub fn to_export(&self) -> SummaryExport {
+        SummaryExport {
+            schema_version: SummaryExport::SCHEMA_VERSION,
+            duration_ns: self.duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+            requests: self.requests,
+            rate_per_s: self.requests_per_sec(),
+            bytes_sent: self.bytes_sent,
+            bytes_recv: self.bytes_recv,
+            latency: LatencyExport::from_hist(&self.latency),
+            ttfb: LatencyExport::from_hist(&self.ttfb),
+            errors: ErrorCountersExport::from_counters(&self.errors),
+            scenarios: self
+                .per_scenario
+                .iter()
+                .map(|s| ScenarioExport {
+                    scenario_id: s.scenario_id,
+                    requests: s.requests,
+                    latency: LatencyExport::from_hist(&s.latency),
+                    errors: ErrorCountersExport::from_counters(&s.errors),
+                    sse: s.sse.as_ref().map(SseExtrasExport::from),
+                    ws: s.ws.as_ref().map(WsExtrasExport::from),
+                })
+                .collect(),
+        }
     }
 }
 

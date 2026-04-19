@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineFingerprint;
 use crate::plan::Plan;
+use crate::stats::SummaryExport;
 
 // ---------------------------------------------------------------------------
 // Archive root
@@ -322,6 +323,15 @@ impl ArchiveWriter {
         let bytes = serde_json::to_vec_pretty(env)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.write_file("env.json", &bytes)
+    }
+
+    /// Write `result.json` — the archive's record of what the run
+    /// measured. Phase 5b carries percentile + counts only; the
+    /// canonical HDR-V2-log `.histlog` sidecar lands in Phase 5c.
+    pub fn write_result(&self, result: &SummaryExport) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(result)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.write_file("result.json", &bytes)
     }
 
     /// Write `INDEX.json` last — acts as a completion marker. A reader

@@ -43,7 +43,8 @@ pub use request_file::{
 pub use rng::BenchRng;
 pub use scenario_context::ScenarioContext;
 pub use stats::{
-    ErrorCounters, ErrorKind, ScenarioStats, SseExtras, Summary, TaskStats, WsExtras,
+    ErrorCounters, ErrorCountersExport, ErrorKind, LatencyExport, ScenarioExport, ScenarioStats,
+    SseExtras, SseExtrasExport, Summary, SummaryExport, TaskStats, WsExtras, WsExtrasExport,
 };
 pub use stop::StopSignal;
 pub use template::{ExpandCtx, Template, TemplateError};

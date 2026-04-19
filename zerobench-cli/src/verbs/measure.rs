@@ -43,7 +43,7 @@ use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step}
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
-use zerobench_core::{ColorChoice, Summary, TaskStats};
+use zerobench_core::{ColorChoice, Summary, SummaryExport, TaskStats};
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -386,6 +386,11 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         env.set_ended();
         writer.write_env(&env)?;
 
+        // Phase 5b: emit result.json with the Summary projection.
+        // Phase 5c follow-up adds `.histlog` alongside.
+        let export = summary.to_export();
+        writer.write_result(&export)?;
+
         let index = Index {
             schema_version: Index::SCHEMA_VERSION,
             schema_versions: SchemaVersions {
@@ -393,7 +398,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 machine: MachineFingerprint::SCHEMA_VERSION,
                 env: EnvRecord::SCHEMA_VERSION,
                 index: Index::SCHEMA_VERSION,
-                result: None, // populated in Phase 5b
+                result: Some(SummaryExport::SCHEMA_VERSION),
             },
             plan_hash: plan_h.clone(),
             target_fingerprint: target_fp.clone(),
