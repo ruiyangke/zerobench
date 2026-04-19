@@ -1085,10 +1085,27 @@ fn run_script_sync(
         };
         let conns = args.connections;
         let dur = plan.duration;
+        // Phase 5e: choose v0.1.0 SseHold backend when the plan uses
+        // the new Step::SseHold variant. Legacy Step::SseStream (the
+        // v0.0.1 semantics) keeps the original dispatcher so
+        // pre-existing scripts keep working during the migration
+        // window.
+        #[allow(deprecated)]
+        let uses_hold = plan_c.scenarios.iter().any(|s| {
+            s.steps.iter().any(|st| {
+                matches!(st, zerobench_core::plan::Step::SseHold(_))
+            })
+        });
         Some(std::thread::spawn(move || {
-            zerobench_sse::run_sse_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, conns, dur, tls, None,
-            )
+            if uses_hold {
+                zerobench_sse::run_sse_hold_from_plan_threaded(
+                    &target_c, &opts_c, &plan_c, dur, tls, None,
+                )
+            } else {
+                zerobench_sse::run_sse_from_plan_threaded(
+                    &target_c, &opts_c, &plan_c, conns, dur, tls, None,
+                )
+            }
         }))
     } else {
         None
@@ -1110,6 +1127,7 @@ fn run_script_sync(
     let ws_handle = if has_ws {
         let plan_c = plan.clone();
         let opts_c = opts.clone();
+        let target_c = target.clone();
         let tls = if target.tls {
             Some(zerobench_http::mio_tls::build_tls_config(
                 &opts,
@@ -1120,8 +1138,21 @@ fn run_script_sync(
         };
         let conns = args.connections;
         let dur = plan.duration;
+        // Phase 5e: same migration-window pattern as SSE above.
+        #[allow(deprecated)]
+        let uses_echo_rtt = plan_c.scenarios.iter().any(|s| {
+            s.steps.iter().any(|st| {
+                matches!(st, zerobench_core::plan::Step::WsEchoRtt(_))
+            })
+        });
         Some(std::thread::spawn(move || {
-            zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, conns, dur, tls, None)
+            if uses_echo_rtt {
+                zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                    &target_c, &opts_c, &plan_c, dur, tls, None,
+                )
+            } else {
+                zerobench_ws::run_ws_from_plan_threaded(&opts_c, &plan_c, conns, dur, tls, None)
+            }
         }))
     } else {
         None
