@@ -478,3 +478,210 @@ fn mixed_protocol_plan_from_rhai() {
         .collect();
     assert_eq!(protocols, vec![Protocol::Http, Protocol::Sse, Protocol::Ws]);
 }
+
+// ---------------------------------------------------------------------------
+// D3: protocol-builder knobs — correlate / heartbeat_frame / mode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ws_echo_rtt_correlate_pingpong() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).correlate("pingpong"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => {
+            assert!(matches!(
+                p.correlate,
+                zerobench_core::plan::CorrelateStrategy::PingPong
+            ));
+        }
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_correlate_substring() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(
+                ws_echo_rtt("ws://api/chat", 1, 10)
+                    .correlate("substring:zb-echo-")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsEchoRtt(p) => match &p.correlate {
+            zerobench_core::plan::CorrelateStrategy::PayloadSubstring { marker } => {
+                assert_eq!(marker, "zb-echo-");
+            }
+            other => panic!("expected PayloadSubstring, got {other:?}"),
+        },
+        _ => panic!("expected WsEchoRtt"),
+    }
+}
+
+#[test]
+fn ws_echo_rtt_correlate_unknown_rejected() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_echo_rtt("ws://api/chat", 1, 10).correlate("nope"));
+        });
+        duration("10s");
+    "#;
+    assert!(
+        load_script_str(src).is_err(),
+        "unknown correlate strategy must fail at script-eval time"
+    );
+}
+
+#[test]
+fn ws_hold_heartbeat_frame_text() {
+    let src = r#"
+        scenario("ws", |s| {
+            s.step(ws_hold("ws://api/bus", 1, "1s").heartbeat_frame("text"));
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsHold(p) => {
+            assert!(matches!(
+                p.heartbeat_frame,
+                zerobench_core::plan::HeartbeatFrame::TextApp
+            ));
+        }
+        _ => panic!("expected WsHold"),
+    }
+}
+
+#[test]
+fn sse_fanout_mode_timestamp_default_field() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                sse_fanout("http://api/events", 3, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .mode("timestamp")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseFanout(p) => match &p.mode {
+            zerobench_core::plan::FanoutMode::Timestamp { emit_field } => {
+                assert_eq!(emit_field, "emit_ns");
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        },
+        _ => panic!("expected SseFanout"),
+    }
+}
+
+#[test]
+fn sse_fanout_mode_timestamp_custom_field() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                sse_fanout("http://api/events", 3, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .mode("timestamp:server_ts")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::SseFanout(p) => match &p.mode {
+            zerobench_core::plan::FanoutMode::Timestamp { emit_field } => {
+                assert_eq!(emit_field, "server_ts");
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        },
+        _ => panic!("expected SseFanout"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D4: top-level plan metadata setters (cooldown / runs / threads / plan_name)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn top_level_cooldown_runs_threads_plan_name_are_honoured() {
+    let src = r#"
+        plan_name("chat-burst");
+        runs(3);
+        threads(8);
+        cooldown("5s");
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.name, "chat-burst");
+    assert_eq!(loaded.plan.runs, 3);
+    assert_eq!(loaded.plan.threads, 8);
+    assert_eq!(loaded.plan.cooldown, std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn defaults_match_single_run_zero_cooldown() {
+    // When the script omits the new setters, behaviour should match
+    // pre-D4 (runs=1, threads=1, cooldown=ZERO, name="").
+    let src = r#"
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.runs, 1);
+    assert_eq!(loaded.plan.threads, 1);
+    assert_eq!(loaded.plan.cooldown, std::time::Duration::ZERO);
+    assert!(loaded.plan.name.is_empty());
+}
+
+#[test]
+fn runs_clamped_to_minimum_one() {
+    // runs(0) or runs(-5) must not produce a zero-run plan — the
+    // dispatcher would skip the scenario entirely.
+    let src = r#"
+        runs(0);
+        scenario("http", |s| { s.step(GET("http://api/ping")); });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    assert_eq!(loaded.plan.runs, 1);
+}
+
+#[test]
+fn ws_fanout_heartbeat_frame_and_mode() {
+    let src = r#"
+        scenario("fan", |s| {
+            s.step(
+                ws_fanout("ws://api/bus", 2, "5s")
+                    .trigger_url("http://api/broadcast")
+                    .heartbeat_frame("text")
+                    .mode("timestamp")
+            );
+        });
+        duration("10s");
+    "#;
+    let loaded = load_script_str(src).expect("load");
+    match &loaded.plan.scenarios[0].steps[0] {
+        Step::WsFanout(p) => {
+            assert!(matches!(
+                p.subscribers.heartbeat_frame,
+                zerobench_core::plan::HeartbeatFrame::TextApp
+            ));
+            assert!(matches!(
+                p.mode,
+                zerobench_core::plan::FanoutMode::Timestamp { .. }
+            ));
+        }
+        _ => panic!("expected WsFanout"),
+    }
+}

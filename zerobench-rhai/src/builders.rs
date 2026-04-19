@@ -82,6 +82,19 @@ pub(crate) struct PlanBuilderState {
     pub duration: Option<Duration>,
     /// Optional warmup period.
     pub warmup: Option<Duration>,
+    /// Cooldown between `runs()` iterations. Defaults to zero when the
+    /// script does not call `cooldown()`.
+    pub cooldown: Option<Duration>,
+    /// Total number of measure iterations. Defaults to 1 when unset
+    /// (single-run plan); larger values feed the bootstrap CI
+    /// aggregator just like `measure --runs N`.
+    pub runs: Option<u32>,
+    /// Client-side worker threads. Defaults to 1 — the CLI and
+    /// top-level runners may override, but the script can pin a
+    /// specific fan-out.
+    pub threads: Option<usize>,
+    /// Human-friendly plan name. Folds into `url_fingerprint` per §7.1.
+    pub name: Option<String>,
     /// Preferred HTTP protocol version — `transport("h1"|"h2")` sets this.
     /// Carried out of the Plan and returned separately; the dispatcher
     /// threads it into `TransportOpts`.
@@ -117,10 +130,26 @@ impl PlanBuilder {
                             StepSource::SseHold(b) => {
                                 Some(b.with_state(|s| s.url.clone()))
                             }
+                            StepSource::SseFanout(b) => {
+                                Some(b.with_state(|s| s.url.clone()))
+                            }
+                            StepSource::SseReconnectStorm(b) => {
+                                Some(b.with_state(|s| s.url.clone()))
+                            }
                             StepSource::WsEchoRtt(b) => {
                                 Some(b.with_state(|s| s.url.clone()))
                             }
-                            _ => None,
+                            StepSource::WsHold(b) => {
+                                Some(b.with_state(|s| s.url.clone()))
+                            }
+                            StepSource::WsServerPush(b) => {
+                                Some(b.with_state(|s| s.url.clone()))
+                            }
+                            StepSource::WsFanout(b) => {
+                                Some(b.with_state(|s| s.url.clone()))
+                            }
+                            StepSource::Pause(_)
+                            | StepSource::PauseRandom { .. } => None,
                         })
                 });
                 if let Some(u) = url {
@@ -264,11 +293,14 @@ fn finalize_state(
         vars: state.vars,
         duration,
         warmup: state.warmup.unwrap_or(Duration::ZERO),
-        cooldown: Duration::ZERO,
-        runs: 1,
-        threads: 1,
+        cooldown: state.cooldown.unwrap_or(Duration::ZERO),
+        runs: state.runs.unwrap_or(1).max(1),
+        threads: state.threads.unwrap_or(1).max(1),
+        // Mode is fixed: Rhai-driven runs are always `Measure`. The CLI
+        // verb (`probe` / `curve` / etc.) picks a different Mode when
+        // needed; scripts don't.
         mode: Mode::default(),
-        name: String::new(),
+        name: state.name.unwrap_or_default(),
     };
     Ok((plan, state.transport))
 }
@@ -462,6 +494,77 @@ impl RequestBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Enum parsers — turn Rhai strings into core plan enums.
+//
+// Parsing is strict (unknown variants are errors) because a typo in a
+// bench script should fail at plan-build time, not silently fall back
+// to a default that changes what's measured.
+// ---------------------------------------------------------------------------
+
+fn parse_heartbeat_frame(s: &str) -> Result<zerobench_core::plan::HeartbeatFrame, String> {
+    use zerobench_core::plan::HeartbeatFrame;
+    match s.to_ascii_lowercase().as_str() {
+        "ping" => Ok(HeartbeatFrame::Ping),
+        "text" | "textapp" | "text_app" => Ok(HeartbeatFrame::TextApp),
+        other => Err(format!(
+            "heartbeat_frame: expected \"ping\" or \"text\", got \"{other}\""
+        )),
+    }
+}
+
+fn parse_correlate(s: &str) -> Result<zerobench_core::plan::CorrelateStrategy, String> {
+    use zerobench_core::plan::CorrelateStrategy;
+    // Accept the bare variant names plus `substring:<marker>` for the
+    // one variant that carries data. Case-insensitive; hyphens and
+    // underscores are interchangeable.
+    let norm = s.trim().to_ascii_lowercase();
+    if let Some(marker) = norm.strip_prefix("substring:") {
+        if marker.is_empty() {
+            return Err("correlate \"substring:\" requires a non-empty marker".into());
+        }
+        // Take the marker from the original (case preserved, no trim)
+        // so the user's literal string survives.
+        let marker = s.trim()[10..].to_string();
+        return Ok(CorrelateStrategy::PayloadSubstring { marker });
+    }
+    match norm.as_str() {
+        "pingpong" | "ping_pong" | "ping-pong" => Ok(CorrelateStrategy::PingPong),
+        "monotonicidprepend" | "monotonic_id_prepend" | "monotonic-id-prepend" | "prepend" => {
+            Ok(CorrelateStrategy::MonotonicIdPrepend)
+        }
+        "firsttextframe" | "first_text_frame" | "first-text-frame" | "first_text" => {
+            Ok(CorrelateStrategy::FirstTextFrame)
+        }
+        other => Err(format!(
+            "correlate: expected \"pingpong\", \"prepend\", \"first_text\", or \"substring:<marker>\", got \"{other}\""
+        )),
+    }
+}
+
+fn parse_fanout_mode(s: &str) -> Result<zerobench_core::plan::FanoutMode, String> {
+    use zerobench_core::plan::FanoutMode;
+    // `timestamp` optionally takes a custom field via `timestamp:<field>`.
+    let norm = s.trim().to_ascii_lowercase();
+    if let Some(field) = norm.strip_prefix("timestamp:") {
+        if field.is_empty() {
+            return Err("mode \"timestamp:\" requires a non-empty field name".into());
+        }
+        // Preserve case from the original.
+        let emit_field = s.trim()[10..].to_string();
+        return Ok(FanoutMode::Timestamp { emit_field });
+    }
+    match norm.as_str() {
+        "triggerrtt" | "trigger_rtt" | "trigger-rtt" => Ok(FanoutMode::TriggerRtt),
+        "timestamp" => Ok(FanoutMode::Timestamp {
+            emit_field: "emit_ns".into(),
+        }),
+        other => Err(format!(
+            "mode: expected \"trigger_rtt\" or \"timestamp[:<field>]\", got \"{other}\""
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Protocol-native builders
 //
 // SseHoldBuilder / WsEchoRttBuilder wrap the SseHoldPlan /
@@ -533,6 +636,7 @@ pub(crate) struct WsEchoRttBuilderState {
     pub connections: u32,
     pub msg_rate_per_conn: f64,
     pub payload: String,
+    pub correlate: zerobench_core::plan::CorrelateStrategy,
 }
 
 impl Default for WsEchoRttBuilderState {
@@ -543,6 +647,7 @@ impl Default for WsEchoRttBuilderState {
             connections: 1,
             msg_rate_per_conn: 100.0,
             payload: "ping".into(),
+            correlate: zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend,
         }
     }
 }
@@ -556,6 +661,7 @@ impl WsEchoRttBuilder {
                 connections: connections.max(1),
                 msg_rate_per_conn,
                 payload: "ping".into(),
+                correlate: zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend,
             })),
         }
     }
@@ -582,6 +688,7 @@ pub(crate) struct WsHoldBuilderState {
     pub headers: Vec<(String, String)>,
     pub connections: u32,
     pub heartbeat: Duration,
+    pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
     pub hold_for: Duration,
 }
 
@@ -592,6 +699,7 @@ impl Default for WsHoldBuilderState {
             headers: Vec::new(),
             connections: 1,
             heartbeat: Duration::from_secs(25),
+            heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
             hold_for: Duration::from_secs(60),
         }
     }
@@ -605,6 +713,7 @@ impl WsHoldBuilder {
                 headers: Vec::new(),
                 connections: connections.max(1),
                 heartbeat: Duration::from_secs(25),
+                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
                 hold_for,
             })),
         }
@@ -679,6 +788,7 @@ pub(crate) struct SseFanoutBuilderState {
     pub hold_for: Duration,
     pub reconnect: bool,
     pub trigger_url: String,
+    pub mode: zerobench_core::plan::FanoutMode,
 }
 impl Default for SseFanoutBuilderState {
     fn default() -> Self {
@@ -689,6 +799,7 @@ impl Default for SseFanoutBuilderState {
             hold_for: Duration::from_secs(60),
             reconnect: true,
             trigger_url: String::new(),
+            mode: zerobench_core::plan::FanoutMode::TriggerRtt,
         }
     }
 }
@@ -702,6 +813,7 @@ impl SseFanoutBuilder {
                 hold_for,
                 reconnect: true,
                 trigger_url: String::new(),
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
             })),
         }
     }
@@ -726,7 +838,9 @@ pub(crate) struct WsFanoutBuilderState {
     pub connections: u32,
     pub hold_for: Duration,
     pub heartbeat: Duration,
+    pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
     pub trigger_url: String,
+    pub mode: zerobench_core::plan::FanoutMode,
 }
 impl Default for WsFanoutBuilderState {
     fn default() -> Self {
@@ -736,7 +850,9 @@ impl Default for WsFanoutBuilderState {
             connections: 1,
             hold_for: Duration::from_secs(60),
             heartbeat: Duration::from_secs(25),
+            heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
             trigger_url: String::new(),
+            mode: zerobench_core::plan::FanoutMode::TriggerRtt,
         }
     }
 }
@@ -749,7 +865,9 @@ impl WsFanoutBuilder {
                 connections: connections.max(1),
                 hold_for,
                 heartbeat: Duration::from_secs(25),
+                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
                 trigger_url: String::new(),
+                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
             })),
         }
     }
@@ -893,6 +1011,7 @@ fn compile_step(
                 connections,
                 msg_rate_per_conn,
                 payload,
+                correlate,
             } = state;
             let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
                 scenario: scenario_name.to_string(),
@@ -926,7 +1045,7 @@ fn compile_step(
                 headers: hdr_out,
                 connections,
                 msg_rate_per_conn,
-                correlate: zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend,
+                correlate,
                 payload: payload_tpl,
             }))
         }
@@ -936,6 +1055,7 @@ fn compile_step(
                 headers,
                 connections,
                 heartbeat,
+                heartbeat_frame,
                 hold_for,
             } = hb.take_state();
             let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
@@ -962,7 +1082,7 @@ fn compile_step(
                 headers: hdr_out,
                 connections,
                 heartbeat,
-                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                heartbeat_frame,
                 hold_for,
             }))
         }
@@ -974,6 +1094,7 @@ fn compile_step(
                 hold_for,
                 reconnect,
                 trigger_url,
+                mode,
             } = fb.take_state();
             if trigger_url.is_empty() {
                 return Err(ScriptError::Template {
@@ -1020,7 +1141,7 @@ fn compile_step(
                     url: trig_tpl,
                     body: None,
                 },
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+                mode,
             }))
         }
         StepSource::SseReconnectStorm(sb) => {
@@ -1072,7 +1193,9 @@ fn compile_step(
                 connections,
                 hold_for,
                 heartbeat,
+                heartbeat_frame,
                 trigger_url,
+                mode,
             } = fb.take_state();
             if trigger_url.is_empty() {
                 return Err(ScriptError::Template {
@@ -1113,14 +1236,14 @@ fn compile_step(
                     headers: hdr_out,
                     connections,
                     heartbeat,
-                    heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
+                    heartbeat_frame,
                     hold_for,
                 },
                 trigger: zerobench_core::plan::TriggerSpec::HttpPost {
                     url: trig_tpl,
                     body: None,
                 },
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
+                mode,
             }))
         }
         StepSource::WsServerPush(pb) => {
@@ -1355,6 +1478,37 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
             .ok_or_else(|| to_rhai_err(format!("invalid warmup {spec:?}")))?;
         r.with_state(|s| s.warmup = Some(d));
         Ok::<(), Box<EvalAltResult>>(())
+    });
+
+    // cooldown("10s") — TIME_WAIT drain between runs.
+    let r = root.clone();
+    engine.register_fn("cooldown", move |spec: ImmutableString| {
+        let d = parse::parse_duration(&spec)
+            .ok_or_else(|| to_rhai_err(format!("invalid cooldown {spec:?}")))?;
+        r.with_state(|s| s.cooldown = Some(d));
+        Ok::<(), Box<EvalAltResult>>(())
+    });
+
+    // runs(3) — iterations per plan. Feeds the bootstrap CI aggregator.
+    let r = root.clone();
+    engine.register_fn("runs", move |n: i64| {
+        let n = if n < 1 { 1u32 } else { n as u32 };
+        r.with_state(|s| s.runs = Some(n));
+    });
+
+    // threads(8) — client-side worker thread count.
+    let r = root.clone();
+    engine.register_fn("threads", move |n: i64| {
+        let n = if n < 1 { 1usize } else { n as usize };
+        r.with_state(|s| s.threads = Some(n));
+    });
+
+    // plan_name("chat-burst") — overrides the default Target-host name
+    // in fingerprints. Useful when a single service is measured under
+    // multiple logical profiles.
+    let r = root.clone();
+    engine.register_fn("plan_name", move |name: ImmutableString| {
+        r.with_state(|s| s.name = Some(name.to_string()));
     });
 
     // transport("h1" | "h2")
@@ -1653,6 +1807,23 @@ fn register_ws_echo_rtt_builders(engine: &mut Engine) {
             b
         },
     );
+
+    // .correlate(strategy) — how to match server echoes to client sends.
+    // Accepts "pingpong", "prepend" (default), "first_text", or
+    // "substring:<marker>". Unknown values fail at plan build time.
+    engine.register_fn(
+        "correlate",
+        move |ctx: NativeCallContext,
+              b: WsEchoRttBuilder,
+              strategy: ImmutableString|
+              -> Result<WsEchoRttBuilder, Box<EvalAltResult>> {
+            let parsed = parse_correlate(&strategy).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+            })?;
+            b.with_state(|s| s.correlate = parsed);
+            Ok(b)
+        },
+    );
 }
 
 fn register_ws_hold_builders(engine: &mut Engine) {
@@ -1688,6 +1859,22 @@ fn register_ws_hold_builders(engine: &mut Engine) {
             b
         },
     );
+    // .heartbeat_frame(kind) — "ping" (RFC 6455 Ping, default) or
+    // "text" (app-level text frame, for servers that don't reply to
+    // Ping).
+    engine.register_fn(
+        "heartbeat_frame",
+        move |ctx: NativeCallContext,
+              b: WsHoldBuilder,
+              kind: ImmutableString|
+              -> Result<WsHoldBuilder, Box<EvalAltResult>> {
+            let parsed = parse_heartbeat_frame(&kind).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+            })?;
+            b.with_state(|s| s.heartbeat_frame = parsed);
+            Ok(b)
+        },
+    );
 }
 
 fn register_sse_fanout_builders(engine: &mut Engine) {
@@ -1718,6 +1905,22 @@ fn register_sse_fanout_builders(engine: &mut Engine) {
         move |b: SseFanoutBuilder, name: ImmutableString, value: ImmutableString| {
             b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
             b
+        },
+    );
+    // .mode(kind) — "trigger_rtt" (default, proxy from trigger 2xx)
+    // or "timestamp[:<field>]" (read emit ns from the broadcast
+    // payload; requires server cooperation).
+    engine.register_fn(
+        "mode",
+        move |ctx: NativeCallContext,
+              b: SseFanoutBuilder,
+              kind: ImmutableString|
+              -> Result<SseFanoutBuilder, Box<EvalAltResult>> {
+            let parsed = parse_fanout_mode(&kind).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+            })?;
+            b.with_state(|s| s.mode = parsed);
+            Ok(b)
         },
     );
 }
@@ -1751,6 +1954,32 @@ fn register_ws_fanout_builders(engine: &mut Engine) {
         move |b: WsFanoutBuilder, name: ImmutableString, value: ImmutableString| {
             b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
             b
+        },
+    );
+    engine.register_fn(
+        "heartbeat_frame",
+        move |ctx: NativeCallContext,
+              b: WsFanoutBuilder,
+              kind: ImmutableString|
+              -> Result<WsFanoutBuilder, Box<EvalAltResult>> {
+            let parsed = parse_heartbeat_frame(&kind).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+            })?;
+            b.with_state(|s| s.heartbeat_frame = parsed);
+            Ok(b)
+        },
+    );
+    engine.register_fn(
+        "mode",
+        move |ctx: NativeCallContext,
+              b: WsFanoutBuilder,
+              kind: ImmutableString|
+              -> Result<WsFanoutBuilder, Box<EvalAltResult>> {
+            let parsed = parse_fanout_mode(&kind).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+            })?;
+            b.with_state(|s| s.mode = parsed);
+            Ok(b)
         },
     );
 }
