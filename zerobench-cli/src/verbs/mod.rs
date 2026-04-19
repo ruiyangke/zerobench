@@ -12,10 +12,7 @@
 //! exit-code conventions, progress banners, default durations — lives
 //! in the respective module.
 //!
-//! As of Phase 7a only `measure` ships; `probe`, `calibrate`, `curve`,
-//! `compare`, `watch`, `diff` follow in subsequent commits. The
-//! existing `Diff` subcommand in `zerobench-cli/src/diff.rs` remains
-//! the v0.0.1 fallback until `verbs::diff` supersedes it.
+//! Verbs: `measure`, `probe`, `calibrate`, `curve`, `diff`.
 
 pub mod calibrate;
 pub mod curve;

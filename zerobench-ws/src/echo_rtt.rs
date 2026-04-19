@@ -3,9 +3,7 @@
 //!
 //! Production WS workload: open N persistent connections, send
 //! messages at a per-connection rate, measure round-trip time from
-//! send to correlated echo. Replaces v0.0.1's `WsRound` (which did
-//! handshake + 1 frame + close per "op" and was dominated by
-//! handshake cost — the wrong signal).
+//! send to correlated echo.
 //!
 //! # Correlation strategy
 //!

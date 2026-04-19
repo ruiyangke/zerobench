@@ -33,8 +33,7 @@ pub use histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS, HIST_
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use machine::MachineFingerprint;
 pub use plan::{
-    Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, SsePlan,
-    Step, WsRoundPlan,
+    Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, Step,
 };
 pub use report::{
     print_json, print_jsonl_tick, print_prometheus, print_terminal, ColorChoice,

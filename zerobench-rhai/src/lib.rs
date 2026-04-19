@@ -14,7 +14,7 @@
 //! The CLI combines these with transport options and dispatches through
 //! the normal runner.
 //!
-//! # What's in the DSL (v0.0.1)
+//! # DSL surface
 //!
 //! See the module docs on [`builders`] for the full registered surface.
 //! Highlights:
@@ -30,9 +30,9 @@
 //! - `env("NAME")`, `env("NAME", "default")`, `slot("slot_name")`
 //!   (named `slot` not `var` because `var` is a reserved Rhai keyword).
 //!
-//! # Not in v0.0.1 (explicitly deferred)
+//! # Not yet supported
 //!
-//! - `extract_json` — needs JsonPath; defer.
+//! - `extract_json` — needs JsonPath; deferred.
 //! - `on_response` hooks — hot-path hook; explicitly out of scope.
 //! - `body_multipart` — out of scope.
 //!
@@ -189,23 +189,18 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     // compilation. Protocol-agnostic because multi-protocol plans are
     // now first-class citizens.
     debug_assert!(plan.scenarios.iter().any(|s| s.steps.iter().any(|st| {
-        #[allow(deprecated)]
-        {
-            matches!(
-                st,
-                Step::Request(_)
-                    | Step::SseStream(_)
-                    | Step::WsRound(_)
-                    | Step::SseHold(_)
-                    | Step::WsEchoRtt(_)
-                    | Step::HttpColdConnect(_)
-                    | Step::SseFanout(_)
-                    | Step::SseReconnectStorm(_)
-                    | Step::WsHold(_)
-                    | Step::WsServerPushRtt(_)
-                    | Step::WsFanout(_)
-            )
-        }
+        matches!(
+            st,
+            Step::Request(_)
+                | Step::SseHold(_)
+                | Step::WsEchoRtt(_)
+                | Step::HttpColdConnect(_)
+                | Step::SseFanout(_)
+                | Step::SseReconnectStorm(_)
+                | Step::WsHold(_)
+                | Step::WsServerPushRtt(_)
+                | Step::WsFanout(_)
+        )
     })));
 
     Ok(LoadedScript {

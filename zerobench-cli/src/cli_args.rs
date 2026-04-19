@@ -233,26 +233,6 @@ pub struct CliArgs {
           help_heading = "Protocol")]
     pub http2_prior_knowledge: bool,
 
-    /// Benchmark SSE streams instead of one-shot HTTP. `-c N` =
-    /// concurrent streams. Reporter adds an SSE block.
-    #[cfg(feature = "sse")]
-    #[arg(long = "sse", action = ArgAction::SetTrue,
-          help_heading = "Protocol")]
-    pub sse: bool,
-
-    /// Benchmark WebSocket RTT (RFC 6455) instead of one-shot HTTP.
-    /// `-c N` = concurrent connections. Accepts `ws://` and `wss://`.
-    #[cfg(feature = "ws")]
-    #[arg(long = "ws", action = ArgAction::SetTrue,
-          help_heading = "Protocol")]
-    pub ws: bool,
-
-    /// WebSocket payload per iteration (default `ping`). Sent as a text frame.
-    #[cfg(feature = "ws")]
-    #[arg(long = "message", default_value = "ping",
-          help_heading = "Protocol")]
-    pub ws_message: String,
-
     // ---------- Network ----------
 
     /// TCP+TLS connect timeout.
@@ -375,9 +355,7 @@ pub enum Subcommand {
     /// no calibration gate — "does the target respond, roughly how
     /// fast?" For rigorous measurements use `measure`.
     Probe(crate::verbs::probe::ProbeArgs),
-    /// Compare two v0.1.0 `result.json` files and report percentile
-    /// deltas. Alternative to the top-level `Diff` subcommand (which
-    /// reads v0.0.1 format).
+    /// Compare two `result.json` files and report percentile deltas.
     Compare(crate::verbs::diff::CompareArgs),
     /// Run the client-side self-check (loopback echo) and print the
     /// ceiling + scheduler jitter. Useful for "what's the fastest

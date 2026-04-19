@@ -33,8 +33,7 @@ use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, ImmutableString, NativeCallCon
 use smallvec::SmallVec;
 
 use zerobench_core::plan::{
-    Assertion, BodySource, Extract, Mode, Plan, RateProfile, RequestPlan, Scenario, SsePlan,
-    Step, WsRoundPlan,
+    Assertion, BodySource, Extract, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::HttpVersionPref;
@@ -114,12 +113,6 @@ impl PlanBuilder {
                         .find_map(|step| match step {
                             StepSource::Request(rb) => {
                                 Some(rb.with_state(|r| r.url.clone()))
-                            }
-                            StepSource::Sse(sb) => {
-                                Some(sb.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::Ws(wb) => {
-                                Some(wb.with_state(|w| w.url.clone()))
                             }
                             StepSource::SseHold(b) => {
                                 Some(b.with_state(|s| s.url.clone()))
@@ -464,97 +457,7 @@ impl RequestBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// SseBuilder — `SSE(url).header(...).expect_chunks(N)`
-// ---------------------------------------------------------------------------
-
-/// Returned by `SSE(url)` and chained through `.header(...)` /
-/// `.expect_chunks(...)`. Finalized into a [`Step::SseStream`] during
-/// [`PlanBuilder::finalize`].
-#[derive(Clone)]
-pub(crate) struct SseBuilder {
-    inner: Arc<Mutex<SseBuilderState>>,
-}
-
-#[derive(Default)]
-pub(crate) struct SseBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub expect_chunks: Option<usize>,
-}
-
-impl SseBuilder {
-    fn new(url: String) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SseBuilderState {
-                url,
-                headers: Vec::new(),
-                expect_chunks: None,
-            })),
-        }
-    }
-
-    fn with_state<R>(&self, f: impl FnOnce(&mut SseBuilderState) -> R) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("SSE builder mutex poisoned");
-        f(&mut guard)
-    }
-
-    /// Take the state out of the Arc. See [`PlanBuilder::finalize`].
-    fn take_state(&self) -> SseBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WsBuilder — `WS(url).header(...).message(text)`
-// ---------------------------------------------------------------------------
-
-/// Returned by `WS(url)` and chained through `.header(...)` /
-/// `.message(...)`. Finalized into a [`Step::WsRound`] during
-/// [`PlanBuilder::finalize`].
-#[derive(Clone)]
-pub(crate) struct WsBuilder {
-    inner: Arc<Mutex<WsBuilderState>>,
-}
-
-#[derive(Default)]
-pub(crate) struct WsBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub message: String,
-}
-
-impl WsBuilder {
-    fn new(url: String) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(WsBuilderState {
-                url,
-                headers: Vec::new(),
-                // Default to empty text frame — scripts that want a
-                // payload call `.message("...")`.
-                message: String::new(),
-            })),
-        }
-    }
-
-    fn with_state<R>(&self, f: impl FnOnce(&mut WsBuilderState) -> R) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("WS builder mutex poisoned");
-        f(&mut guard)
-    }
-
-    /// Take the state out of the Arc. See [`PlanBuilder::finalize`].
-    fn take_state(&self) -> WsBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// v0.1.0 protocol-native builders
+// Protocol-native builders
 //
 // SseHoldBuilder / WsEchoRttBuilder wrap the Phase 1 SseHoldPlan /
 // WsEchoRttPlan state. Construction is one-shot — users pass the
@@ -677,8 +580,6 @@ impl WsEchoRttBuilder {
 #[derive(Clone)]
 pub(crate) enum StepSource {
     Request(RequestBuilder),
-    Sse(SseBuilder),
-    Ws(WsBuilder),
     SseHold(SseHoldBuilder),
     WsEchoRtt(WsEchoRttBuilder),
     Pause(Duration),
@@ -697,89 +598,6 @@ fn compile_step(
     match src {
         StepSource::Pause(d) => Ok(Step::Pause(d)),
         StepSource::PauseRandom { min, max } => Ok(Step::PauseRandom { min, max }),
-        StepSource::Sse(sb) => {
-            let state = sb.take_state();
-            let SseBuilderState {
-                url,
-                headers,
-                expect_chunks,
-            } = state;
-            let url_tpl = Template::compile(&url, vars).map_err(|e| {
-                ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("SSE url {url:?}"),
-                    error: e,
-                }
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let name_tpl = Template::compile(&name, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("SSE header name {name:?}"),
-                        error: e,
-                    }
-                })?;
-                let value_tpl = Template::compile(&value, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("SSE header {name:?} value {value:?}"),
-                        error: e,
-                    }
-                })?;
-                hdr_out.push((name_tpl, value_tpl));
-            }
-            Ok(Step::SseStream(SsePlan {
-                url: url_tpl,
-                headers: hdr_out,
-                expect_chunks,
-            }))
-        }
-        StepSource::Ws(wb) => {
-            let state = wb.take_state();
-            let WsBuilderState {
-                url,
-                headers,
-                message,
-            } = state;
-            let url_tpl = Template::compile(&url, vars).map_err(|e| {
-                ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("WS url {url:?}"),
-                    error: e,
-                }
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let name_tpl = Template::compile(&name, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("WS header name {name:?}"),
-                        error: e,
-                    }
-                })?;
-                let value_tpl = Template::compile(&value, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("WS header {name:?} value {value:?}"),
-                        error: e,
-                    }
-                })?;
-                hdr_out.push((name_tpl, value_tpl));
-            }
-            let message_tpl = Template::compile(&message, vars).map_err(|e| {
-                ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: "WS message".into(),
-                    error: e,
-                }
-            })?;
-            Ok(Step::WsRound(WsRoundPlan {
-                url: url_tpl,
-                headers: hdr_out,
-                message: message_tpl,
-            }))
-        }
         StepSource::SseHold(sb) => {
             let state = sb.take_state();
             let SseHoldBuilderState {
@@ -941,8 +759,6 @@ pub fn register(engine: &mut Engine, root: PlanBuilder) {
     register_types(engine);
     register_top_level(engine, root.clone());
     register_request_builders(engine);
-    register_sse_builders(engine);
-    register_ws_builders(engine);
     register_sse_hold_builders(engine);
     register_ws_echo_rtt_builders(engine);
     register_scenario_builder(engine);
@@ -954,8 +770,6 @@ fn register_types(engine: &mut Engine) {
     engine.register_type_with_name::<PlanBuilder>("PlanBuilder");
     engine.register_type_with_name::<ScenarioBuilder>("ScenarioBuilder");
     engine.register_type_with_name::<RequestBuilder>("RequestBuilder");
-    engine.register_type_with_name::<SseBuilder>("SseBuilder");
-    engine.register_type_with_name::<WsBuilder>("WsBuilder");
     engine.register_type_with_name::<SseHoldBuilder>("SseHoldBuilder");
     engine.register_type_with_name::<WsEchoRttBuilder>("WsEchoRttBuilder");
     engine.register_type_with_name::<VarSlotHandle>("VarSlot");
@@ -1263,29 +1077,6 @@ fn register_request_builders(engine: &mut Engine) {
     );
 }
 
-fn register_sse_builders(engine: &mut Engine) {
-    // SSE(url) -> SseBuilder
-    engine.register_fn("SSE", move |url: ImmutableString| {
-        SseBuilder::new(url.to_string())
-    });
-
-    // .header(name, value)
-    engine.register_fn(
-        "header",
-        move |b: SseBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
-
-    // .expect_chunks(n) — minimum number of data events.
-    engine.register_fn("expect_chunks", move |b: SseBuilder, n: i64| {
-        let n = if n < 0 { 0usize } else { n as usize };
-        b.with_state(|s| s.expect_chunks = Some(n));
-        b
-    });
-}
-
 fn register_sse_hold_builders(engine: &mut Engine) {
     // sse_hold(url, subscribers, hold_for) — Phase 6a hold semantics.
     engine.register_fn(
@@ -1375,31 +1166,6 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
     }
 }
 
-fn register_ws_builders(engine: &mut Engine) {
-    // WS(url) -> WsBuilder
-    engine.register_fn("WS", move |url: ImmutableString| {
-        WsBuilder::new(url.to_string())
-    });
-
-    // .header(name, value)
-    engine.register_fn(
-        "header",
-        move |b: WsBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
-
-    // .message(text) — text-frame payload sent per iteration.
-    engine.register_fn(
-        "message",
-        move |b: WsBuilder, text: ImmutableString| {
-            b.with_state(|s| s.message = text.to_string());
-            b
-        },
-    );
-}
-
 fn register_scenario_builder(engine: &mut Engine) {
     // s.step(request_builder)  — Request step.
     //
@@ -1417,23 +1183,7 @@ fn register_scenario_builder(engine: &mut Engine) {
         },
     );
 
-    // s.step(sse_builder)  — SSE step.
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, sse: SseBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::Sse(sse)));
-        },
-    );
-
-    // s.step(ws_builder)  — WS round step.
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, ws: WsBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::Ws(ws)));
-        },
-    );
-
-    // v0.1.0 protocol-native variants.
+    // Protocol-native v0.1.0 step variants.
     engine.register_fn(
         "step",
         move |s: ScenarioBuilder, b: SseHoldBuilder| {

@@ -514,9 +514,8 @@ pub fn print_json(summary: &Summary, plan: &Plan, out: &mut impl Write) -> io::R
 /// during the run, piping to stdout while the terminal summary goes
 /// to stderr at end-of-run.
 ///
-/// Format is stable; see docs/plans/2026-04-16-v0.0.1-impl.md Task 12.
-/// Consumers (Grafana, kibana, ad-hoc jq pipelines) must be able to
-/// round-trip every field as JSON — no NaN, no Infinity.
+/// Format is stable. Consumers (Grafana, kibana, ad-hoc jq pipelines)
+/// must be able to round-trip every field as JSON — no NaN, no Infinity.
 pub fn print_jsonl_tick(tick: &LiveTick, out: &mut impl Write) -> io::Result<()> {
     let t_secs = tick.elapsed.as_secs_f64();
     // The aggregator's window is 1s by convention (the ticker wakes on
@@ -1262,7 +1261,7 @@ mod tests {
 
     fn plan_with_protocols(entries: &[(&str, Protocol)]) -> Plan {
         use crate::plan::{
-            Mode, Plan, RateProfile, RequestPlan, Scenario, SsePlan, Step, WsRoundPlan,
+            Mode, Plan, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step, WsEchoRttPlan,
         };
         use crate::template::Template;
         use crate::var::VarRegistry;
@@ -1275,15 +1274,20 @@ mod tests {
             .map(|(name, proto)| {
                 let step = match proto {
                     Protocol::Http => Step::Request(RequestPlan::get(url.clone())),
-                    Protocol::Sse => Step::SseStream(SsePlan {
+                    Protocol::Sse => Step::SseHold(SseHoldPlan {
                         url: url.clone(),
                         headers: SmallVec::new(),
-                        expect_chunks: None,
+                        subscribers: 1,
+                        hold_for: Duration::from_secs(1),
+                        reconnect: true,
                     }),
-                    Protocol::Ws => Step::WsRound(WsRoundPlan {
+                    Protocol::Ws => Step::WsEchoRtt(WsEchoRttPlan {
                         url: url.clone(),
                         headers: SmallVec::new(),
-                        message: url.clone(),
+                        connections: 1,
+                        msg_rate_per_conn: 1.0,
+                        correlate: crate::plan::CorrelateStrategy::PingPong,
+                        payload: url.clone(),
                     }),
                 };
                 Scenario {

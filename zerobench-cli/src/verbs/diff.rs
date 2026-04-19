@@ -1,4 +1,4 @@
-//! `zerobench compare A B` — diff two v0.1.0 `result.json` artefacts.
+//! `zerobench compare A B` — diff two `result.json` artefacts.
 //!
 //! Per PHILOSOPHY §P2 / §9.3: the comparison-first workflow. This
 //! verb reads two `SummaryExport` files, computes raw percentile
@@ -8,15 +8,8 @@
 //!
 //! The full statistical comparison engine (bootstrap CI for N≥3,
 //! Anderson-Darling for N=1, Holm-Bonferroni multi-metric correction)
-//! lands with Phase 8. For now, diff is the simple-delta form —
-//! already useful as a regression gate when thresholds are set.
-//!
-//! # Naming
-//!
-//! `compare` here (as a v0.1.0 subcommand) is distinct from the
-//! top-level `Diff` subcommand, which reads v0.0.1 JSON. When
-//! Phase 7c finalises the migration, `Diff` is deprecated and
-//! `compare` becomes the default.
+//! is in `zerobench_core::compare`. This verb's simple-delta form is
+//! sufficient as a regression gate when thresholds are set.
 
 use std::fs;
 use std::path::PathBuf;

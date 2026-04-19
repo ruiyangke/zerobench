@@ -3,7 +3,7 @@
 //! # Compilation
 //!
 //! [`Template::compile`] scans the source once, producing a [`Vec<Part>`].
-//! Each `{{...}}` expression is looked up in the v0.0.1 vocabulary (see
+//! Each `{{...}}` expression is looked up in the template vocabulary (see
 //! module docs in [`crate`]); literal bytes between expressions collapse
 //! into [`Part::Literal`].
 //!
@@ -71,7 +71,7 @@ pub enum TemplateError {
     #[error("invalid rand args: {0}")]
     InvalidRandArgs(String),
 
-    /// A v0.0.1-deferred feature (e.g. `{{line:FILE}}`) was used.
+    /// A not-yet-implemented feature (e.g. `{{line:FILE}}`) was used.
     #[error("not yet supported: {0}")]
     NotYetSupported(String),
 

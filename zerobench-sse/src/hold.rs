@@ -1,24 +1,21 @@
-//! SSE `hold` mode — the protocol-native v0.1.0 SSE workload.
+//! SSE `hold` mode — the protocol-native SSE workload.
 //!
 //! Implements `docs/PHILOSOPHY.md` §4.3 and `docs/design-v0.1.0.md`
 //! §3.2: open N concurrent subscribers, hold them for `hold_for`,
 //! count individual events (not streams) as the op, measure
 //! inter-event gap as the primary latency axis.
 //!
-//! Contrast with v0.0.1's [`run_sse_from_plan_threaded`](crate::run_sse_from_plan_threaded)
-//! which opened-read-close per iteration and counted *stream
-//! completions* — the wrong question per PHILOSOPHY §4.3. `SseHold`
-//! answers the production question: "how many concurrent subscribers
+//! Answers the production question: "how many concurrent subscribers
 //! can the server sustain at what event rate and chunk-gap p99?"
 //!
 //! # Synchronous I/O
 //!
-//! Phase 6a uses plain `std::net::TcpStream` + `rustls::StreamOwned`
+//! Uses plain `std::net::TcpStream` + `rustls::StreamOwned`
 //! (one OS thread per subscriber) for implementation clarity. This
 //! scales comfortably up to a few thousand subscribers. For 10k+
-//! subscribers (production chat / notification workloads), Phase 6b
-//! will move to a mio event loop multiplexing all subscribers in a
-//! single thread. The public API stays identical.
+//! subscribers (production chat / notification workloads), a future
+//! revision will move to a mio event loop multiplexing all
+//! subscribers in a single thread. The public API stays identical.
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -392,8 +389,7 @@ pub fn run_sse_hold_from_plan_threaded(
             continue;
         }
 
-        // Find the SseHold step; skip scenarios that aren't Hold
-        // (e.g. deprecated SseStream — handled by the legacy path).
+        // Find the SseHold step; skip scenarios using other protocols.
         let hold_plan = scenario.steps.iter().find_map(|s| match s {
             Step::SseHold(p) => Some(p.clone()),
             _ => None,

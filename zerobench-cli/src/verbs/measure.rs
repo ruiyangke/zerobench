@@ -15,8 +15,8 @@
 //!    `--allow-coarse-clock` was passed.
 //! 5. Open [`ArchiveWriter`] (Phase 5a) and write `plan.json`,
 //!    `machine.json`, `env.json` before the real run starts.
-//! 6. Dispatch `runs` consecutive benchmark runs to the existing
-//!    v0.0.1 HTTP backend, with `cooldown` between runs.
+//! 6. Dispatch `runs` consecutive benchmark runs to the HTTP backend,
+//!    with `cooldown` between runs.
 //! 7. Merge per-run stats into a [`Summary`]; print a compact report.
 //! 8. Stamp `env.ended_at_unix`, rewrite `env.json`, finalise
 //!    `INDEX.json`.

@@ -60,10 +60,7 @@ pub enum BuildError {
 /// 3. `--requests DIR` — parse every `.http` file in the directory;
 ///    one scenario per file, weighted per `scenarios.toml`.
 pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError> {
-    // Transport opts are shared across all input modes. When --sse is on
-    // we force HTTP/1: v0.0.1's streaming path is only wired through
-    // `Http1Pool::exchange_streaming`, and HTTP/2 multiplexing would
-    // conflate chunk timing across concurrent streams anyway.
+    // Transport opts are shared across all input modes.
     //
     // `--http2-prior-knowledge` is an alias for `--http-version h2` —
     // discoverable via a curl-familiar flag name. Our mio_h2 always uses
@@ -78,12 +75,9 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
             CliHttpVersion::H2 => HttpVersionPref::Http2,
         }
     };
-    #[cfg(feature = "sse")]
-    let http_version = if args.sse {
-        HttpVersionPref::Http1
-    } else {
-        http_version
-    };
+    // The legacy `--sse` forced HTTP/1 fallback. v0.1.0 SSE goes
+    // through `measure --sse-hold` which uses HTTP/1 by construction;
+    // no special-case here.
 
     let opts = TransportOpts {
         connect_timeout: args.connect_timeout,
@@ -202,7 +196,7 @@ fn build_from_url(
         body,
         extract: Vec::new(),
         checks,
-        expect_streaming: is_sse(args),
+        expect_streaming: false,
     };
 
     let rate = pick_rate_profile(args, 1.0);
@@ -312,7 +306,7 @@ fn build_from_request_file(
         body: parsed.body,
         extract: Vec::new(),
         checks,
-        expect_streaming: is_sse(args),
+        expect_streaming: false,
     };
 
     let rate = pick_rate_profile(args, 1.0);
@@ -400,7 +394,7 @@ fn build_from_request_dir(
             body: parsed.body,
             extract: Vec::new(),
             checks: checks.clone(),
-            expect_streaming: is_sse(args),
+            expect_streaming: false,
         };
         let rate = pick_rate_profile(args, entry.weight as f64);
         scenarios.push(Scenario {
@@ -455,81 +449,6 @@ fn build_from_request_dir(
 fn format_authority(t: &Target) -> String {
     let scheme = if t.tls { "https" } else { "http" };
     format!("{scheme}://{}:{}", t.host, t.port)
-}
-
-/// `true` when the user asked for SSE mode. Centralised behind a helper
-/// so the #[cfg(feature = "sse")] gate lives in one spot instead of
-/// smearing across every RequestPlan construction site.
-#[inline]
-fn is_sse(_args: &CliArgs) -> bool {
-    #[cfg(feature = "sse")]
-    {
-        _args.sse
-    }
-    #[cfg(not(feature = "sse"))]
-    {
-        false
-    }
-}
-
-/// Extract the path-and-query portion of a URL (e.g. `/echo?x=1`) for
-/// use as the HTTP Upgrade target. Falls back to `/` when absent.
-///
-/// Used by the `--ws` dispatch path, which needs the path as a separate
-/// field on [`zerobench_ws::WsPlan`] (the rest of the URL goes into
-/// [`Target`]).
-#[cfg(feature = "ws")]
-pub fn extract_path_from_url(url: &str) -> String {
-    let rest = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => return "/".to_string(),
-    };
-    match rest.find(|c: char| c == '/' || c == '?' || c == '#') {
-        Some(i) => {
-            let p = &rest[i..];
-            // Strip fragment — it's client-side only.
-            match p.find('#') {
-                Some(j) => p[..j].to_string(),
-                None => p.to_string(),
-            }
-        }
-        None => "/".to_string(),
-    }
-}
-
-/// Build a [`WsPlan`] from the parsed CLI args + the positional URL.
-///
-/// The `--ws` path doesn't go through the regular [`Plan`] construction
-/// because the WebSocket benchmark doesn't need templates, scenarios,
-/// rate profiles, or any of the other Phase-C machinery. Everything the
-/// runner needs lives directly on [`WsPlan`].
-#[cfg(feature = "ws")]
-pub fn build_ws_plan(
-    args: &CliArgs,
-) -> Result<(zerobench_ws::WsPlan, zerobench_core::transport::TransportOpts), BuildError> {
-    let url = args.url.as_deref().ok_or(BuildError::MissingInput)?;
-    let target = Target::parse(url)?;
-    let path = extract_path_from_url(url);
-
-    let opts = zerobench_core::transport::TransportOpts {
-        connect_timeout: args.connect_timeout,
-        request_timeout: args.request_timeout,
-        max_conns: args.connections,
-        tcp_nodelay: true,
-        insecure_tls: args.insecure,
-        http_version: HttpVersionPref::Http1,
-        resolve_overrides: args.resolve.clone(),
-    };
-
-    let plan = zerobench_ws::WsPlan {
-        target,
-        path,
-        headers: args.headers.clone(),
-        message: bytes::Bytes::copy_from_slice(args.ws_message.as_bytes()),
-        opts: opts.clone(),
-    };
-
-    Ok((plan, opts))
 }
 
 fn build_checks(args: &CliArgs) -> Vec<Assertion> {

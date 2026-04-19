@@ -320,7 +320,7 @@ pub fn parse_request_bytes(
         }
         // We assume plain HTTP for relative paths. TLS users should either
         // use an absolute URL in the request line or wrap with `--url`
-        // override (outside the scope of the v0.0.1 parser).
+        // override (outside the scope of this parser).
         let full = format!("http://{host}{raw_target}");
         let target = Target::parse(&full)?;
         (target, full)

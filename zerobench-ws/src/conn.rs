@@ -5,7 +5,7 @@
 //! frame codec and below the benchmark loop:
 //!
 //! ```text
-//!     run_ws_threaded
+//!     run_ws_echo_rtt_from_plan_threaded
 //!       └── WsConnection ← this module
 //!             └── frame  ← zerobench_ws::frame
 //!                 └── MioStream (plain or TLS)

@@ -5,10 +5,7 @@
 //! to this type. Phase 2 (rate scheduler → dispatcher → transport) consumes
 //! a `Plan` and never inspects the original source.
 //!
-//! See `docs/design.md` §3 for the full data model. This module implements
-//! the v0.0.1 subset: Task 1 lands the skeleton; later tasks extend
-//! [`BodySource`], [`Extract`], [`Assertion`] with richer variants, and
-//! swap [`RateProfile`] from a placeholder into a real scheduler input.
+//! See `docs/design-v0.1.0.md` §3 for the full data model.
 
 use std::time::Duration;
 
@@ -26,10 +23,8 @@ use crate::var::{VarRegistry, VarSlot};
 /// reference-counted buffer. Workers receive their own clones and never
 /// mutate the plan during execution.
 ///
-/// v0.1.0: `mode`, `runs`, `cooldown`, `name` are new; `warmup` is no
-/// longer optional (`Duration::ZERO` means "no warmup"). Back-compat
-/// serde defaults let v0.0.1 JSON round-trip into a well-formed v0.1.0
-/// value — see `docs/design-v0.1.0.md` §1 and §16.
+/// `warmup == Duration::ZERO` means "no warmup". See
+/// `docs/design-v0.1.0.md` §1 for the full field semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     /// Scenarios to run, each with its own rate profile and steps. The
@@ -43,8 +38,7 @@ pub struct Plan {
     /// cooldown are separate and excluded from the reported histogram.
     pub duration: Duration,
     /// Warmup phase — requests are fired but stats are discarded. Zero
-    /// disables warmup entirely. v0.0.1 plans deserialise their
-    /// `Option<Duration>::None` into `Duration::ZERO` (serde default).
+    /// disables warmup entirely.
     #[serde(default, with = "humanduration")]
     pub warmup: Duration,
     /// Inter-run cooldown, observed between each of `runs` runs. Lets
@@ -82,10 +76,8 @@ fn default_runs() -> u32 {
     1
 }
 
-// Duration serde wrapper that accepts both a raw-nanoseconds integer
-// (the serde default for `Duration`) and zerobench's preferred
-// `{secs, nanos}` struct form. We accept both to stay compatible with
-// existing v0.0.1 JSON while preferring the struct form for new output.
+// Duration serde wrapper — `{secs, nanos}` struct form matching the
+// serde default for `Duration`.
 mod humanduration {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
@@ -168,8 +160,6 @@ pub enum Mode {
 }
 
 impl Default for Mode {
-    /// `Measure` is the v0.1.0 default when a plan is deserialised
-    /// from a v0.0.1 artifact that lacks a mode field.
     fn default() -> Self {
         Self::Measure
     }
@@ -304,12 +294,9 @@ impl RateProfile {
 
 /// One unit of work inside a scenario iteration.
 ///
-/// v0.1.0 adds protocol-native variants (`SseHold`, `WsEchoRtt`, etc.)
-/// that replace the v0.0.1 `SseStream` / `WsRound` — see
-/// `docs/PHILOSOPHY.md` §4 for the semantic rationale. The old
-/// variants remain, flagged with `#[deprecated]`, so existing
-/// `.rhai` scripts and archived plans still deserialise during the
-/// migration window.
+/// SSE and WebSocket are modelled as protocol-native workloads
+/// (`SseHold`, `WsEchoRtt`, etc.) rather than single-shot HTTP
+/// requests — see `docs/PHILOSOPHY.md` §4 for the semantic rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Step {
     // -----------------------------------------------------------------
@@ -345,7 +332,7 @@ pub enum Step {
     WsHold(WsHoldPlan),
     /// Client-initiated message with explicit echo correlation
     /// (default `ping_pong`); measures RTT over a persistent
-    /// connection. Replaces v0.0.1's handshake-per-op `WsRound`.
+    /// connection.
     WsEchoRtt(WsEchoRttPlan),
     /// Server-initiated push RTT — client only reads, measures
     /// inter-message gap and ordering.
@@ -365,48 +352,6 @@ pub enum Step {
         /// Maximum sleep.
         max: Duration,
     },
-
-    // -----------------------------------------------------------------
-    // Deprecated — removed in v0.2.x. Retained for deserialisation of
-    // v0.0.1 archives and scripts during the migration window.
-    // -----------------------------------------------------------------
-    /// v0.0.1 SSE: open a stream, count chunks to `expect_chunks`,
-    /// close. Measures the wrong question — see `PHILOSOPHY.md` §4.3.
-    #[deprecated(since = "0.1.0", note = "use SseHold; see PHILOSOPHY.md §4.3 / migration in design-v0.1.0.md §16")]
-    SseStream(SsePlan),
-    /// v0.0.1 WS: handshake + 1 send + 1 recv + close. Handshake cost
-    /// dominates the signal; not a real workload.
-    #[deprecated(since = "0.1.0", note = "use WsEchoRtt; see PHILOSOPHY.md §4.4 / migration in design-v0.1.0.md §16")]
-    WsRound(WsRoundPlan),
-}
-
-/// Compiled SSE stream plan. One iteration opens one stream, reads chunks
-/// until the server closes or `expect_chunks` is satisfied, then records
-/// the stream as completed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SsePlan {
-    /// Target URL — a template so `{{env:HOST}}/events/{{var:id}}` works.
-    pub url: Template,
-    /// Extra HTTP headers beyond the protocol-mandated `Accept:
-    /// text/event-stream`. Both sides are templates.
-    pub headers: SmallVec<[(Template, Template); 4]>,
-    /// Assertion: the stream must emit at least this many data events
-    /// before closing. `None` = no minimum, just count whatever arrives.
-    pub expect_chunks: Option<usize>,
-}
-
-/// Compiled WebSocket round plan. One iteration opens a WS connection,
-/// sends `message`, receives one reply, then closes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsRoundPlan {
-    /// Target URL — `ws://` or `wss://`. Templates are allowed in the
-    /// path/query (see [`crate::template::Template`]).
-    pub url: Template,
-    /// Extra HTTP headers beyond the protocol-mandated Upgrade/Sec-*
-    /// handshake headers. Both sides are templates.
-    pub headers: SmallVec<[(Template, Template); 4]>,
-    /// Text frame payload sent on every iteration.
-    pub message: Template,
 }
 
 // ---------------------------------------------------------------------------
@@ -650,19 +595,16 @@ impl Scenario {
     /// skips it (the HTTP backend's `pick_scenario` filters scenarios
     /// that have no Request step).
     pub fn protocol(&self) -> Protocol {
-        #[allow(deprecated)]
         for step in &self.steps {
             match step {
                 Step::Request(_) | Step::HttpColdConnect(_) => return Protocol::Http,
-                Step::SseHold(_)
-                | Step::SseFanout(_)
-                | Step::SseReconnectStorm(_)
-                | Step::SseStream(_) => return Protocol::Sse,
+                Step::SseHold(_) | Step::SseFanout(_) | Step::SseReconnectStorm(_) => {
+                    return Protocol::Sse
+                }
                 Step::WsHold(_)
                 | Step::WsEchoRtt(_)
                 | Step::WsServerPushRtt(_)
-                | Step::WsFanout(_)
-                | Step::WsRound(_) => return Protocol::Ws,
+                | Step::WsFanout(_) => return Protocol::Ws,
                 Step::Pause(_) | Step::PauseRandom { .. } => continue,
             }
         }
@@ -693,7 +635,7 @@ pub struct RequestPlan {
     /// than buffered. Used by SSE plans so the runner can time each chunk
     /// as it arrives.
     ///
-    /// Default `false` — the buffered path is the v0.0.1 baseline.
+    /// Default `false` — the buffered path is the baseline.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expect_streaming: bool,
 }
@@ -904,10 +846,12 @@ mod tests {
     fn protocol_sse_when_first_step_is_sse() {
         let sc = Scenario::new(
             "s",
-            vec![Step::SseStream(SsePlan {
+            vec![Step::SseHold(SseHoldPlan {
                 url: lit("http://x/events"),
                 headers: SmallVec::new(),
-                expect_chunks: None,
+                subscribers: 1,
+                hold_for: Duration::from_secs(1),
+                reconnect: false,
             })],
         );
         assert_eq!(sc.protocol(), Protocol::Sse);
@@ -917,10 +861,13 @@ mod tests {
     fn protocol_ws_when_first_step_is_ws() {
         let sc = Scenario::new(
             "w",
-            vec![Step::WsRound(WsRoundPlan {
+            vec![Step::WsEchoRtt(WsEchoRttPlan {
                 url: lit("ws://x/"),
                 headers: SmallVec::new(),
-                message: lit("ping"),
+                connections: 1,
+                msg_rate_per_conn: 1.0,
+                correlate: CorrelateStrategy::PingPong,
+                payload: lit("ping"),
             })],
         );
         assert_eq!(sc.protocol(), Protocol::Ws);
@@ -936,10 +883,13 @@ mod tests {
                     min: Duration::from_millis(1),
                     max: Duration::from_millis(2),
                 },
-                Step::WsRound(WsRoundPlan {
+                Step::WsEchoRtt(WsEchoRttPlan {
                     url: lit("ws://x/"),
                     headers: SmallVec::new(),
-                    message: lit("hi"),
+                    connections: 1,
+                    msg_rate_per_conn: 1.0,
+                    correlate: CorrelateStrategy::PingPong,
+                    payload: lit("hi"),
                 }),
             ],
         );
