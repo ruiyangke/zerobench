@@ -13,13 +13,14 @@
 //! subscriber (memoryless) so the aggregate kill rate matches
 //! `kill_rate_per_s`.
 
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use mio::net::TcpStream as MioTcp;
+use mio::{Events, Interest, Poll, Token};
 use rand::Rng;
 use rustls::ClientConfig;
 
@@ -27,8 +28,11 @@ use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{Plan, Protocol, SseReconnectStormPlan, Step};
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_http::mio_tls::MioStream;
 
 use crate::line_parser::{SseEvent, SseLineParser};
+
+const POLL_TOKEN: Token = Token(0);
 
 /// Per-subscriber rollup.
 #[derive(Debug, Clone)]
@@ -183,8 +187,12 @@ fn run_one_subscriber(
     let mut reconnect_gaps: Vec<Duration> = Vec::new();
     let mut rng = zerobench_core::rng::from_entropy();
     let mut last_event_id: Option<String> = None;
-    let mut prior_last_event_id: Option<String> = None;
     let mut first_connect = true;
+    // Instant at which the previous session ended. Used to compute
+    // the honest reconnect-latency: new-session-first-byte minus
+    // prior-session-end. None on the first iteration (no reconnect
+    // has happened yet).
+    let mut prior_session_end: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         let kill_duration = if kill_rate > 0.0 {
@@ -196,10 +204,9 @@ fn run_one_subscriber(
         };
         let session_deadline = (Instant::now() + kill_duration).min(deadline);
 
-        let connect_start = Instant::now();
+        let prior_id = if first_connect { None } else { last_event_id.clone() };
         if !first_connect {
             stats.reconnects_attempted += 1;
-            prior_last_event_id = last_event_id.clone();
         }
         match run_one_session(
             target,
@@ -207,7 +214,7 @@ fn run_one_subscriber(
             plan,
             session_deadline,
             stop,
-            last_event_id.as_deref(),
+            prior_id.as_deref(),
         ) {
             Ok(session) => {
                 if first_ttfb.is_none() {
@@ -220,12 +227,31 @@ fn run_one_subscriber(
                 }
                 if !first_connect {
                     stats.reconnects_succeeded += 1;
-                    reconnect_gaps.push(connect_start.elapsed());
-                    // Heuristic: assume resume happened if the post-
-                    // reconnect session saw at least one event AND the
-                    // final last_event_id differs from the prior one
-                    // we sent on the resume request.
-                    if session.events > 0 && last_event_id != prior_last_event_id {
+                    // C5: Honest reconnect gap = prior-session-end →
+                    // new-session-first-byte. Only recordable when we
+                    // saw a first byte this session.
+                    if let (Some(prior_end), Some(first_byte)) =
+                        (prior_session_end, session.first_byte_at)
+                    {
+                        reconnect_gaps
+                            .push(first_byte.saturating_duration_since(prior_end));
+                    }
+                    // C6: Resume-honoured heuristic. We count a
+                    // reconnect as "resumed" only when (a) the server
+                    // did NOT re-send the event carrying
+                    // prior_last_event_id (verified by tracking that
+                    // specific ID through the new session) AND (b)
+                    // new events actually arrived. A non-resuming
+                    // server that starts from scratch and assigns new
+                    // IDs would re-send the prior ID (within the
+                    // buffered window) and trip saw_prior_id. A
+                    // server that skips past prior and only emits new
+                    // IDs does NOT trip saw_prior_id → counted as
+                    // resumed.
+                    if prior_id.is_some()
+                        && session.events > 0
+                        && !session.saw_prior_id
+                    {
                         stats.reconnects_resumed += 1;
                     }
                 }
@@ -237,6 +263,7 @@ fn run_one_subscriber(
                 stats.errors_read += 1;
             }
         }
+        prior_session_end = Some(Instant::now());
         first_connect = false;
     }
     (stats, first_ttfb, reconnect_gaps)
@@ -251,7 +278,14 @@ struct SessionOutcome {
     events: u64,
     bytes_received: u64,
     ttfb: Option<Duration>,
+    /// Monotonic instant of the first response byte for this session.
+    /// Used by the caller to compute the honest reconnect gap.
+    first_byte_at: Option<Instant>,
     last_event_id: Option<String>,
+    /// `true` iff any `id:` line seen in this session matches the
+    /// `expected_prior_id` the caller supplied. Set only when the
+    /// caller asks us to watch for a specific prior id.
+    saw_prior_id: bool,
 }
 
 fn run_one_session(
@@ -260,30 +294,49 @@ fn run_one_session(
     plan: &SseReconnectStormPlan,
     deadline: Instant,
     stop: &AtomicBool,
-    last_event_id: Option<&str>,
+    expected_prior_id: Option<&str>,
 ) -> Result<SessionOutcome, SessionErr> {
     let addr = target.resolve(opts).map_err(|_| SessionErr::Connect)?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, opts.connect_timeout).map_err(|_| SessionErr::Connect)?;
-    let _ = stream.set_nodelay(true);
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .map_err(|_| SessionErr::Read)?;
-    stream
-        .set_write_timeout(Some(opts.request_timeout))
-        .map_err(|_| SessionErr::Read)?;
-
-    let request = build_request(target, plan, last_event_id);
-    stream
-        .write_all(&request)
+    let mut poll = Poll::new().map_err(|_| SessionErr::Connect)?;
+    let mut events = Events::with_capacity(4);
+    let mut tcp = MioTcp::connect(addr).map_err(|_| SessionErr::Connect)?;
+    let _ = tcp.set_nodelay(true);
+    poll.registry()
+        .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
         .map_err(|_| SessionErr::Connect)?;
+    wait_for(&mut poll, &mut events, opts.connect_timeout, |e| {
+        e.token() == POLL_TOKEN && e.is_writable()
+    })
+    .map_err(|_| SessionErr::Connect)?;
+    if tcp.peer_addr().is_err() {
+        return Err(SessionErr::Connect);
+    }
+    let mut stream = MioStream::Plain(tcp);
+
+    let request = build_request(target, plan, expected_prior_id);
+    let mut write_pos = 0;
+    while write_pos < request.len() {
+        match stream.write(&request[write_pos..]) {
+            Ok(0) => return Err(SessionErr::Connect),
+            Ok(n) => write_pos += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_for(&mut poll, &mut events, opts.request_timeout, |e| {
+                    e.token() == POLL_TOKEN && e.is_writable()
+                })
+                .map_err(|_| SessionErr::Connect)?;
+            }
+            Err(_) => return Err(SessionErr::Connect),
+        }
+    }
     let t_sent = Instant::now();
 
     let mut outcome = SessionOutcome {
         events: 0,
         bytes_received: 0,
         ttfb: None,
-        last_event_id: last_event_id.map(|s| s.to_string()),
+        first_byte_at: None,
+        last_event_id: expected_prior_id.map(|s| s.to_string()),
+        saw_prior_id: false,
     };
 
     let mut buf = [0u8; 8192];
@@ -291,15 +344,14 @@ fn run_one_session(
     let mut header_done = false;
     let mut parser = SseLineParser::default();
     let mut decoder = crate::hold::ChunkDecoder::new();
-    let mut first_byte: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let now = Instant::now();
-                if first_byte.is_none() {
-                    first_byte = Some(now);
+                if outcome.first_byte_at.is_none() {
+                    outcome.first_byte_at = Some(now);
                     outcome.ttfb = Some(now.saturating_duration_since(t_sent));
                 }
                 outcome.bytes_received += n as u64;
@@ -323,15 +375,22 @@ fn run_one_session(
                 let _ = decoder.decode(body_slice, &mut decoded);
                 if !decoded.is_empty() {
                     let events_ref = &mut outcome.events;
-                    // Also capture `id:` values for Last-Event-ID
-                    // propagation. SseLineParser swallows id lines
-                    // (reports Ignored) so we also grep manually.
+                    // Capture `id:` values for Last-Event-ID
+                    // propagation, and also check each against the
+                    // caller's expected_prior_id so the worker can
+                    // tell whether the server actually skipped past
+                    // the id we asked it to resume from.
                     for line in decoded.split(|&b| b == b'\n') {
                         if line.starts_with(b"id:") {
                             let val = line[3..]
                                 .trim_ascii_start()
                                 .trim_ascii_end();
                             if let Ok(s) = std::str::from_utf8(val) {
+                                if let Some(expected) = expected_prior_id {
+                                    if s == expected {
+                                        outcome.saw_prior_id = true;
+                                    }
+                                }
                                 outcome.last_event_id = Some(s.to_string());
                             }
                         }
@@ -342,17 +401,45 @@ fn run_one_session(
                     });
                 }
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No data yet — wait up to 100ms for readability or
+                // the deadline, whichever comes first.
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let budget =
+                    (deadline - now).min(Duration::from_millis(100));
+                let _ = poll.poll(&mut events, Some(budget));
+            }
             Err(_) => {
-                let _ = stream.shutdown(Shutdown::Both);
                 return Err(SessionErr::Read);
             }
         }
     }
-    let _ = stream.shutdown(Shutdown::Both);
     Ok(outcome)
+}
+
+/// Poll until an event matching `pred` fires, or `timeout` elapses.
+fn wait_for(
+    poll: &mut Poll,
+    events: &mut Events,
+    timeout: Duration,
+    pred: impl Fn(&mio::event::Event) -> bool,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "reconnect-storm wait"));
+        }
+        poll.poll(events, Some(deadline - now))?;
+        for ev in events.iter() {
+            if pred(ev) {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn build_request(

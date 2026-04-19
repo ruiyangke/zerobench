@@ -9,7 +9,6 @@
 //! Scope mirrors `SseFanout` — only `TriggerSpec::HttpPost` and
 //! `FanoutMode::TriggerRtt` are wired today.
 
-use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -270,9 +269,11 @@ fn fire_http_trigger(
     opts: &TransportOpts,
     trigger_url: &str,
 ) -> std::io::Result<()> {
-    // The trigger URL typically points at the same host (e.g. an HTTP
-    // /broadcast endpoint alongside the WS /subscribe). For cross-host
-    // triggers the user can set a different hostname in the URL.
+    // Delegated to zerobench_http::simple_post::fire_http_post — pure
+    // mio, no blocking std::net::TcpStream on the client side. The
+    // trigger URL typically points at the same host (an HTTP
+    // /broadcast endpoint alongside the WS /subscribe). Cross-host
+    // triggers aren't supported here yet (requires a second Target).
     let path = match trigger_url.find("://").and_then(|i| trigger_url[i + 3..].find('/')) {
         Some(rel) => {
             let abs_idx = trigger_url.find("://").map(|i| i + 3).unwrap_or(0) + rel;
@@ -280,37 +281,7 @@ fn fire_http_trigger(
         }
         None => "/",
     };
-    let addr = target
-        .resolve(opts)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, opts.connect_timeout)?;
-    let _ = stream.set_nodelay(true);
-    stream.set_read_timeout(Some(opts.request_timeout))?;
-    stream.set_write_timeout(Some(opts.request_timeout))?;
-    let host = if (target.tls && target.port == 443) || (!target.tls && target.port == 80) {
-        target.host.clone()
-    } else {
-        format!("{}:{}", target.host, target.port)
-    };
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-    );
-    stream.write_all(req.as_bytes())?;
-    let mut sink = [0u8; 512];
-    loop {
-        match stream.read(&mut sink) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+    zerobench_http::simple_post::fire_http_post(target, opts, path, &[], None)
 }
 
 fn render_template(tpl: &zerobench_core::Template) -> String {

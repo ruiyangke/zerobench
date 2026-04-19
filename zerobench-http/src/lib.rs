@@ -16,6 +16,10 @@ pub mod mio_h1;
 #[cfg(feature = "mio-h1")]
 pub mod cold_connect;
 
+// --- One-shot POST (fanout triggers, control-plane probes) ---
+#[cfg(feature = "mio-h1")]
+pub mod simple_post;
+
 // --- Mio H2 backend (h2 crate manually polled from mio) ---
 #[cfg(feature = "mio-h2")]
 pub mod mio_h2;
