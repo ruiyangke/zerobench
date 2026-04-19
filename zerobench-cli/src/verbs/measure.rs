@@ -40,7 +40,8 @@ use zerobench_core::fingerprint::{
 };
 use zerobench_core::machine::MachineFingerprint;
 use zerobench_core::plan::{
-    Mode, Plan, Protocol, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step,
+    CorrelateStrategy, Mode, Plan, Protocol, RateProfile, RequestPlan, Scenario, SseHoldPlan,
+    Step, WsEchoRttPlan,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
@@ -184,6 +185,33 @@ pub struct MeasureArgs {
     #[arg(long = "sse-reconnect", action = ArgAction::SetTrue,
           help_heading = "SSE")]
     pub sse_reconnect: bool,
+
+    // -------------------------------------------------------------------
+    // WebSocket EchoRtt (Phase 6e)
+    //
+    // When `--ws-echo N` is passed, the verb builds a
+    // `Step::WsEchoRtt` scenario. N persistent connections each send
+    // text frames at `--msg-rate` req/s per conn; every send expects
+    // a correlated echo; RTT is the primary latency axis.
+    // -------------------------------------------------------------------
+    /// Open N persistent WS connections and measure echo RTT per
+    /// message. URL must be `ws://` or `wss://`; the server must
+    /// echo text frames verbatim (or preserve the 16-char monotonic
+    /// id prefix for correlation).
+    #[arg(long = "ws-echo", value_name = "CONNECTIONS", help_heading = "WebSocket")]
+    pub ws_echo: Option<u32>,
+
+    /// Per-connection send rate for `--ws-echo`. Defaults to 100 msg/s
+    /// per connection.
+    #[arg(long = "msg-rate", value_name = "RATE",
+          value_parser = super::super::cli_args::parse_rate_flag,
+          default_value = "100", help_heading = "WebSocket")]
+    pub ws_msg_rate: f64,
+
+    /// Text payload body for each send (the 16-char monotonic id
+    /// prefix is prepended automatically for correlation).
+    #[arg(long = "ws-payload", default_value = "ping", help_heading = "WebSocket")]
+    pub ws_payload: String,
 }
 
 fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
@@ -403,9 +431,21 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     }
                 }
                 Protocol::Ws => {
-                    return Err(
-                        "WS protocol not yet supported in measure verb (Phase 6c)".into(),
-                    );
+                    #[cfg(feature = "ws")]
+                    {
+                        let _ = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                            &target,
+                            &opts,
+                            &plan,
+                            args.warmup,
+                            tls_config.clone(),
+                            None,
+                        );
+                    }
+                    #[cfg(not(feature = "ws"))]
+                    {
+                        return Err("WS scenario requires `--features ws`".into());
+                    }
                 }
             }
         }
@@ -449,9 +489,21 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 }
             }
             Protocol::Ws => {
-                return Err(
-                    "WS protocol not yet supported in measure verb (Phase 6c)".into(),
-                );
+                #[cfg(feature = "ws")]
+                {
+                    zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.duration,
+                        tls_config.clone(),
+                        stop,
+                    )
+                }
+                #[cfg(not(feature = "ws"))]
+                {
+                    return Err("WS scenario requires `--features ws`".into());
+                }
             }
         };
 
@@ -586,7 +638,25 @@ fn build_measure_plan(
     let mut vars = VarRegistry::new();
     let url = Template::compile(&args.url, &mut vars)?;
 
-    let scenario = if let Some(subscribers) = args.sse_hold {
+    let scenario = if let Some(connections) = args.ws_echo {
+        // WS Echo RTT mode (Phase 6e) — build Step::WsEchoRtt with
+        // N persistent connections at msg_rate/conn.
+        let payload = Template::compile(&args.ws_payload, &mut vars)?;
+        Scenario {
+            name: "ws-echo-rtt".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: connections as usize,
+            },
+            steps: vec![Step::WsEchoRtt(WsEchoRttPlan {
+                url,
+                headers: SmallVec::new(),
+                connections,
+                msg_rate_per_conn: args.ws_msg_rate,
+                correlate: CorrelateStrategy::MonotonicIdPrepend,
+                payload,
+            })],
+        }
+    } else if let Some(subscribers) = args.sse_hold {
         // SSE Hold mode (Phase 6b) — build Step::SseHold with
         // N subscribers held for `hold_for` (defaults to --duration).
         let hold_for = args.hold_for.unwrap_or(args.duration);
@@ -721,6 +791,9 @@ mod tests {
             sse_hold: None,
             hold_for: None,
             sse_reconnect: false,
+            ws_echo: None,
+            ws_msg_rate: 100.0,
+            ws_payload: "ping".to_string(),
         }
     }
 

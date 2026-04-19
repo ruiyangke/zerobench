@@ -31,8 +31,11 @@
 //!    isn't worth the complexity.
 
 pub mod conn;
+pub mod echo_rtt;
 pub mod frame;
 pub mod handshake;
+
+pub use echo_rtt::run_ws_echo_rtt_from_plan_threaded;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
