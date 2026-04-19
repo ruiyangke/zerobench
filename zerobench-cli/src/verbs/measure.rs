@@ -39,7 +39,9 @@ use zerobench_core::fingerprint::{
     plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
 };
 use zerobench_core::machine::MachineFingerprint;
-use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
+use zerobench_core::plan::{
+    Mode, Plan, Protocol, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step,
+};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
@@ -153,6 +155,35 @@ pub struct MeasureArgs {
     #[arg(long = "context", value_parser = parse_kv_pair,
           help_heading = "Archive")]
     pub context: Vec<(String, String)>,
+
+    // -------------------------------------------------------------------
+    // SSE Hold (Phase 6b)
+    //
+    // When `--sse-hold N` is passed, the verb builds a
+    // `Step::SseHold` scenario instead of the default HTTP GET.
+    // Measures production-relevant SSE semantics per PHILOSOPHY §4.3:
+    // N persistent subscribers, "op = event received", chunk-gap p99
+    // as the primary latency metric.
+    // -------------------------------------------------------------------
+    /// Open N concurrent SSE subscribers and hold them for `--for`.
+    /// URL must be an SSE endpoint (`text/event-stream`); measures
+    /// events/s and inter-event gap rather than req/s. Phase 6a
+    /// backend, http:// only (TLS lands in Phase 6b follow-up).
+    #[arg(long = "sse-hold", value_name = "SUBSCRIBERS", help_heading = "SSE")]
+    pub sse_hold: Option<u32>,
+
+    /// Subscriber hold duration for `--sse-hold`. Defaults to
+    /// `--duration` when omitted.
+    #[arg(long = "for", value_name = "DURATION",
+          value_parser = super::super::cli_args::parse_duration_flag,
+          help_heading = "SSE")]
+    pub hold_for: Option<Duration>,
+
+    /// Whether subscribers follow the WHATWG EventSource reconnect
+    /// protocol when the server closes. Default `true`.
+    #[arg(long = "sse-reconnect", action = ArgAction::SetTrue,
+          help_heading = "SSE")]
+    pub sse_reconnect: bool,
 }
 
 fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
@@ -322,44 +353,126 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             std::thread::sleep(args.cooldown);
         }
 
-        // Warmup: fire traffic, discard. Mio dispatch doesn't natively
-        // separate warmup from measure yet (TODO in v0.1.0 Phase 6);
-        // for now we run (warmup + duration) and discard the first
-        // `warmup` worth of stats by re-running without warmup on
-        // iteration >0. On iteration 0 we honour it as a prefix.
+        // Protocol-dispatched: the first scenario's protocol drives
+        // the backend choice. Single-scenario plans in the measure
+        // verb keep this simple; multi-scenario plans (Rhai) go
+        // through a different code path.
+        let scenario_protocol = plan
+            .scenarios
+            .first()
+            .map(|s| s.protocol())
+            .unwrap_or(Protocol::Http);
+
+        // Warmup: fire traffic, discard. Only on iteration 0 — we
+        // amortise the warmup cost across the N runs per PHILOSOPHY
+        // §P8. Mio dispatch doesn't natively separate warmup from
+        // measure yet — we model it as a prefixed short run whose
+        // stats we drop on the floor.
         if !args.warmup.is_zero() && run_idx == 0 {
             eprintln!("[warmup] {} (discarded)...", format_duration(args.warmup));
-            let _ = zerobench_http::mio_h1::run_mio_threaded(
+            match scenario_protocol {
+                Protocol::Http => {
+                    let _ = zerobench_http::mio_h1::run_mio_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.threads.max(1),
+                        args.connections,
+                        args.warmup,
+                        target_rate,
+                        tls_config.clone(),
+                        None,
+                        None,
+                    );
+                }
+                Protocol::Sse => {
+                    #[cfg(feature = "sse")]
+                    {
+                        let _ = zerobench_sse::run_sse_hold_from_plan_threaded(
+                            &target,
+                            &opts,
+                            &plan,
+                            args.warmup,
+                            tls_config.clone(),
+                            None,
+                        );
+                    }
+                    #[cfg(not(feature = "sse"))]
+                    {
+                        return Err("SSE scenario requires `--features sse`".into());
+                    }
+                }
+                Protocol::Ws => {
+                    return Err(
+                        "WS protocol not yet supported in measure verb (Phase 6c)".into(),
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "[run {}/{}] starting ({}, {:?})...",
+            run_idx + 1,
+            args.runs,
+            format_duration(args.duration),
+            scenario_protocol,
+        );
+        let stop: Option<Arc<AtomicBool>> = None;
+        let stats = match scenario_protocol {
+            Protocol::Http => zerobench_http::mio_h1::run_mio_threaded(
                 &target,
                 &opts,
                 &plan,
                 args.threads.max(1),
                 args.connections,
-                args.warmup,
+                args.duration,
                 target_rate,
                 tls_config.clone(),
                 None,
-                None,
-            );
-        }
+                stop,
+            ),
+            Protocol::Sse => {
+                #[cfg(feature = "sse")]
+                {
+                    zerobench_sse::run_sse_hold_from_plan_threaded(
+                        &target,
+                        &opts,
+                        &plan,
+                        args.duration,
+                        tls_config.clone(),
+                        stop,
+                    )
+                }
+                #[cfg(not(feature = "sse"))]
+                {
+                    return Err("SSE scenario requires `--features sse`".into());
+                }
+            }
+            Protocol::Ws => {
+                return Err(
+                    "WS protocol not yet supported in measure verb (Phase 6c)".into(),
+                );
+            }
+        };
 
-        eprintln!("[run {}/{}] starting ({})...",
-            run_idx + 1, args.runs, format_duration(args.duration));
-        let stop: Option<Arc<AtomicBool>> = None;
-        let stats = zerobench_http::mio_h1::run_mio_threaded(
-            &target,
-            &opts,
-            &plan,
-            args.threads.max(1),
-            args.connections,
-            args.duration,
-            target_rate,
-            tls_config.clone(),
-            None,
-            stop,
+        // Op count semantics per protocol:
+        //   HTTP → stats.requests is req count
+        //   SSE  → stats.requests is event count (populated by
+        //          run_sse_hold_from_plan_threaded which treats each
+        //          SSE event as an op per PHILOSOPHY §4.3)
+        let run_ops: u64 = stats.iter().map(|s| s.requests).sum();
+        let op_label = match scenario_protocol {
+            Protocol::Http => "requests",
+            Protocol::Sse => "events",
+            Protocol::Ws => "messages",
+        };
+        eprintln!(
+            "[run {}/{}] {} {}",
+            run_idx + 1,
+            args.runs,
+            run_ops,
+            op_label
         );
-        let run_requests: u64 = stats.iter().map(|s| s.requests).sum();
-        eprintln!("[run {}/{}] {} requests", run_idx + 1, args.runs, run_requests);
 
         // Phase 8a: capture per-run metrics before merging into the
         // aggregate. These are the elementary samples the bootstrap
@@ -471,31 +584,51 @@ fn build_measure_plan(
     name: &str,
 ) -> Result<Plan, Box<dyn std::error::Error>> {
     let mut vars = VarRegistry::new();
-    // For the Phase 7a MVP we benchmark `GET /`. Rhai-scripted multi-
-    // step scenarios go through `zerobench run` / Phase 7 follow-ups.
     let url = Template::compile(&args.url, &mut vars)?;
 
-    let request = RequestPlan {
-        method: http::Method::GET,
-        url,
-        headers: SmallVec::new(),
-        body: None,
-        extract: Vec::new(),
-        checks: Vec::new(),
-        expect_streaming: false,
-    };
+    let scenario = if let Some(subscribers) = args.sse_hold {
+        // SSE Hold mode (Phase 6b) — build Step::SseHold with
+        // N subscribers held for `hold_for` (defaults to --duration).
+        let hold_for = args.hold_for.unwrap_or(args.duration);
+        Scenario {
+            name: "sse-hold".into(),
+            rate: RateProfile::Saturate {
+                max_concurrency: subscribers as usize,
+            },
+            steps: vec![Step::SseHold(SseHoldPlan {
+                url,
+                headers: SmallVec::new(),
+                subscribers,
+                hold_for,
+                reconnect: args.sse_reconnect,
+            })],
+        }
+    } else {
+        // HTTP (Phase 7a MVP) — single-step GET. Multi-step scenarios
+        // go through `zerobench run` (Rhai) until Phase 7 wires
+        // richer CLI-built plans.
+        let request = RequestPlan {
+            method: http::Method::GET,
+            url,
+            headers: SmallVec::new(),
+            body: None,
+            extract: Vec::new(),
+            checks: Vec::new(),
+            expect_streaming: false,
+        };
 
-    let rate = match args.rate {
-        Some(r) => RateProfile::Constant(r),
-        None => RateProfile::Saturate {
-            max_concurrency: args.connections,
-        },
-    };
+        let rate = match args.rate {
+            Some(r) => RateProfile::Constant(r),
+            None => RateProfile::Saturate {
+                max_concurrency: args.connections,
+            },
+        };
 
-    let scenario = Scenario {
-        name: "measure".into(),
-        rate,
-        steps: vec![Step::Request(request)],
+        Scenario {
+            name: "measure".into(),
+            rate,
+            steps: vec![Step::Request(request)],
+        }
     };
 
     // `target` participates in url_fp via host/port/scheme/sni; the
@@ -585,6 +718,9 @@ mod tests {
             allow_coarse_clock: false,
             no_archive: true,
             context: Vec::new(),
+            sse_hold: None,
+            hold_for: None,
+            sse_reconnect: false,
         }
     }
 
@@ -620,6 +756,53 @@ mod tests {
             RateProfile::Constant(r) => assert!((r - 1234.5).abs() < 1e-9),
             ref other => panic!("expected Constant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sse_hold_flag_produces_sse_step() {
+        let mut args = sample_args("http://sse.example.com/stream");
+        args.sse_hold = Some(100);
+        args.hold_for = Some(Duration::from_secs(30));
+        args.sse_reconnect = true;
+
+        let target = Target::parse(&args.url).unwrap();
+        let plan = build_measure_plan(&args, &target, "x").unwrap();
+
+        assert_eq!(plan.scenarios.len(), 1);
+        assert_eq!(plan.scenarios[0].protocol(), Protocol::Sse);
+        match &plan.scenarios[0].steps[0] {
+            Step::SseHold(p) => {
+                assert_eq!(p.subscribers, 100);
+                assert_eq!(p.hold_for, Duration::from_secs(30));
+                assert!(p.reconnect);
+            }
+            other => panic!("expected SseHold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_hold_defaults_hold_for_to_duration_when_omitted() {
+        let mut args = sample_args("http://sse.example.com/stream");
+        args.sse_hold = Some(10);
+        args.duration = Duration::from_secs(5);
+        args.hold_for = None;
+
+        let target = Target::parse(&args.url).unwrap();
+        let plan = build_measure_plan(&args, &target, "x").unwrap();
+
+        match &plan.scenarios[0].steps[0] {
+            Step::SseHold(p) => assert_eq!(p.hold_for, Duration::from_secs(5)),
+            _ => panic!("expected SseHold"),
+        }
+    }
+
+    #[test]
+    fn http_plan_built_when_sse_hold_absent() {
+        let args = sample_args("http://x:1/");
+        let target = Target::parse(&args.url).unwrap();
+        let plan = build_measure_plan(&args, &target, "x").unwrap();
+        assert_eq!(plan.scenarios[0].protocol(), Protocol::Http);
+        assert!(matches!(plan.scenarios[0].steps[0], Step::Request(_)));
     }
 
     #[test]
