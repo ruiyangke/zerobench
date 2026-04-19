@@ -96,7 +96,12 @@ toml = "0.8"
 
 # WebSocket primitives
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
+hex = "0.4"
+
+# Time formatting for run_ids
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [profile.release]
 opt-level = 3
