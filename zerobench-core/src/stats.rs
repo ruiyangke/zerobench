@@ -581,21 +581,13 @@ pub struct PerRunMetrics {
     /// broadcast_rtt; reconnect_storm → reconnect-gap aka
     /// chunk_gap slot). Empty for pure-HTTP runs. Consumers of
     /// `--regress-on p99:+5%` should read whichever of
-    /// `latency` / `protocol_latency` is non-empty. Added in
-    /// schema v2; defaults to empty on v1 archives.
-    #[serde(default)]
+    /// `latency` / `protocol_latency` is non-empty.
     pub protocol_latency: LatencyExport,
 }
 
 impl SummaryExport {
     /// Schema version for `result.json`.
-    ///
-    /// v1: initial shape.
-    /// v2: added `SseExtrasExport.broadcast_rtt`,
-    ///     `WsExtrasExport.broadcast_rtt`, and
-    ///     `PerRunMetrics.protocol_latency`. All three are
-    ///     `#[serde(default)]` so v1 archives still round-trip.
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 1;
 }
 
 /// Percentile breakdown extracted from an HDR histogram.
@@ -717,10 +709,8 @@ pub struct SseExtrasExport {
     pub streams_completed: u64,
     /// Payload bytes received.
     pub bytes_received: u64,
-    /// Broadcast RTT histogram (SseFanout only). Absent in archives
-    /// produced before this field was added; `#[serde(default)]`
-    /// deserialises the empty form for back-compat.
-    #[serde(default)]
+    /// Broadcast RTT histogram (SseFanout only). Empty for every
+    /// other SSE backend.
     pub broadcast_rtt: LatencyExport,
 }
 
@@ -752,9 +742,8 @@ pub struct WsExtrasExport {
     pub bytes_sent: u64,
     /// Bytes received.
     pub bytes_recv: u64,
-    /// Broadcast RTT histogram (WsFanout only). See
-    /// [`SseExtrasExport::broadcast_rtt`].
-    #[serde(default)]
+    /// Broadcast RTT histogram (WsFanout only). Empty for every
+    /// other WS backend.
     pub broadcast_rtt: LatencyExport,
 }
 
