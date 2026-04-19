@@ -73,16 +73,35 @@ impl ErrorCounters {
         self.assertion_failed += other.assertion_failed;
     }
 
-    /// Total error count across all categories.
+    /// Total error count across all categories — the sum of
+    /// [`Self::hard_total`] and [`Self::soft_total`].
+    ///
+    /// Use this for overall reporting. Do **not** use it to gate
+    /// process exit status: a healthy saturate run against a stub
+    /// server that returns 404s will have `total() > 0` even though
+    /// the tool itself is working correctly. Use `hard_total()` for
+    /// exit-code decisions.
     pub fn total(&self) -> u64 {
-        self.connect
-            + self.read
-            + self.write
-            + self.timeout
-            + self.keepup
-            + self.status_4xx
-            + self.status_5xx
-            + self.assertion_failed
+        self.hard_total() + self.soft_total()
+    }
+
+    /// Transport-level failures: the tool couldn't complete the op at
+    /// all. These are the errors that should gate a non-zero exit.
+    ///
+    /// `connect` / `read` / `write` / `timeout` / `keepup` all mean
+    /// zerobench gave up on an op before the server decided anything.
+    pub fn hard_total(&self) -> u64 {
+        self.connect + self.read + self.write + self.timeout + self.keepup
+    }
+
+    /// Server-layer responses: the op completed end-to-end but the
+    /// server returned a non-2xx status or a user assertion fired.
+    ///
+    /// These are part of the benchmark *signal* (latency of a 4xx
+    /// path is still a real measurement), so they must not, by
+    /// default, fail the bench. Reports surface them separately.
+    pub fn soft_total(&self) -> u64 {
+        self.status_4xx + self.status_5xx + self.assertion_failed
     }
 
     /// Increment the counter for a given [`ErrorKind`].

@@ -150,6 +150,19 @@ impl Template {
         self.parts.iter().all(|p| matches!(p, Part::Literal(_)))
     }
 
+    /// If this template is a single literal, return its bytes.
+    ///
+    /// Useful for compile-time inspection (e.g. checking whether a
+    /// header name is `Connection` without expanding the template).
+    /// Returns `None` for multi-part templates, even if every part is
+    /// a literal — concatenating would require allocation.
+    pub fn static_literal(&self) -> Option<&[u8]> {
+        match self.parts.as_slice() {
+            [Part::Literal(b)] => Some(b),
+            _ => None,
+        }
+    }
+
     /// Expand the template into `out`.
     ///
     /// The output buffer is appended to; callers reuse the same `Vec<u8>`

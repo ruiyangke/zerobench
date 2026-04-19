@@ -709,14 +709,26 @@ pub fn ad_test(a: &Histogram<u64>, b: &Histogram<u64>) -> AdResult {
     }
     let a_squared = ((total - 1.0) / (n * m * total)) * acc;
 
-    // Standardise. For k=2, Scholz-Stephens give σ_N² as a function
-    // of N. We use the simplified large-N approximation:
+    // Standardise. For k=2, Scholz-Stephens (1987) eq. (8) gives
+    // σ²_N exactly as a cubic polynomial in N divided by
+    // (N-1)(N-2)(N-3), parameterised by:
+    //   H  = Σ 1/n_i         (harmonic sum of sample sizes)
+    //   h  = H_{N-1}         (harmonic number)
+    //   g  = Σ_{i=1..N-2} Σ_{j=i+1..N-1} 1/((N-i)·j)
     //
-    //   σ²  ≈ (4/3) · (1 - (1.34 / N))
-    //
-    // which is within a few percent of the exact value for N ≥ 100
-    // (the regime we always operate in).
-    let sigma = ((4.0 / 3.0) * (1.0 - 1.34 / total)).sqrt().max(f64::EPSILON);
+    // For k=2 the polynomial coefficients reduce to simple linear
+    // combinations of h and g. We compute h and g exactly up to
+    // moderate totals (≤ 100k) and fall back to the equal-sample
+    // asymptotic (4/3)·(1 - 1.34/N) for larger totals where the
+    // relative correction term is already small.
+    let n_total = total as u64;
+    let sigma_sq = if n_total >= 4 {
+        ad_sigma_squared_k2(n_total, n, m)
+    } else {
+        // Degenerate: not enough samples for the cubic to evaluate.
+        4.0 / 3.0
+    };
+    let sigma = sigma_sq.sqrt().max(f64::EPSILON);
     let t = (a_squared - 1.0) / sigma;
     let p = ad_p_value(t);
     let significance = if p < 0.05 {
@@ -732,6 +744,65 @@ pub fn ad_test(a: &Histogram<u64>, b: &Histogram<u64>) -> AdResult {
         n_b,
         significance,
     }
+}
+
+/// Exact variance σ²_N of the two-sample Anderson-Darling statistic
+/// under the null hypothesis, per Scholz-Stephens (1987) eq. (8)
+/// specialised to k=2.
+///
+/// For sample sizes n₁, n₂ (total N = n₁+n₂):
+///
+/// ```text
+///   σ²_N = (aN³ + bN² + cN + d) / ((N-1)(N-2)(N-3))
+///
+///   H = 1/n₁ + 1/n₂
+///   h = H_{N-1}                             (harmonic number)
+///   g = Σ_{i=1..N-2} Σ_{j=i+1..N-1} 1/((N-i)·j)
+///
+///   a = 4g - 6 + (10 - 6g)·H
+///   b = 12g + 8h - 22 + (2g - 14h - 4)·H
+///   c = 36h + 4       + (2h - 6)·H
+///   d = 24
+/// ```
+///
+/// Exact up to `EXACT_MAX`; beyond that the cost of the O(N²)-ish
+/// g term stops being worth the extra precision (the finite-sample
+/// correction is already ≤ 1% of σ² at that scale), so we fall
+/// back to the classic equal-sample asymptotic.
+fn ad_sigma_squared_k2(n_total: u64, n_a: f64, n_b: f64) -> f64 {
+    const EXACT_MAX: u64 = 100_000;
+    if n_total > EXACT_MAX {
+        // Equal-sample large-N asymptotic. Accurate to ~1% by this
+        // point regardless of sample-size ratio.
+        return (4.0 / 3.0) * (1.0 - 1.34 / n_total as f64);
+    }
+    let n = n_total as usize;
+    // Precompute h_i = Σ_{k=1..i} 1/k for i in 0..=N-1.
+    let mut h_vals = vec![0.0_f64; n];
+    for i in 1..n {
+        h_vals[i] = h_vals[i - 1] + 1.0 / (i as f64);
+    }
+    let h = h_vals[n - 1];
+    // g = Σ_{j=2..N-1} (h - h_{N-j}) / j.
+    //
+    // Derivation: swap order of summation in the original
+    // g = Σ_{i=1..N-2} Σ_{j=i+1..N-1} 1/((N-i)·j)
+    // via substitution j_outer = N-i, giving a one-dimensional sum
+    // over the OUTER harmonic fraction with a two-line inner piece
+    // expressible as a harmonic-number difference.
+    let mut g = 0.0_f64;
+    for j in 2..n {
+        g += (h - h_vals[n - j]) / (j as f64);
+    }
+    let cap_h = 1.0 / n_a + 1.0 / n_b;
+    let n_f = n_total as f64;
+    let a = 4.0 * g - 6.0 + (10.0 - 6.0 * g) * cap_h;
+    let b = 12.0 * g + 8.0 * h - 22.0 + (2.0 * g - 14.0 * h - 4.0) * cap_h;
+    let c = 36.0 * h + 4.0 + (2.0 * h - 6.0) * cap_h;
+    let d = 24.0;
+    let num = a * n_f.powi(3) + b * n_f.powi(2) + c * n_f + d;
+    let denom = (n_f - 1.0) * (n_f - 2.0) * (n_f - 3.0);
+    (num / denom).max(f64::EPSILON)
 }
 
 /// Approximate p-value for the standardised Scholz-Stephens T

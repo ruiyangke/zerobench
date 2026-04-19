@@ -87,14 +87,21 @@ fn canonicalise(v: serde_json::Value) -> serde_json::Value {
 // Plan hash
 // ---------------------------------------------------------------------------
 
-/// SHA-256 of the canonical JSON representation of `plan`.
+/// SHA-256 of the canonical JSON representation of `plan`'s
+/// *identity projection*.
 ///
 /// **Tool version is intentionally not part of the hash.** Two versions
 /// of zerobench producing the same `Plan` from the same source must
 /// hash identically, so archived runs stay grouped when the tool is
 /// upgraded.
+///
+/// **Run-time settings (`duration`, `runs`, `threads`, `cooldown`,
+/// `warmup`, `mode`, `name`) are also excluded** so changing those
+/// knobs doesn't fragment the archive — the same benchmark run for
+/// 30s vs 60s, 1 run vs 5, or 4 threads vs 16, still groups together
+/// under the same `plan_hash`. See [`Plan::identity_projection`].
 pub fn plan_hash(plan: &Plan) -> String {
-    canonical_sha256(plan)
+    canonical_sha256(&plan.identity_projection())
 }
 
 // ---------------------------------------------------------------------------
@@ -332,11 +339,47 @@ mod tests {
     }
 
     #[test]
-    fn plan_hash_changes_with_name() {
+    fn plan_hash_does_not_depend_on_name() {
+        // Name is a human label — it is deliberately excluded from
+        // identity so renaming a plan does not fragment the archive.
+        // Per-profile grouping happens through `url_fingerprint`,
+        // which still mixes `name` in.
         let mut p1 = Plan::new();
         p1.name = "a".into();
         let mut p2 = Plan::new();
         p2.name = "b".into();
+        assert_eq!(plan_hash(&p1), plan_hash(&p2));
+    }
+
+    #[test]
+    fn plan_hash_stable_across_runtime_settings() {
+        // Varying duration / warmup / cooldown / runs / threads /
+        // mode must NOT produce a new archive bucket — it's the
+        // same workload measured under a different time budget.
+        use crate::plan::Mode;
+        let p1 = Plan::new();
+        let mut p2 = Plan::new();
+        p2.duration = std::time::Duration::from_secs(900);
+        p2.warmup = std::time::Duration::from_secs(5);
+        p2.cooldown = std::time::Duration::from_secs(30);
+        p2.runs = 7;
+        p2.threads = 32;
+        p2.mode = Mode::default();
+        assert_eq!(plan_hash(&p1), plan_hash(&p2));
+    }
+
+    #[test]
+    fn plan_hash_changes_when_workload_changes() {
+        use crate::plan::{RateProfile, Scenario};
+        // A scenario addition is a workload change, so the hash
+        // must differ — identity is driven by scenarios + vars.
+        let p1 = Plan::new();
+        let mut p2 = Plan::new();
+        p2.scenarios.push(Scenario {
+            name: "added".into(),
+            rate: RateProfile::Saturate { max_concurrency: 10 },
+            steps: Vec::new(),
+        });
         assert_ne!(plan_hash(&p1), plan_hash(&p2));
     }
 

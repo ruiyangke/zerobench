@@ -92,6 +92,39 @@ impl Plan {
             name: String::new(),
         }
     }
+
+    /// Return a borrow of the *identity* fields — the projection
+    /// that should drive `plan_hash` / archive bucketing.
+    ///
+    /// Fields excluded from identity:
+    ///
+    /// - `duration`, `warmup`, `cooldown` — time budget, not workload
+    /// - `runs`, `threads` — concurrency / repetition settings
+    /// - `mode` — verb dispatch (`measure` / `probe` / ...), all share
+    ///   the same archive family
+    /// - `name` — human label, deliberately excluded so rename doesn't
+    ///   split the bucket. `url_fingerprint` already mixes `name` in
+    ///   for per-profile grouping.
+    ///
+    /// Included: scenarios (URLs, headers, steps, rate profiles) and
+    /// the variable registry (shape matters — slots resolve by index).
+    pub fn identity_projection(&self) -> PlanIdentity<'_> {
+        PlanIdentity {
+            scenarios: &self.scenarios,
+            vars: &self.vars,
+        }
+    }
+}
+
+/// Serialisable identity slice of a [`Plan`], produced by
+/// [`Plan::identity_projection`]. Used by fingerprinting to keep
+/// archive buckets stable when only run-time settings vary.
+#[derive(Debug, Serialize)]
+pub struct PlanIdentity<'a> {
+    /// Workload: URLs, headers, bodies, assertions, extractions.
+    pub scenarios: &'a Vec<Scenario>,
+    /// Compile-time variable slot layout.
+    pub vars: &'a VarRegistry,
 }
 
 impl Default for Plan {
