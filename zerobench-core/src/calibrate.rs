@@ -13,6 +13,15 @@
 //! add (tool version, machine fingerprint, concurrency flags, CPU
 //! governor) is a way for a stale calibration to lie silently.
 //!
+//! # I/O model
+//!
+//! Pure mio / non-blocking sockets on both sides. The echo server
+//! runs in a background thread with its own [`mio::Poll`]
+//! multiplexing the listener and all accepted connections. The
+//! client self-check holds one [`mio::Poll`] with a pool of
+//! persistent connections; per-request write + readable-wait +
+//! read-exact proceed under non-blocking semantics.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -28,34 +37,35 @@
 //! }
 //! ```
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
+use mio::{Events, Interest, Poll, Token};
 
 use crate::histogram::{new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
 
 // ---------------------------------------------------------------------------
-// LoopbackEcho — a minimal blocking TCP echo server bound to 127.0.0.1:<ephemeral>.
+// LoopbackEcho — mio-multiplexed TCP echo server on 127.0.0.1:<ephemeral>.
 //
-// Each accepted connection spawns a small handler thread that echoes
-// whatever it reads back to the writer. Intended for calibration only —
-// do not use for load benchmarks (one thread per connection doesn't scale).
-//
-// The listener socket is set to non-blocking mode so the acceptor loop
-// can check the stop flag at ~1ms cadence and exit promptly on drop.
+// One background thread owns a single `mio::Poll` driving the listener
+// and every accepted connection through non-blocking reads/writes. No
+// thread-per-connection, no blocking I/O. Dropping the `LoopbackEcho`
+// signals stop and joins the thread.
 // ---------------------------------------------------------------------------
 
 /// A minimal in-process TCP echo server for client-side calibration.
 ///
-/// Binds to `127.0.0.1:0` (kernel-chosen port). Each connection is
-/// handled by a dedicated OS thread that echoes read bytes verbatim.
-/// Dropping the `LoopbackEcho` signals all threads to stop and joins
-/// the acceptor.
+/// Binds to `127.0.0.1:0` (kernel-chosen port). Every connection is
+/// multiplexed on a single mio `Poll` — non-blocking throughout.
+/// Dropping the `LoopbackEcho` signals the background thread to stop
+/// and joins it.
 pub struct LoopbackEcho {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -64,16 +74,22 @@ pub struct LoopbackEcho {
 
 impl LoopbackEcho {
     /// Spawn the echo server on a kernel-chosen ephemeral port.
-    pub fn spawn() -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+    pub fn spawn() -> io::Result<Self> {
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid literal");
+        let mut listener = MioTcpListener::bind(bind)?;
         let addr = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = stop.clone();
         let handle = thread::Builder::new()
-            .name("zerobench-echo-accept".into())
-            .spawn(move || Self::accept_loop(listener, stop_c))?;
+            .name("zerobench-echo".into())
+            .spawn(move || {
+                if let Err(_e) = run_echo_loop(&mut listener, &stop_c) {
+                    // Socket I/O error during shutdown is fine; anything
+                    // mid-run would be surprising but we have no channel
+                    // to surface it. Intentionally swallowed.
+                }
+            })?;
 
         Ok(Self {
             addr,
@@ -86,55 +102,150 @@ impl LoopbackEcho {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+}
 
-    fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
-        while !stop.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let stop_c = stop.clone();
-                    // One handler thread per connection. Fine for ≤16
-                    // connections (the calibration pool size). Not for
-                    // production workloads.
-                    let _ = thread::Builder::new()
-                        .name("zerobench-echo-conn".into())
-                        .spawn(move || Self::echo_loop(stream, stop_c));
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => break,
-            }
+const LISTENER_TOKEN: Token = Token(usize::MAX);
+
+/// Per-connection echo state: a small read buffer plus whatever
+/// bytes are queued for write back to the peer.
+struct EchoConn {
+    stream: MioTcpStream,
+    pending_write: Vec<u8>,
+    interests: Interest,
+}
+
+impl EchoConn {
+    fn new(stream: MioTcpStream) -> Self {
+        Self {
+            stream,
+            pending_write: Vec::new(),
+            interests: Interest::READABLE,
         }
     }
+}
 
-    fn echo_loop(mut stream: TcpStream, stop: Arc<AtomicBool>) {
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        let mut buf = [0u8; 4096];
+fn run_echo_loop(listener: &mut MioTcpListener, stop: &AtomicBool) -> io::Result<()> {
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+    poll.registry()
+        .register(listener, LISTENER_TOKEN, Interest::READABLE)?;
 
-        while !stop.load(Ordering::Relaxed) {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stream.write_all(&buf[..n]).is_err() {
-                        break;
+    let mut conns: HashMap<Token, EchoConn> = HashMap::new();
+    let mut next_token: usize = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        for event in events.iter() {
+            if event.token() == LISTENER_TOKEN {
+                // Drain the accept queue — edge-triggered friendly.
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nodelay(true);
+                            let token = Token(next_token);
+                            next_token = next_token.wrapping_add(1);
+                            if poll
+                                .registry()
+                                .register(&mut stream, token, Interest::READABLE)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            conns.insert(token, EchoConn::new(stream));
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
                     }
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Read timeout fired — give the stop flag a chance
-                    // to be observed, then retry.
-                    continue;
+                continue;
+            }
+
+            let Some(conn) = conns.get_mut(&event.token()) else { continue };
+
+            let mut drop_conn = false;
+            if event.is_readable() {
+                drop_conn |= echo_read(conn, poll.registry(), event.token()).is_err();
+            }
+            if !drop_conn && event.is_writable() {
+                drop_conn |= echo_write(conn, poll.registry(), event.token()).is_err();
+            }
+            if drop_conn {
+                if let Some(mut c) = conns.remove(&event.token()) {
+                    let _ = poll.registry().deregister(&mut c.stream);
                 }
-                Err(_) => break,
             }
         }
     }
+
+    // Graceful teardown: deregister everything so the Drop path is
+    // predictable in nested test harnesses.
+    for (_, mut c) in conns.drain() {
+        let _ = poll.registry().deregister(&mut c.stream);
+    }
+    let _ = poll.registry().deregister(listener);
+    Ok(())
+}
+
+/// Read as much as the kernel has buffered into the pending-write
+/// queue. On EOF or fatal error, returns Err so the caller drops the
+/// connection.
+fn echo_read(
+    conn: &mut EchoConn,
+    registry: &mio::Registry,
+    token: Token,
+) -> io::Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        match conn.stream.read(&mut buf) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof")),
+            Ok(n) => conn.pending_write.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    // If we have bytes to echo, try writing immediately; any remainder
+    // waits for a writable event.
+    if !conn.pending_write.is_empty() {
+        echo_write(conn, registry, token)?;
+    }
+    Ok(())
+}
+
+/// Flush as much of the pending-write queue as the kernel accepts.
+/// Toggles interest to include WRITABLE when bytes remain.
+fn echo_write(
+    conn: &mut EchoConn,
+    registry: &mio::Registry,
+    token: Token,
+) -> io::Result<()> {
+    while !conn.pending_write.is_empty() {
+        match conn.stream.write(&conn.pending_write) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "zero write")),
+            Ok(n) => {
+                conn.pending_write.drain(..n);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let want_writable = !conn.pending_write.is_empty();
+    let desired = if want_writable {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    if desired != conn.interests {
+        registry.reregister(&mut conn.stream, token, desired)?;
+        conn.interests = desired;
+    }
+    Ok(())
 }
 
 impl Drop for LoopbackEcho {
@@ -209,7 +320,7 @@ pub struct ClientSelfCheck {
 
 impl ClientSelfCheck {
     /// Spawn the echo server and return a ready-to-drive self-check.
-    pub fn spawn() -> std::io::Result<Self> {
+    pub fn spawn() -> io::Result<Self> {
         Ok(Self {
             echo: LoopbackEcho::spawn()?,
         })
@@ -227,21 +338,30 @@ impl ClientSelfCheck {
         rate_rps: f64,
         duration: Duration,
         pool_size: Option<usize>,
-    ) -> std::io::Result<SelfCheckResult> {
+    ) -> io::Result<SelfCheckResult> {
         assert!(rate_rps > 0.0, "rate_rps must be positive");
         assert!(!duration.is_zero(), "duration must be non-zero");
 
         let pool_size = pool_size.unwrap_or(8).max(1);
 
-        // Open the pool. Every connection is persistent; keep-alive is
-        // implicit because we only send on one side at a time.
-        let mut pool: Vec<TcpStream> = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let s = TcpStream::connect(self.echo.addr)?;
+        let mut poll = Poll::new()?;
+        let mut events = Events::with_capacity(pool_size.max(16));
+
+        // Open the pool. Non-blocking connect — register all sockets
+        // with WRITABLE and wait for each to signal writable (TCP
+        // connect complete).
+        let mut pool: Vec<MioTcpStream> = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let mut s = MioTcpStream::connect(self.echo.addr)?;
             s.set_nodelay(true)?;
-            s.set_read_timeout(Some(Duration::from_millis(500)))?;
+            poll.registry().register(
+                &mut s,
+                Token(i),
+                Interest::READABLE | Interest::WRITABLE,
+            )?;
             pool.push(s);
         }
+        wait_connected(&mut poll, &mut events, &mut pool)?;
 
         let interval_ns = (1_000_000_000.0 / rate_rps) as u64;
         let start = Instant::now();
@@ -254,7 +374,7 @@ impl ClientSelfCheck {
         let mut intended_elapsed_ns: u64 = 0;
         let mut pool_idx: usize = 0;
         let mut req_id: u64 = 0;
-        let mut buf = [0u8; 8];
+        let mut recv_buf = [0u8; 8];
 
         loop {
             let now = Instant::now();
@@ -268,8 +388,6 @@ impl ClientSelfCheck {
             let intended_start = start + Duration::from_nanos(intended_elapsed_ns);
             if intended_start > now {
                 let sleep_for = intended_start - now;
-                // thread::sleep has µs-ish resolution on Linux; for
-                // short sleeps we accept the granularity cost.
                 if sleep_for > Duration::from_micros(1) {
                     thread::sleep(sleep_for);
                 }
@@ -280,24 +398,21 @@ impl ClientSelfCheck {
                 .duration_since(start)
                 .as_nanos()
                 .saturating_sub(intended_elapsed_ns as u128) as u64;
-            // Clamp to the HDR range. Drift 0 becomes 1 (HDR can't
-            // record 0).
             let drift_sample = drift_ns.clamp(HIST_LO_NS, HIST_HI_NS);
             let _ = jitter.record(drift_sample);
 
-            // Round-robin through the pool. Sending+reading serially
-            // on one connection is fine because each request is tiny.
             let conn = &mut pool[pool_idx];
+            let token = Token(pool_idx);
             pool_idx = (pool_idx + 1) % pool_size;
             req_id += 1;
             let payload = req_id.to_le_bytes();
 
-            // Any failure here ends the check — the caller sees a
-            // short run and can interpret via the verdict + elapsed.
-            if conn.write_all(&payload).is_err() {
+            // Send. Any failure here ends the check — the caller sees
+            // a short run and can interpret via the verdict + elapsed.
+            if nb_write_all(&mut poll, &mut events, conn, token, &payload).is_err() {
                 break;
             }
-            if conn.read_exact(&mut buf).is_err() {
+            if nb_read_exact(&mut poll, &mut events, conn, token, &mut recv_buf).is_err() {
                 break;
             }
 
@@ -306,6 +421,12 @@ impl ClientSelfCheck {
             let _ = latency.record(lat_sample);
             completed += 1;
             intended_elapsed_ns = intended_elapsed_ns.saturating_add(interval_ns);
+        }
+
+        // Deregister everything before returning so repeated calls on
+        // the same ClientSelfCheck don't leak kernel state.
+        for s in pool.iter_mut() {
+            let _ = poll.registry().deregister(s);
         }
 
         let elapsed = start.elapsed();
@@ -326,6 +447,150 @@ impl ClientSelfCheck {
     }
 }
 
+/// Wait until every connection in `pool` reports writable (TCP connect
+/// complete). Returns an error if any connection fails to connect
+/// within 5s.
+fn wait_connected(
+    poll: &mut Poll,
+    events: &mut Events,
+    pool: &mut [MioTcpStream],
+) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ready = vec![false; pool.len()];
+    let mut ready_count = 0;
+
+    while ready_count < pool.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "loopback connect timeout",
+            ));
+        }
+        poll.poll(events, Some(deadline - now))?;
+        for event in events.iter() {
+            let idx = event.token().0;
+            if idx >= pool.len() || ready[idx] {
+                continue;
+            }
+            if event.is_error() {
+                if let Ok(Some(e)) = pool[idx].take_error() {
+                    return Err(e);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "connect error",
+                ));
+            }
+            if event.is_writable() {
+                match pool[idx].peer_addr() {
+                    Ok(_) => {
+                        ready[idx] = true;
+                        ready_count += 1;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::NotConnected => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Non-blocking write-all: loops `stream.write()` until every byte in
+/// `buf` is sent, polling for writable events when the kernel buffer
+/// fills. Returns when done or on fatal error.
+fn nb_write_all(
+    poll: &mut Poll,
+    events: &mut Events,
+    stream: &mut MioTcpStream,
+    token: Token,
+    buf: &[u8],
+) -> io::Result<()> {
+    let mut sent = 0;
+    while sent < buf.len() {
+        match stream.write(&buf[sent..]) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "zero write"));
+            }
+            Ok(n) => sent += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_interest(poll, events, stream, token, Interest::WRITABLE)?;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Non-blocking read-exact: loops `stream.read()` until `buf` is full,
+/// polling for readable events between partial reads.
+fn nb_read_exact(
+    poll: &mut Poll,
+    events: &mut Events,
+    stream: &mut MioTcpStream,
+    token: Token,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let mut read = 0;
+    while read < buf.len() {
+        match stream.read(&mut buf[read..]) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+            }
+            Ok(n) => read += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_interest(poll, events, stream, token, Interest::READABLE)?;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Poll with a short timeout until `stream`'s `token` signals
+/// `desired` readiness. Bounded so a misbehaving server can't hang
+/// calibration forever.
+fn wait_for_interest(
+    poll: &mut Poll,
+    events: &mut Events,
+    _stream: &mut MioTcpStream,
+    token: Token,
+    desired: Interest,
+) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "calibration poll timeout",
+            ));
+        }
+        poll.poll(events, Some(deadline - now))?;
+        for event in events.iter() {
+            if event.token() != token {
+                continue;
+            }
+            if event.is_error() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "socket error during calibration",
+                ));
+            }
+            let readable_ok =
+                desired == Interest::READABLE && event.is_readable();
+            let writable_ok =
+                desired == Interest::WRITABLE && event.is_writable();
+            if readable_ok || writable_ok {
+                return Ok(());
+            }
+        }
+    }
+}
+
 // Silence unused-import warning when `new_hist` isn't referenced in a
 // feature-gated build; we always use it here, but keep the re-export
 // list consistent with other core modules.
@@ -340,35 +605,37 @@ const _HDR_CONSTS: (u64, u64, u8) = (HIST_LO_NS, HIST_HI_NS, HIST_SIG);
 mod tests {
     use super::*;
 
+    /// Open a blocking-style client against `addr` using std::net — the
+    /// tests exercise LoopbackEcho from outside, so a plain blocking
+    /// stream is the clearest way to assert the echo behaviour. The
+    /// server itself is still pure mio.
+    fn client_round_trip(addr: SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(addr)?;
+        s.set_nodelay(true)?;
+        s.set_read_timeout(Some(Duration::from_millis(500)))?;
+        s.write_all(payload)?;
+        let mut buf = vec![0u8; payload.len()];
+        s.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     #[test]
     fn echo_spawns_and_accepts() {
         let echo = LoopbackEcho::spawn().expect("spawn echo");
-        let mut conn = TcpStream::connect(echo.addr()).expect("connect");
-        conn.set_nodelay(true).ok();
-        conn.set_read_timeout(Some(Duration::from_millis(500))).ok();
-
         let sent = b"hello-world-1234";
-        conn.write_all(sent).expect("write");
-        let mut buf = [0u8; 16];
-        conn.read_exact(&mut buf).expect("read");
-        assert_eq!(&buf, sent);
-
-        drop(conn);
-        drop(echo); // Drop signals stop to the acceptor + any handler.
+        let got = client_round_trip(echo.addr(), sent).expect("round trip");
+        assert_eq!(&got[..], sent);
+        drop(echo);
     }
 
     #[test]
     fn echo_handles_many_sequential_connections() {
         let echo = LoopbackEcho::spawn().expect("spawn");
         for i in 0u32..50 {
-            let mut c = TcpStream::connect(echo.addr()).expect("connect");
-            c.set_nodelay(true).ok();
-            c.set_read_timeout(Some(Duration::from_millis(500))).ok();
             let payload = i.to_le_bytes();
-            c.write_all(&payload).expect("write");
-            let mut buf = [0u8; 4];
-            c.read_exact(&mut buf).expect("read");
-            assert_eq!(buf, payload);
+            let got = client_round_trip(echo.addr(), &payload).expect("round trip");
+            assert_eq!(got, payload);
         }
     }
 
