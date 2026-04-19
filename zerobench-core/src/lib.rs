@@ -6,6 +6,7 @@ pub mod calibrate;
 pub mod fingerprint;
 pub mod histogram;
 pub mod live_snapshot;
+pub mod machine;
 pub mod plan;
 pub mod report;
 pub mod request_file;
@@ -25,6 +26,7 @@ pub use fingerprint::{
 };
 pub use histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
+pub use machine::MachineFingerprint;
 pub use plan::{
     Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, SsePlan,
     Step, WsRoundPlan,

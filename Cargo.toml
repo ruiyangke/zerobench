@@ -103,6 +103,13 @@ hex = "0.4"
 # Time formatting for run_ids
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
+# Blake3 for hostname hashing (fast, no rainbow surface for short inputs)
+blake3 = "1"
+
+# libc + num_cpus for machine fingerprint collection
+libc = "0.2"
+num_cpus = "1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

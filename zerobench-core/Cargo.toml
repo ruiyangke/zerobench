@@ -30,6 +30,9 @@ webpki-roots = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 time = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
+num_cpus = { workspace = true }
 
 [lints]
 workspace = true
