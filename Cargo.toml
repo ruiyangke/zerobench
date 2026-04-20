@@ -8,7 +8,6 @@ members = [
     "zerobench-rhai",
     "zerobench-tui",
     "zerobench-cli",
-    "zerobench-stub",
 ]
 
 [workspace.package]
