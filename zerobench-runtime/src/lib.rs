@@ -14,7 +14,7 @@
 //!   - [`recorder`]      — fans one op out to TaskStats + LiveSnapshot (§4.3)
 //!   - [`stop`]          — shared stop-flag primitive
 //!   - [`tls`]           — shared rustls `ClientConfig` builder
-//!   - [`transport`]     — runtime error taxonomy (`TransportError`)
+//!   - [`transport`]     — runtime error taxonomy (`TransportError`, `classify`)
 //!
 //! `BenchRng` lives in `zerobench_core::rng` because `template` and
 //! `scenario_context` (in core) need it. Everything here is downstream of
@@ -48,4 +48,4 @@ pub use machine::MachineFingerprint;
 pub use recorder::{Recorder, Sample};
 pub use stop::StopSignal;
 pub use tls::tls_client_config;
-pub use transport::TransportError;
+pub use transport::{classify, TransportError};

@@ -26,8 +26,9 @@ use rustls::ClientConfig;
 
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{Plan, Protocol, SseReconnectStormPlan, Step};
-use zerobench_core::stats::{SseExtras, TaskStats};
+use zerobench_core::stats::{ErrorKind, SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_runtime::transport::{classify, TransportError};
 use crate::http::mio_tls::MioStream;
 
 use crate::sse::line_parser::{SseEvent, SseLineParser};
@@ -294,25 +295,26 @@ fn run_one_subscriber(
                 // toward artificially large values on flaky servers.
                 prior_session_end = Some(Instant::now());
             }
-            Err(SessionErr::Connect) => {
-                stats.errors_connect += 1;
-                // Leave prior_session_end as-is: the next successful
-                // reconnect will compute its gap relative to the last
+            Err(e) => {
+                // Connect-class failures (including TLS) are
+                // accounted to `errors_connect`; read/protocol/write
+                // to `errors_read`. `classify` is the one place that
+                // decides — no local taxonomy.
+                //
+                // `prior_session_end` is intentionally left as-is
+                // after a connect failure: the next successful
+                // reconnect computes its gap relative to the last
                 // *good* session, not relative to a connect-failure
                 // pit that contains no useful timing signal.
-            }
-            Err(SessionErr::Read) => {
-                stats.errors_read += 1;
+                match classify(&e) {
+                    ErrorKind::Connect => stats.errors_connect += 1,
+                    _ => stats.errors_read += 1,
+                }
             }
         }
         first_connect = false;
     }
     (stats, first_ttfb, reconnect_gaps)
-}
-
-enum SessionErr {
-    Connect,
-    Read,
 }
 
 struct SessionOutcome {
@@ -338,34 +340,39 @@ fn run_one_session(
     stop: &AtomicBool,
     expected_prior_id: Option<&str>,
     tls_config: Option<&Arc<ClientConfig>>,
-) -> Result<SessionOutcome, SessionErr> {
-    let addr = target.resolve(opts).map_err(|_| SessionErr::Connect)?;
-    let mut poll = Poll::new().map_err(|_| SessionErr::Connect)?;
+) -> Result<SessionOutcome, TransportError> {
+    let addr = target
+        .resolve(opts)
+        .map_err(|_| TransportError::Connect("dns".into()))?;
+    let mut poll = Poll::new().map_err(|e| TransportError::Connect(e.to_string()))?;
     let mut events = Events::with_capacity(4);
-    let mut tcp = MioTcp::connect(addr).map_err(|_| SessionErr::Connect)?;
+    let mut tcp =
+        MioTcp::connect(addr).map_err(|e| TransportError::Connect(e.to_string()))?;
     let _ = tcp.set_nodelay(true);
     poll.registry()
         .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
-        .map_err(|_| SessionErr::Connect)?;
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
     wait_for(&mut poll, &mut events, opts.connect_timeout, |e| {
         e.token() == POLL_TOKEN && e.is_writable()
     })
-    .map_err(|_| SessionErr::Connect)?;
-    if tcp.peer_addr().is_err() {
-        return Err(SessionErr::Connect);
+    .map_err(|e| TransportError::Connect(e.to_string()))?;
+    if let Err(e) = tcp.peer_addr() {
+        return Err(TransportError::Connect(e.to_string()));
     }
     let mut stream = if target.tls {
-        let cfg = tls_config.ok_or(SessionErr::Connect)?;
+        let cfg = tls_config
+            .ok_or_else(|| TransportError::Tls("tls config missing".into()))?;
         let sni = target.sni_name().to_string();
         let tls = crate::http::mio_tls::MioTlsStream::new(tcp, Arc::clone(cfg), &sni)
-            .map_err(|_| SessionErr::Connect)?;
+            .map_err(|e| TransportError::Tls(e.to_string()))?;
         let mut s = MioStream::Tls(tls);
         let hs_start = Instant::now();
         while s.is_handshaking() {
             if hs_start.elapsed() > Duration::from_secs(5) {
-                return Err(SessionErr::Connect);
+                return Err(TransportError::Timeout);
             }
-            s.drive_tls_io().map_err(|_| SessionErr::Connect)?;
+            s.drive_tls_io()
+                .map_err(|e| TransportError::Tls(format!("handshake: {e}")))?;
             if !s.is_handshaking() {
                 break;
             }
@@ -380,15 +387,19 @@ fn run_one_session(
     let mut write_pos = 0;
     while write_pos < request.len() {
         match stream.write(&request[write_pos..]) {
-            Ok(0) => return Err(SessionErr::Connect),
+            Ok(0) => {
+                return Err(TransportError::Write(
+                    "peer closed during request write".into(),
+                ))
+            }
             Ok(n) => write_pos += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 wait_for(&mut poll, &mut events, opts.request_timeout, |e| {
                     e.token() == POLL_TOKEN && e.is_writable()
                 })
-                .map_err(|_| SessionErr::Connect)?;
+                .map_err(|_| TransportError::Timeout)?;
             }
-            Err(_) => return Err(SessionErr::Connect),
+            Err(e) => return Err(TransportError::Write(e.to_string())),
         }
     }
     let t_sent = Instant::now();
@@ -475,8 +486,8 @@ fn run_one_session(
                     (deadline - now).min(Duration::from_millis(100));
                 let _ = poll.poll(&mut events, Some(budget));
             }
-            Err(_) => {
-                return Err(SessionErr::Read);
+            Err(e) => {
+                return Err(TransportError::Read(e.to_string()));
             }
         }
     }

@@ -34,6 +34,7 @@ use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_runtime::transport::{classify, TransportError};
 use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use crate::http::mio_tls::{MioStream, MioTlsStream};
@@ -305,7 +306,7 @@ fn run_worker(
                 ctx.clear_all();
             }
             Err(e) => {
-                let kind = classify_err(&e);
+                let kind = classify(&e);
                 Recorder::new(&mut task, live).record_error(scenario_id, kind);
             }
         }
@@ -326,61 +327,6 @@ struct OpOutcome {
     /// headers. Fed to `apply_extractions` so the scenario's
     /// `.extract_header(...)` slots get populated.
     extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-// ARCH(error-unify): replace with zerobench_runtime::TransportError.
-// Every backend's op-level error becomes one shared type; runtime's
-// classify() is the single mapping to ErrorKind. See ARCH-REVIEW §4.7.
-/// Categorised errors from a single cold-connect op.
-///
-/// Each hard-failure variant carries enough context (the underlying
-/// `io::Error` for transport failures, a free-form TLS message) that a
-/// downstream error-classification dashboard can tell "connection
-/// refused" from "DNS timeout" from "SNI mismatch" without guessing.
-/// Today only the ErrorKind category is surfaced upstream via
-/// `TaskStats`, but `Display` is implemented so dropped-op diagnostics
-/// can log the detail.
-#[derive(Debug)]
-enum ColdErr {
-    /// TCP connect failed (refused, unreachable, socket error).
-    ConnectIo(io::Error),
-    /// TLS construction or handshake failed. Carries a message rather
-    /// than a typed rustls error so callers don't take a dep on
-    /// rustls just to match.
-    Tls(String),
-    /// Raw socket write failed mid-request.
-    Write(io::Error),
-    /// Raw socket read failed mid-response.
-    Read(io::Error),
-    /// Response headers didn't parse as HTTP/1.
-    BadResponse(&'static str),
-    /// Wall-clock deadline elapsed waiting for connect / handshake /
-    /// read / write.
-    Timeout,
-}
-
-impl std::fmt::Display for ColdErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ColdErr::ConnectIo(e) => write!(f, "connect: {e}"),
-            ColdErr::Tls(m) => write!(f, "tls: {m}"),
-            ColdErr::Write(e) => write!(f, "write: {e}"),
-            ColdErr::Read(e) => write!(f, "read: {e}"),
-            ColdErr::BadResponse(m) => write!(f, "bad response: {m}"),
-            ColdErr::Timeout => write!(f, "timeout"),
-        }
-    }
-}
-
-fn classify_err(e: &ColdErr) -> ErrorKind {
-    match e {
-        // TLS failures are client-visible "I couldn't establish the
-        // connection" events, i.e. connect-class for ErrorCounters.
-        ColdErr::ConnectIo(_) | ColdErr::Tls(_) => ErrorKind::Connect,
-        ColdErr::Write(_) => ErrorKind::Write,
-        ColdErr::Read(_) | ColdErr::BadResponse(_) => ErrorKind::Read,
-        ColdErr::Timeout => ErrorKind::Timeout,
-    }
 }
 
 /// RAII guard that deregisters a stream from mio's registry on drop.
@@ -434,11 +380,11 @@ fn do_one_op(
     opts: &TransportOpts,
     req_plan: &RequestPlan,
     tls_config: Option<&Arc<ClientConfig>>,
-) -> Result<OpOutcome, ColdErr> {
+) -> Result<OpOutcome, TransportError> {
     let connect_start = Instant::now();
 
     // --- TCP connect (no registration yet) ---
-    let tcp = MioTcp::connect(addr).map_err(ColdErr::ConnectIo)?;
+    let tcp = MioTcp::connect(addr).map_err(|e| TransportError::Connect(e.to_string()))?;
     let _ = tcp.set_nodelay(true);
 
     // --- TLS wrap BEFORE registration ---
@@ -449,14 +395,14 @@ fn do_one_op(
     // before the guard arms, no mio registration exists.
     let stream = if target.tls {
         let config = tls_config.ok_or_else(|| {
-            ColdErr::Tls(
+            TransportError::Tls(
                 "https:// target but no TLS config was provided by the caller"
                     .into(),
             )
         })?;
         let sni = target.sni_name().to_string();
         let tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
-            .map_err(|e| ColdErr::Tls(format!("init: {e}")))?;
+            .map_err(|e| TransportError::Tls(format!("init: {e}")))?;
         MioStream::Tls(tls)
     } else {
         MioStream::Plain(tcp)
@@ -471,11 +417,11 @@ fn do_one_op(
     let registry = poll
         .registry()
         .try_clone()
-        .map_err(ColdErr::ConnectIo)?;
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
     let mut guard = StreamGuard::new(registry, stream);
     guard
         .register(POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
-        .map_err(ColdErr::ConnectIo)?;
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
     guard.arm();
 
     // Wait for writable (TCP connect done).
@@ -485,9 +431,9 @@ fn do_one_op(
         opts.connect_timeout,
         |ev| ev.token() == POLL_TOKEN && ev.is_writable(),
     )
-    .map_err(ColdErr::ConnectIo)?;
+    .map_err(|e| TransportError::Connect(e.to_string()))?;
     if let Err(e) = guard.stream_mut().tcp_stream_mut().peer_addr() {
-        return Err(ColdErr::ConnectIo(e));
+        return Err(TransportError::Connect(e.to_string()));
     }
 
     // Drive TLS handshake to completion.
@@ -496,17 +442,17 @@ fn do_one_op(
         let hs_start = Instant::now();
         while guard.stream_mut().is_handshaking() {
             if hs_start.elapsed() > hs_deadline {
-                return Err(ColdErr::Timeout);
+                return Err(TransportError::Timeout);
             }
             guard
                 .stream_mut()
                 .drive_tls_io()
-                .map_err(|e| ColdErr::Tls(format!("handshake: {e}")))?;
+                .map_err(|e| TransportError::Tls(format!("handshake: {e}")))?;
             if !guard.stream_mut().is_handshaking() {
                 break;
             }
             poll.poll(events, Some(Duration::from_millis(200)))
-                .map_err(ColdErr::ConnectIo)?;
+                .map_err(|e| TransportError::Connect(e.to_string()))?;
         }
     }
 
@@ -519,25 +465,23 @@ fn do_one_op(
     // until `request_timeout` for every op. The builder emits
     // `Connection: close` directly; a user-provided Connection
     // header (e.g. `upgrade` for WS handshakes) wins.
-    build_raw_request(req_plan, ctx, target, ConnectionMode::Close, req_buf)
-        .map_err(|e| ColdErr::Write(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
+    build_raw_request(req_plan, ctx, target, ConnectionMode::Close, req_buf)?;
     let mut write_pos = 0;
     while write_pos < req_buf.len() {
         match guard.stream_mut().write(&req_buf[write_pos..]) {
             Ok(0) => {
-                return Err(ColdErr::Write(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "peer closed during request write",
-                )))
+                return Err(TransportError::Write(
+                    "peer closed during request write".into(),
+                ))
             }
             Ok(n) => write_pos += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 wait_for(poll, events, opts.request_timeout, |ev| {
                     ev.token() == POLL_TOKEN && ev.is_writable()
                 })
-                .map_err(|_| ColdErr::Timeout)?;
+                .map_err(|_| TransportError::Timeout)?;
             }
-            Err(e) => return Err(ColdErr::Write(e)),
+            Err(e) => return Err(TransportError::Write(e.to_string())),
         }
     }
     let request_bytes = req_buf.len() as u64;
@@ -557,14 +501,14 @@ fn do_one_op(
     let read_deadline = Instant::now() + opts.request_timeout;
     loop {
         if Instant::now() >= read_deadline {
-            return Err(ColdErr::Timeout);
+            return Err(TransportError::Timeout);
         }
         match guard.stream_mut().read(&mut scratch) {
             Ok(0) => {
                 // EOF — if we haven't parsed headers, that's a read error.
                 if header_end.is_none() {
-                    return Err(ColdErr::BadResponse(
-                        "EOF before response headers received",
+                    return Err(TransportError::Protocol(
+                        "EOF before response headers received".into(),
                     ));
                 }
                 // Otherwise EOF after headers is valid Connection: close.
@@ -601,8 +545,8 @@ fn do_one_op(
                                 captured_headers = capture_headers(&resp);
                             }
                             _ => {
-                                return Err(ColdErr::BadResponse(
-                                    "malformed HTTP/1 response headers",
+                                return Err(TransportError::Protocol(
+                                    "malformed HTTP/1 response headers".into(),
                                 ))
                             }
                         }
@@ -620,14 +564,14 @@ fn do_one_op(
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let left = read_deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(ColdErr::Timeout);
+                    return Err(TransportError::Timeout);
                 }
                 wait_for(poll, events, left, |ev| {
                     ev.token() == POLL_TOKEN && ev.is_readable()
                 })
-                .map_err(|_| ColdErr::Timeout)?;
+                .map_err(|_| TransportError::Timeout)?;
             }
-            Err(e) => return Err(ColdErr::Read(e)),
+            Err(e) => return Err(TransportError::Read(e.to_string())),
         }
     }
 

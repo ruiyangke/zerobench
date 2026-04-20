@@ -39,6 +39,7 @@ use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use rand::SeedableRng;
 use zerobench_core::BenchRng;
+use zerobench_runtime::transport::TransportError;
 use zerobench_runtime::Recorder;
 
 use crate::ws::conn::{DataFrame, WsConnection, WsError};
@@ -231,31 +232,28 @@ fn run_one_echo_rtt(
                     bytes as u64,
                 );
             }
-            Err(RecvErr::Timeout) => {
+            Err(TransportError::Timeout) => {
                 // Deadline fired while waiting for echo — stop cleanly.
                 break;
             }
-            Err(RecvErr::Transport) => {
-                stats.errors_read += 1;
-                break;
-            }
-            Err(RecvErr::ProtocolMismatch) => {
+            Err(TransportError::Protocol(_)) => {
                 // Got a frame but prefix didn't match — likely a
                 // server-push message. Count as read-error for now;
                 // a future strategy (first_text_frame) tolerates this.
                 stats.errors_read += 1;
+            }
+            Err(_) => {
+                // Any other transport error (Read/Write/Connect/Tls/
+                // RequestBuild) is fatal for this connection — record
+                // and exit.
+                stats.errors_read += 1;
+                break;
             }
         }
     }
 
     let _ = conn.close(1000, "bye");
     stats
-}
-
-enum RecvErr {
-    Timeout,
-    Transport,
-    ProtocolMismatch,
 }
 
 /// What an inbound frame must satisfy to be considered an echo for
@@ -284,16 +282,16 @@ fn recv_matching(
     key: &MatchKey,
     deadline: Instant,
     stop: &AtomicBool,
-) -> Result<usize, RecvErr> {
+) -> Result<usize, TransportError> {
     // Try up to 100 frames before giving up — guards against server
     // pushing unrelated frames ahead of our echo.
     for _ in 0..100 {
         if stop.load(Ordering::Relaxed) {
-            return Err(RecvErr::Timeout);
+            return Err(TransportError::Timeout);
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(RecvErr::Timeout);
+            return Err(TransportError::Timeout);
         }
         // Use try_recv so the underlying socket read respects the
         // remaining deadline budget. Previously `conn.recv()` could
@@ -331,18 +329,18 @@ fn recv_matching(
             }
             Ok(None) => {
                 // Deadline reached with no frame in hand.
-                return Err(RecvErr::Timeout);
+                return Err(TransportError::Timeout);
             }
             Err(WsError::Closed { .. }) => {
                 // Server closed cleanly (Close handshake). Treat as
                 // timeout so the outer loop exits without flagging a
                 // transport error — the connection is simply gone.
-                return Err(RecvErr::Timeout);
+                return Err(TransportError::Timeout);
             }
-            Err(_) => return Err(RecvErr::Transport),
+            Err(e) => return Err(TransportError::Read(format!("{e:?}"))),
         }
     }
-    Err(RecvErr::ProtocolMismatch)
+    Err(TransportError::Protocol("echo mismatch".into()))
 }
 
 fn write_hex16(v: u64, out: &mut Vec<u8>) {
