@@ -564,11 +564,11 @@ fn run_script_sync(
     use zerobench_core::template::Template;
     use zerobench_core::transport::TransportOpts;
 
-    let zerobench_rhai::LoadedScript {
+    let zerobench_dsl::LoadedScript {
         mut plan,
         target,
         http_version: _,
-    } = zerobench_rhai::load_script(&args.script)?;
+    } = zerobench_dsl::load_script(&args.script)?;
 
     if let Some(d) = args.duration {
         plan.duration = d;

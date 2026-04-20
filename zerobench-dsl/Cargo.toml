@@ -1,6 +1,6 @@
 [package]
-name = "zerobench-rhai"
-description = "Rhai plan-builder for zerobench — compile-time scenario DSL"
+name = "zerobench-dsl"
+description = "Script-driven plan construction for zerobench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

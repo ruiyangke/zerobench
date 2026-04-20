@@ -10,7 +10,7 @@ use http::Method;
 use std::path::PathBuf;
 
 use zerobench_core::plan::{RateProfile, Step};
-use zerobench_rhai::{load_script, load_script_str, ScriptError};
+use zerobench_dsl::{load_script, load_script_str, ScriptError};
 
 /// Resolve `examples/NAME` against the workspace root. `CARGO_MANIFEST_DIR`
 /// points at this crate, so we walk up one level.

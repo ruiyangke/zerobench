@@ -830,7 +830,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 // ARCH(builder-unify): ~200 LoC of per-protocol plan construction duplicated
-// with zerobench-rhai/src/builders.rs. Target: one typed PlanBuilder per
+// with zerobench-dsl/src/builders.rs. Target: one typed PlanBuilder per
 // *Plan struct, called by BOTH this CLI translator AND the Rhai DSL —
 // see ARCH-REVIEW §4.5, §B5.
 fn build_measure_plan(
