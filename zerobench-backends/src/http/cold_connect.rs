@@ -34,7 +34,7 @@ use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_runtime::LiveSnapshot;
+use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use crate::http::mio_tls::{MioStream, MioTlsStream};
 use crate::http::raw_h1_common::{
@@ -255,25 +255,19 @@ fn run_worker(
                 // This is the meaningful signal for cold-connect: the server's
                 // accept + TLS + first-write latency together.
                 let full_ttfb = outcome.handshake + outcome.ttfb;
-                // ARCH(recorder): collapses to
-                //     recorder.record(sid, Sample { latency: total, ttfb: full_ttfb,
-                //                                   bytes_sent, bytes_recv });
-                // Kills the triple-record pattern. See ARCH-REVIEW §4.3.
-                task.record(
-                    scenario_id,
-                    total,
-                    full_ttfb,
-                    outcome.request_bytes,
-                    outcome.response_bytes,
-                );
-                if let Some(live) = live {
-                    let ns = total.as_nanos() as u64;
-                    live.record(ns, outcome.request_bytes, outcome.response_bytes);
-                    live.record_scenario(
+                {
+                    // Scope the recorder so its `&mut task` borrow is released
+                    // before the error-path blocks below (which still use
+                    // `&mut task` directly — see note below).
+                    let mut recorder = Recorder::new(&mut task, live);
+                    recorder.record(
                         scenario_id,
-                        ns,
-                        outcome.request_bytes,
-                        outcome.response_bytes,
+                        Sample {
+                            latency: total,
+                            ttfb: full_ttfb,
+                            bytes_sent: outcome.request_bytes,
+                            bytes_recv: outcome.response_bytes,
+                        },
                     );
                 }
                 // Classify 4xx/5xx.

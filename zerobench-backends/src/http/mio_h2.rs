@@ -57,7 +57,7 @@ use zerobench_core::plan::{Plan, Protocol, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_runtime::LiveSnapshot;
+use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use super::mio_tls::{MioStream, MioTlsStream};
 
@@ -268,8 +268,7 @@ impl H2Conn {
         &mut self,
         cx: &mut Context<'_>,
         now: Instant,
-        stats: &mut TaskStats,
-        live: Option<&LiveSnapshot>,
+        recorder: &mut Recorder<'_>,
         request_plan: &zerobench_core::plan::RequestPlan,
         ctx: &mut zerobench_core::scenario_context::ScenarioContext,
     ) -> bool {
@@ -322,11 +321,7 @@ impl H2Conn {
                         let sid = self.streams[i].scenario_id;
                         self.streams.swap_remove(i);
                         self.idle_slots += 1;
-                        stats.record_error(sid, ErrorKind::Read);
-                        if let Some(l) = live {
-                            l.record_error(ErrorKind::Read);
-                            l.record_scenario_error(sid, ErrorKind::Read);
-                        }
+                        recorder.record_error(sid, ErrorKind::Read);
                         continue;
                     }
                     Poll::Pending => {
@@ -372,30 +367,24 @@ impl H2Conn {
                 let sid = stream.scenario_id;
                 let bs = stream.request_bytes;
                 let br = stream.response_bytes;
-                // ARCH(recorder): triple-record site — see ARCH-REVIEW §4.3.
-                stats.record(sid, co_free_latency, ttfb, bs, br);
-                if let Some(l) = live {
-                    let lat_ns = co_free_latency.as_nanos() as u64;
-                    l.record(lat_ns, bs, br);
-                    l.record_scenario(sid, lat_ns, bs, br);
-                }
+                recorder.record(
+                    sid,
+                    Sample {
+                        latency: co_free_latency,
+                        ttfb,
+                        bytes_sent: bs,
+                        bytes_recv: br,
+                    },
+                );
                 // 4xx/5xx classification + user assertions +
                 // extractions. Identical semantics to the mio_h1 +
                 // cold_connect paths so `.expect_status(...)` /
                 // `.extract_header(...)` from the DSL behave the
                 // same under `--http-version h2`.
                 if (400..500).contains(&stream.status) {
-                    stats.record_error(sid, ErrorKind::Status4xx);
-                    if let Some(l) = live {
-                        l.record_error(ErrorKind::Status4xx);
-                        l.record_scenario_error(sid, ErrorKind::Status4xx);
-                    }
+                    recorder.record_error(sid, ErrorKind::Status4xx);
                 } else if (500..600).contains(&stream.status) {
-                    stats.record_error(sid, ErrorKind::Status5xx);
-                    if let Some(l) = live {
-                        l.record_error(ErrorKind::Status5xx);
-                        l.record_scenario_error(sid, ErrorKind::Status5xx);
-                    }
+                    recorder.record_error(sid, ErrorKind::Status5xx);
                 }
                 let assertion_failures = crate::http::raw_h1_common::check_assertions(
                     request_plan,
@@ -403,11 +392,7 @@ impl H2Conn {
                     co_free_latency,
                 );
                 for _ in 0..assertion_failures {
-                    stats.record_error(sid, ErrorKind::AssertionFailed);
-                    if let Some(l) = live {
-                        l.record_error(ErrorKind::AssertionFailed);
-                        l.record_scenario_error(sid, ErrorKind::AssertionFailed);
-                    }
+                    recorder.record_error(sid, ErrorKind::AssertionFailed);
                 }
                 crate::http::raw_h1_common::apply_extractions(
                     request_plan,
@@ -540,16 +525,6 @@ pub fn run_mio_h2_worker(
         return stats;
     }
 
-    // Helper: record error to both TaskStats and LiveSnapshot (if present).
-    #[inline(always)]
-    fn err(stats: &mut TaskStats, live: Option<&LiveSnapshot>, scenario_id: u16, kind: ErrorKind) {
-        stats.record_error(scenario_id, kind);
-        if let Some(l) = live {
-            l.record_error(kind);
-            l.record_scenario_error(scenario_id, kind);
-        }
-    }
-
     fn pick_scenario(http_indices: &[usize], ctx: &mut ScenarioContext) -> usize {
         if http_indices.len() <= 1 {
             http_indices[0]
@@ -563,7 +538,9 @@ pub fn run_mio_h2_worker(
     let mut tcp = match connect_with_retry(target, opts) {
         Ok((s, _)) => s,
         Err(_) => {
-            err(&mut stats, live, 0, ErrorKind::Connect);
+            // Scope the Recorder so its `&mut stats` borrow drops
+            // before the early `return stats;` below.
+            Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
             return stats;
         }
     };
@@ -580,7 +557,7 @@ pub fn run_mio_h2_worker(
         let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), sni_name) {
             Ok(s) => s,
             Err(_) => {
-                err(&mut stats, live, 0, ErrorKind::Connect);
+                Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
                 return stats;
             }
         };
@@ -588,7 +565,7 @@ pub fn run_mio_h2_worker(
             .complete_handshake(&mut poll, token, opts.connect_timeout)
             .is_err()
         {
-            err(&mut stats, live, 0, ErrorKind::Connect);
+            Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
             return stats;
         }
         // Re-register after handshake: mio uses edge-triggered epoll
@@ -615,7 +592,7 @@ pub fn run_mio_h2_worker(
     let (send_request, connection) = match handshake_blocking(adapter, &mut poll, &mut events, &waker) {
         Ok(pair) => pair,
         Err(_) => {
-            err(&mut stats, live, 0, ErrorKind::Connect);
+            Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
             return stats;
         }
     };
@@ -638,6 +615,10 @@ pub fn run_mio_h2_worker(
             _ => None,
         })
         .expect("mio-h2 HTTP scenario must contain at least one Request step");
+
+    // Unified sink for the main loop — every completed op or error
+    // fans out to both TaskStats and LiveSnapshot through one call.
+    let mut recorder = Recorder::new(&mut stats, live);
 
     // Token scheduling (same as H1).
     let open_loop = target_rps.is_some();
@@ -671,7 +652,7 @@ pub fn run_mio_h2_worker(
             // Cap the queue — excess tokens are keepup drops.
             while pending_tokens.len() > max_pending {
                 pending_tokens.pop_front();
-                err(&mut stats, live, 0, ErrorKind::Keepup);
+                recorder.record_error(0, ErrorKind::Keepup);
             }
         }
 
@@ -712,14 +693,13 @@ pub fn run_mio_h2_worker(
         let alive = h2.poll_progress(
             &mut cx,
             batch_now,
-            &mut stats,
-            live,
+            &mut recorder,
             &request_plan_for_assertions,
             &mut ctx,
         );
         if !alive {
             // Connection died — record error and exit.
-            err(&mut stats, live, 0, ErrorKind::Read);
+            recorder.record_error(0, ErrorKind::Read);
             break;
         }
 
@@ -751,6 +731,8 @@ pub fn run_mio_h2_worker(
         }
     }
 
+    // Drop the recorder so `stats` is no longer borrowed.
+    drop(recorder);
     stats
 }
 

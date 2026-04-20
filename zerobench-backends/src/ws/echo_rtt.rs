@@ -39,6 +39,7 @@ use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use rand::SeedableRng;
 use zerobench_core::BenchRng;
+use zerobench_runtime::Recorder;
 
 use crate::ws::conn::{DataFrame, WsConnection, WsError};
 
@@ -94,6 +95,11 @@ fn run_one_echo_rtt(
     scenario_id: u16,
 ) -> ConnStats {
     let mut stats = ConnStats::new();
+
+    // Cross-cutting live-snapshot sink. `stats.rtt` is the subscriber-
+    // local RTT histogram and stays inline below — the Recorder only
+    // owns the live-snapshot fan-out (there's no TaskStats here).
+    let mut recorder = Recorder::live_only(live);
 
     // Derive path from the plan's URL template (static for now).
     let path = extract_ws_path(&plan.url);
@@ -212,23 +218,18 @@ fn run_one_echo_rtt(
             Ok(bytes) => {
                 let rtt = Instant::now().saturating_duration_since(intended_start);
                 let rtt_ns = duration_to_hist_ns(rtt);
-                // ARCH(recorder): triple-record (rtt histogram + live aggregate
-                // + live scenario). Collapses to recorder.record(sid, Sample{..}).
-                // See ARCH-REVIEW §4.3.
+                // Subscriber-local RTT histogram — protocol-specific,
+                // stays inline. Live-snapshot aggregate + per-scenario
+                // writes go through the recorder below.
                 let _ = stats.rtt.record(rtt_ns);
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(bytes as u64);
-                if let Some(live) = live {
-                    // Each matched echo is one op; latency = RTT.
-                    let blen = bytes as u64;
-                    live.record(rtt_ns, send_buf.len() as u64, blen);
-                    live.record_scenario(
-                        scenario_id,
-                        rtt_ns,
-                        send_buf.len() as u64,
-                        blen,
-                    );
-                }
+                recorder.record_ns(
+                    scenario_id,
+                    rtt_ns,
+                    send_buf.len() as u64,
+                    bytes as u64,
+                );
             }
             Err(RecvErr::Timeout) => {
                 // Deadline fired while waiting for echo — stop cleanly.

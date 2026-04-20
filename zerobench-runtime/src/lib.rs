@@ -11,6 +11,7 @@
 //!   - [`json_scan`]     — byte-level JSON field lookup (used by fanout Timestamp mode)
 //!   - [`live_snapshot`] — sharded HDR histogram + counters, read per-tick by TUI
 //!   - [`machine`]       — host fingerprint (CPU, RAM, OS) captured once per run
+//!   - [`recorder`]      — fans one op out to TaskStats + LiveSnapshot (§4.3)
 //!   - [`stop`]          — shared stop-flag primitive
 //!   - [`tls`]           — shared rustls `ClientConfig` builder
 //!   - [`transport`]     — runtime error taxonomy (`TransportError`)
@@ -28,6 +29,7 @@ pub mod fingerprint;
 pub mod json_scan;
 pub mod live_snapshot;
 pub mod machine;
+pub mod recorder;
 pub mod stop;
 pub mod tls;
 pub mod transport;
@@ -43,6 +45,7 @@ pub use fingerprint::{
 pub use json_scan::find_json_u64_field;
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use machine::MachineFingerprint;
+pub use recorder::{Recorder, Sample};
 pub use stop::StopSignal;
 pub use tls::tls_client_config;
 pub use transport::TransportError;

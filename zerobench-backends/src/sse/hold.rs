@@ -32,6 +32,7 @@ use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_
 use zerobench_core::plan::{Plan, Protocol, SseHoldPlan, Step};
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_runtime::Recorder;
 use crate::http::mio_tls::{MioStream, MioTlsStream};
 
 use crate::sse::line_parser::{SseEvent, SseLineParser};
@@ -179,7 +180,7 @@ fn create_subscriber(
 fn drive_subscriber(
     sub: &mut Subscriber,
     request: &[u8],
-    live: Option<&zerobench_runtime::LiveSnapshot>,
+    recorder: &mut Recorder<'_>,
     scenario_id: u16,
 ) -> DriveOutcome {
     loop {
@@ -269,7 +270,7 @@ fn drive_subscriber(
                             sub.pre_body.clear();
                             sub.state = SubState::ReadingBody;
                             if !body_tail.is_empty() {
-                                feed_body(sub, &body_tail, live, scenario_id);
+                                feed_body(sub, &body_tail, recorder, scenario_id);
                             }
                         }
                         // Loop again — more header bytes may already
@@ -292,7 +293,7 @@ fn drive_subscriber(
                     Ok(n) => {
                         sub.stats.bytes_received =
                             sub.stats.bytes_received.saturating_add(n as u64);
-                        feed_body(sub, &buf[..n], live, scenario_id);
+                        feed_body(sub, &buf[..n], recorder, scenario_id);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         return DriveOutcome::Alive;
@@ -329,7 +330,7 @@ fn drive_subscriber(
 fn feed_body(
     sub: &mut Subscriber,
     input: &[u8],
-    live: Option<&zerobench_runtime::LiveSnapshot>,
+    recorder: &mut Recorder<'_>,
     scenario_id: u16,
 ) {
     let mut decoded: Vec<u8> = Vec::with_capacity(input.len());
@@ -352,16 +353,12 @@ fn feed_body(
             }
             *last_event_at = Some(now);
             stats.events = stats.events.saturating_add(1);
-            // ARCH(recorder): double-record site (SSE has no TaskStats
-            // write here — stats.events is per-subscriber; live is the
-            // cross-cutting one). Collapses when Recorder gains an
-            // `observe(sid, sample)` mode for count-only observations.
-            // See ARCH-REVIEW §4.3.
-            if let Some(live) = live {
-                let blen = payload.len() as u64;
-                live.record(gap_ns, 0, blen);
-                live.record_scenario(scenario_id, gap_ns, 0, blen);
-            }
+            // The subscriber-local `stats.event_gap` histogram above is
+            // protocol-local and stays inline. Only the cross-cutting
+            // live-snapshot writes go through the recorder (live_only
+            // — SSE has no TaskStats slot per subscriber).
+            let blen = payload.len() as u64;
+            recorder.record_ns(scenario_id, gap_ns, 0, blen);
         }
         SseEvent::Done => {
             // PHILOSOPHY §4.3 SseHold: do NOT terminate on [DONE].
@@ -598,6 +595,12 @@ fn run_hold_scenario(
     let request = build_hold_request(target, hold_plan);
     let n_subs = hold_plan.subscribers.max(1) as usize;
 
+    // SSE has no TaskStats at the subscriber level — stats.events /
+    // stats.event_gap are per-subscriber histograms folded into the
+    // rollup below. The Recorder exists solely to fan cross-cutting
+    // live-snapshot writes through one call site.
+    let mut recorder = Recorder::live_only(live);
+
     let mut rollup = ScenarioRollup {
         ttfb: new_hist(),
         event_gap: new_hist(),
@@ -694,7 +697,7 @@ fn run_hold_scenario(
             }
 
             if let DriveOutcome::Dead =
-                drive_subscriber(sub, &request, live, scenario_id)
+                drive_subscriber(sub, &request, &mut recorder, scenario_id)
             {
                 sub.state = SubState::Dead;
                 alive -= 1;

@@ -72,7 +72,7 @@ use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_runtime::LiveSnapshot;
+use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use super::mio_tls::{MioStream, MioTlsStream};
 use super::raw_h1_common::{
@@ -549,20 +549,9 @@ pub fn run_mio_worker(
     // Per-worker ScenarioContext for template expansion + extraction.
     let mut ctx = ScenarioContext::new(plan.vars.len(), zerobench_core::rng::from_entropy());
 
-    // Helper: record error to both TaskStats and LiveSnapshot (if present).
-    #[inline(always)]
-    fn err(
-        stats: &mut TaskStats,
-        live: Option<&LiveSnapshot>,
-        scenario_id: u16,
-        kind: ErrorKind,
-    ) {
-        stats.record_error(scenario_id, kind);
-        if let Some(l) = live {
-            l.record_error(kind);
-            l.record_scenario_error(scenario_id, kind);
-        }
-    }
+    // Unified sink — one call per op fans out to TaskStats + LiveSnapshot
+    // + per-scenario live slot. Kills the former triple-record antipattern.
+    let mut recorder = Recorder::new(&mut stats, live);
 
     // --- Static fast-path detection ---
     // When every scenario is a single static request with no extractions
@@ -636,7 +625,7 @@ pub fn run_mio_worker(
         let mut tcp = match connect_with_retry(target, opts) {
             Ok((s, _)) => s,
             Err(_) => {
-                err(&mut stats, live, 0, ErrorKind::Connect);
+                recorder.record_error(0, ErrorKind::Connect);
                 continue;
             }
         };
@@ -657,7 +646,7 @@ pub fn run_mio_worker(
             let mut tls_stream = match MioTlsStream::new(tcp, Arc::clone(config), &sni_name) {
                 Ok(s) => s,
                 Err(_) => {
-                    err(&mut stats, live, 0, ErrorKind::Connect);
+                    recorder.record_error(0, ErrorKind::Connect);
                     continue;
                 }
             };
@@ -670,7 +659,7 @@ pub fn run_mio_worker(
                 .complete_handshake(&mut poll, Token(i), opts.connect_timeout)
                 .is_err()
             {
-                err(&mut stats, live, 0, ErrorKind::Connect);
+                recorder.record_error(0, ErrorKind::Connect);
                 continue;
             }
             // Re-register after handshake: mio uses edge-triggered epoll
@@ -735,7 +724,7 @@ pub fn run_mio_worker(
             // Cap the queue — excess tokens are keepup drops.
             while pending_tokens.len() > max_pending {
                 pending_tokens.pop_front();
-                err(&mut stats, live, 0, ErrorKind::Keepup);
+                recorder.record_error(0, ErrorKind::Keepup);
             }
         }
 
@@ -753,7 +742,7 @@ pub fn run_mio_worker(
                         Ok(false) => {}
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
+                            recorder.record_error(sel.scenario_id, ErrorKind::Write);
                         }
                     }
                 } else {
@@ -807,7 +796,7 @@ pub fn run_mio_worker(
                         Ok(false) => {} // would-block
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            err(&mut stats, live, conn.scenario_id, ErrorKind::Write);
+                            recorder.record_error(conn.scenario_id, ErrorKind::Write);
                         }
                     },
                     ConnState::Idle if !open_loop => {
@@ -830,7 +819,7 @@ pub fn run_mio_worker(
                             Ok(false) => {}
                             Err(_) => {
                                 conn.state = ConnState::Dead;
-                                err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
+                                recorder.record_error(sel.scenario_id, ErrorKind::Write);
                             }
                         }
                     }
@@ -858,22 +847,21 @@ pub fn run_mio_worker(
 
                         // --- Status-class error tracking ---
                         if (400..500).contains(&status) {
-                            err(&mut stats, live, scenario_id, ErrorKind::Status4xx);
+                            recorder.record_error(scenario_id, ErrorKind::Status4xx);
                         } else if (500..600).contains(&status) {
-                            err(&mut stats, live, scenario_id, ErrorKind::Status5xx);
+                            recorder.record_error(scenario_id, ErrorKind::Status5xx);
                         }
 
                         // --- Record stats ---
-                        // ARCH(recorder): triple-record site — collapses to
-                        //   recorder.record(sid, Sample { latency: co_free_latency,
-                        //                                 ttfb, bytes_sent, bytes_recv });
-                        // See ARCH-REVIEW §4.3.
-                        stats.record(scenario_id, co_free_latency, ttfb, bytes_sent, bytes_recv);
-                        if let Some(live) = live {
-                            let lat_ns = co_free_latency.as_nanos() as u64;
-                            live.record(lat_ns, bytes_sent, bytes_recv);
-                            live.record_scenario(scenario_id, lat_ns, bytes_sent, bytes_recv);
-                        }
+                        recorder.record(
+                            scenario_id,
+                            Sample {
+                                latency: co_free_latency,
+                                ttfb,
+                                bytes_sent,
+                                bytes_recv,
+                            },
+                        );
 
                         // --- Apply extractions + assertions (skip in static fast path) ---
                         if !use_static {
@@ -897,7 +885,7 @@ pub fn run_mio_worker(
                             let assertion_failures =
                                 check_assertions(request_plan, status, co_free_latency);
                             for _ in 0..assertion_failures {
-                                err(&mut stats, live, scenario_id, ErrorKind::AssertionFailed);
+                                recorder.record_error(scenario_id, ErrorKind::AssertionFailed);
                             }
 
                             ctx.clear_all();
@@ -920,9 +908,7 @@ pub fn run_mio_worker(
                                     Ok(false) => {}
                                     Err(_) => {
                                         conn.state = ConnState::Dead;
-                                        err(
-                                            &mut stats,
-                                            live,
+                                        recorder.record_error(
                                             sel.scenario_id,
                                             ErrorKind::Write,
                                         );
@@ -935,7 +921,7 @@ pub fn run_mio_worker(
                     Err(_) => {
                         let scenario_id = conn.scenario_id;
                         conn.state = ConnState::Dead;
-                        err(&mut stats, live, scenario_id, ErrorKind::Read);
+                        recorder.record_error(scenario_id, ErrorKind::Read);
                     }
                 }
             }
@@ -958,7 +944,7 @@ pub fn run_mio_worker(
                         Ok(false) => {}
                         Err(_) => {
                             conn.state = ConnState::Dead;
-                            err(&mut stats, live, sel.scenario_id, ErrorKind::Write);
+                            recorder.record_error(sel.scenario_id, ErrorKind::Write);
                         }
                     }
                 } else {
@@ -968,6 +954,8 @@ pub fn run_mio_worker(
         }
     }
 
+    // Drop the recorder so `stats` is no longer borrowed.
+    drop(recorder);
     stats
 }
 
