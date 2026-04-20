@@ -1,11 +1,10 @@
 //! Minimal one-shot HTTP POST
 //!
-//! ARCH(fanout-core): primary caller is the SSE + WS fanout trigger
-//! loops, which become one shared module in zerobench-backends::fanout_core.
-//! This file stays usable standalone.
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §7. — used by benchmark harness paths that
-//! need to fire an occasional side-channel request (fanout triggers,
-//! control-plane probes) without standing up the full mio_h1 pool.
+//! Primary caller is [`crate::fanout_core`] — the shared SSE + WS
+//! fanout trigger loop. Also usable standalone by any benchmark
+//! harness path that needs to fire an occasional side-channel request
+//! (fanout triggers, control-plane probes) without standing up the
+//! full mio_h1 pool.
 //!
 //! Pure mio / non-blocking throughout: the whole point of this module
 //! is to avoid regressing the "no blocking std::net on the client

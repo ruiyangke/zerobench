@@ -1,15 +1,10 @@
 //! SSE broadcast-latency benchmark
 //!
-//! ARCH(fanout-core): HEAVY DUPLICATION with ws/fanout.rs. Extract:
-//!   - run_trigger_loop  (structurally identical to ws/fanout::run_trigger_loop)
-//!   - render_template   (identical)
-//!   - fire_trigger      (fire_http_trigger in ws/fanout; same func)
-//!   - post-run trigger↔event correlation pass
-//! All four go to zerobench-backends::fanout_core. This file keeps only
-//! the SSE-specific subscriber logic + the SseFanoutPlan handler.
+//! Trigger-side helpers live in [`crate::fanout_core`]. This file
+//! holds only the SSE-specific subscriber logic + the `SseFanoutPlan`
+//! handler.
 //!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §B1, §7. — `docs/design-v0.1.0.md` §3.2
-//! `SseFanout` and `docs/PHILOSOPHY.md` §4.3.
+//! See `docs/design-v0.1.0.md` §3.2 `SseFanout` and `docs/PHILOSOPHY.md` §4.3.
 //!
 //! N SSE subscribers + a periodic external trigger. On each trigger
 //! firing we record the send instant; every subscriber records its
@@ -51,7 +46,6 @@ use zerobench_runtime::LiveSnapshot;
 use crate::sse::line_parser::{SseEvent, SseLineParser};
 
 const POLL_TOKEN: Token = Token(0);
-const TRIGGER_INTERVAL_MS: u64 = 500; // 2/s triggers — balances accuracy vs server load
 
 /// Event arrival instant for one subscriber.
 /// One inbound broadcast event observed by a subscriber.
@@ -201,7 +195,7 @@ pub fn run_sse_fanout_from_plan_threaded(
         let trigger_handle = std::thread::Builder::new()
             .name("zerobench-sse-fanout-trigger".into())
             .spawn(move || {
-                run_trigger_loop(
+                crate::fanout_core::run_trigger_loop(
                     &trigger_target,
                     &trigger_opts,
                     &trigger_url_tpl,
@@ -335,93 +329,12 @@ pub fn run_sse_fanout_from_plan_threaded(
     out
 }
 
-// ARCH(fanout-core): run_trigger_loop, fire_trigger, render_template
-// are duplicated byte-for-pattern with ws/fanout.rs equivalents.
-// Target: extract to zerobench-backends::fanout_core and call from
-// both. See ARCH-REVIEW §4.6, §B1.
-
-/// Fire HTTP POST triggers at `TRIGGER_INTERVAL_MS`, recording each
-/// send instant into `triggers`. The trigger URL is re-expanded from
-/// its [`Template`] every firing, so `{{counter}}` / `{{uuid}}` /
-/// `{{now_ns}}` advance per trigger (a single thread-local counter
-/// persists across firings).
-fn run_trigger_loop(
-    target: &Target,
-    opts: &TransportOpts,
-    trigger_url: &zerobench_core::Template,
-    deadline: Instant,
-    stop: &AtomicBool,
-    triggers: &Mutex<Vec<Instant>>,
-    tls_config: Option<&Arc<ClientConfig>>,
-) {
-    let interval = Duration::from_millis(TRIGGER_INTERVAL_MS);
-    let mut next = Instant::now() + interval;
-    let mut rng = zerobench_core::rng::from_entropy();
-    let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        let now = Instant::now();
-        if now < next {
-            std::thread::sleep((next - now).min(Duration::from_millis(100)));
-            continue;
-        }
-        // Re-render per firing.
-        let mut url_buf: Vec<u8> = Vec::with_capacity(128);
-        {
-            let mut ctx = zerobench_core::ExpandCtx {
-                rng: &mut rng,
-                counter: &counter,
-                scenario_vars: &[],
-            };
-            trigger_url.expand_into(&mut url_buf, &mut ctx);
-        }
-        let url_str = String::from_utf8_lossy(&url_buf).to_string();
-        let t = Instant::now();
-        if fire_trigger(target, opts, &url_str, tls_config).is_ok() {
-            triggers.lock().expect("triggers mutex").push(t);
-        }
-        next = Instant::now() + interval;
-    }
-}
-
-/// Send one non-blocking HTTP POST to `trigger_url` via
-/// [`crate::http::simple_post::fire_http_post`] — pure mio,
-/// no std::net leakage on the client side.
-fn fire_trigger(
-    target: &Target,
-    opts: &TransportOpts,
-    trigger_url: &str,
-    tls_config: Option<&Arc<ClientConfig>>,
-) -> std::io::Result<()> {
-    let path = match trigger_url.find("://").and_then(|i| trigger_url[i + 3..].find('/')) {
-        Some(rel) => {
-            let abs_idx = trigger_url.find("://").map(|i| i + 3).unwrap_or(0) + rel;
-            &trigger_url[abs_idx..]
-        }
-        None => "/",
-    };
-    crate::http::simple_post::fire_http_post(target, opts, path, &[], tls_config)
-}
-
-/// Render a static template to a String. Fanout triggers can't use
-/// per-iteration variables today (no scenario context at trigger time).
-fn render_template(tpl: &zerobench_core::Template) -> String {
-    let mut buf = Vec::with_capacity(256);
-    let mut rng = zerobench_core::rng::from_entropy();
-    let mut ctx = zerobench_core::ExpandCtx {
-        rng: &mut rng,
-        counter: &std::rc::Rc::new(std::cell::Cell::new(0)),
-        scenario_vars: &[],
-    };
-    tpl.expand_into(&mut buf, &mut ctx);
-    String::from_utf8_lossy(&buf).to_string()
-}
-
 /// Build the subscribe request (re-uses hold's request format).
 fn build_subscribe_request(
     target: &Target,
     plan: &SseFanoutPlan,
 ) -> Vec<u8> {
-    let url = render_template(&plan.subscribers.url);
+    let url = crate::fanout_core::render_template(&plan.subscribers.url);
     let path = match url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j)) {
         Some(p) => url[p..].to_string(),
         None => "/".to_string(),

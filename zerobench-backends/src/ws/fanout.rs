@@ -1,15 +1,10 @@
 //! WebSocket broadcast-latency benchmark
 //!
-//! ARCH(fanout-core): HEAVY DUPLICATION with sse/fanout.rs. Extract:
-//!   - run_trigger_loop    (mirror of sse/fanout::run_trigger_loop)
-//!   - fire_http_trigger   (mirror of sse/fanout::fire_trigger)
-//!   - render_template     (identical)
-//!   - post-run trigger↔frame correlation pass
-//! All four go to zerobench-backends::fanout_core. This file keeps only
-//! WS-specific subscriber logic + the WsFanoutPlan handler.
+//! Trigger-side helpers live in [`crate::fanout_core`]. This file
+//! holds only the WS-specific subscriber logic + the `WsFanoutPlan`
+//! handler.
 //!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §B1, §7. — `docs/design-v0.1.0.md` §3.3
-//! `WsFanout`.
+//! See `docs/design-v0.1.0.md` §3.3 `WsFanout`.
 //!
 //! Same shape as `SseFanout`: N held WS subscribers + a periodic
 //! external trigger. For each trigger firing we record the send
@@ -36,8 +31,6 @@ use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::BenchRng;
 
 use crate::ws::conn::{DataFrame, WsConnection};
-
-const TRIGGER_INTERVAL_MS: u64 = 500;
 
 /// One broadcast frame observed by a subscriber. `emit_ns` is
 /// populated only under `FanoutMode::Timestamp` via the SSE crate's
@@ -118,7 +111,7 @@ pub fn run_ws_fanout_from_plan_threaded(
         let triggers: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
         let sub_count = fan.subscribers.connections.max(1) as usize;
 
-        let path = extract_path(&fan.subscribers.url);
+        let path = crate::fanout_core::extract_path(&fan.subscribers.url);
         let sub_handles: Vec<_> = (0..sub_count)
             .map(|_| {
                 let target = target.clone();
@@ -155,7 +148,7 @@ pub fn run_ws_fanout_from_plan_threaded(
         let trigger_handle = std::thread::Builder::new()
             .name("zerobench-ws-fanout-trigger".into())
             .spawn(move || {
-                run_trigger_loop(
+                crate::fanout_core::run_trigger_loop(
                     &trigger_target,
                     &trigger_opts,
                     &trigger_url_tpl,
@@ -337,83 +330,4 @@ fn run_one_subscriber(
     }
     let _ = conn.close(1000, "bye");
     stats
-}
-
-fn run_trigger_loop(
-    target: &Target,
-    opts: &TransportOpts,
-    trigger_url: &zerobench_core::Template,
-    deadline: Instant,
-    stop: &AtomicBool,
-    triggers: &Mutex<Vec<Instant>>,
-    tls_config: Option<&Arc<ClientConfig>>,
-) {
-    let interval = Duration::from_millis(TRIGGER_INTERVAL_MS);
-    let mut next = Instant::now() + interval;
-    let mut rng = zerobench_core::rng::from_entropy();
-    let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        let now = Instant::now();
-        if now < next {
-            std::thread::sleep((next - now).min(Duration::from_millis(100)));
-            continue;
-        }
-        let mut url_buf: Vec<u8> = Vec::with_capacity(128);
-        {
-            let mut ctx = zerobench_core::ExpandCtx {
-                rng: &mut rng,
-                counter: &counter,
-                scenario_vars: &[],
-            };
-            trigger_url.expand_into(&mut url_buf, &mut ctx);
-        }
-        let url_str = String::from_utf8_lossy(&url_buf).to_string();
-        let t = Instant::now();
-        if fire_http_trigger(target, opts, &url_str, tls_config).is_ok() {
-            triggers.lock().expect("triggers mutex").push(t);
-        }
-        next = Instant::now() + interval;
-    }
-}
-
-fn fire_http_trigger(
-    target: &Target,
-    opts: &TransportOpts,
-    trigger_url: &str,
-    tls_config: Option<&Arc<ClientConfig>>,
-) -> std::io::Result<()> {
-    // Delegated to crate::http::simple_post::fire_http_post — pure
-    // mio, no blocking std::net::TcpStream on the client side. The
-    // trigger URL typically points at the same host (an HTTP
-    // /broadcast endpoint alongside the WS /subscribe). Cross-host
-    // triggers aren't supported here yet (requires a second Target).
-    let path = match trigger_url.find("://").and_then(|i| trigger_url[i + 3..].find('/')) {
-        Some(rel) => {
-            let abs_idx = trigger_url.find("://").map(|i| i + 3).unwrap_or(0) + rel;
-            &trigger_url[abs_idx..]
-        }
-        None => "/",
-    };
-    crate::http::simple_post::fire_http_post(target, opts, path, &[], tls_config)
-}
-
-fn render_template(tpl: &zerobench_core::Template) -> String {
-    let mut buf = Vec::with_capacity(256);
-    let mut rng = zerobench_core::rng::from_entropy();
-    let mut ctx = zerobench_core::ExpandCtx {
-        rng: &mut rng,
-        counter: &std::rc::Rc::new(std::cell::Cell::new(0)),
-        scenario_vars: &[],
-    };
-    tpl.expand_into(&mut buf, &mut ctx);
-    String::from_utf8_lossy(&buf).to_string()
-}
-
-fn extract_path(url: &zerobench_core::Template) -> String {
-    let s = render_template(url);
-    if let Some(path_start) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j)) {
-        s[path_start..].to_string()
-    } else {
-        "/".to_string()
-    }
 }

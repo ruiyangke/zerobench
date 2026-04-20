@@ -11,6 +11,7 @@
 //!
 //! See `docs/ARCH-REVIEW-2026-04-20.md` §4.1, §7.
 
+pub mod fanout_core;
 pub mod http;
 pub mod sse;
 pub mod ws;
