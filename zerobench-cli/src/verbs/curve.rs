@@ -1,14 +1,3 @@
-//! ARCH STATUS: REWRITE
-//!
-//! Phase 2c routed the HTTP backend call through
-//! `zerobench_backends::run_plan` — dispatch is now a single call. Phase
-//! 4b collapsed plan construction into `zerobench_core::plan_builder`,
-//! shared with measure.rs and the DSL. Still has its own runs/archive
-//! lifecycle. Post-rewrite: ~100 LoC wrapping runner.execute() in a
-//! rate-sweep loop. See ARCH-REVIEW §6 Phase 4, §B2.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! `zerobench curve URL` — saturation-curve exploration.
 //!
 //! Per PHILOSOPHY §P4 "load is a curve, not a point": steps offered
@@ -19,11 +8,13 @@
 //!
 //! Output: a CSV-style table to stdout + (optionally) an archive
 //! entry with the full per-step measurement data.
+//!
+//! The fingerprint / calibration / archive / harness scaffolding is
+//! shared with `measure.rs` via `zerobench_runtime::runner`; curve.rs
+//! only owns the rate-ladder loop and the knee-detection.
 
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use smallvec::SmallVec;
@@ -33,12 +24,7 @@ use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::{Summary, SummaryExport};
-use zerobench_runtime::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
-use zerobench_runtime::calibrate::ClientSelfCheck;
-use zerobench_runtime::fingerprint::{
-    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
-};
-use zerobench_runtime::machine::MachineFingerprint;
+use zerobench_runtime::runner::{calibrate, ArchiveSession, RunHarness};
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -150,28 +136,167 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Err("--over must be non-zero".into());
     }
 
-    let run_start_wall = SystemTime::now();
-
+    // -------------------------------------------------------------------
+    // Plan + transport
+    // -------------------------------------------------------------------
     let target = Target::parse(&args.url)?;
     let name = args
         .name
         .clone()
         .unwrap_or_else(|| format!("{}-curve", target.host));
+    let opts = build_transport_opts(&args);
+    let base_plan = build_curve_plan(&args, &name)?;
+    let resolved = target.resolve(&opts)?;
 
-    // Build the base plan (single GET /, saturate — the Step
-    // template is reused for every step with a different rate).
-    let opts = TransportOpts {
+    // -------------------------------------------------------------------
+    // Calibration gate — verify the client can sustain the top of the
+    // ramp before we burn time on the sweep.
+    // -------------------------------------------------------------------
+    let calibration_skipped = args.no_calibrate;
+    let mut force_overload = args.force_overload;
+    if !calibration_skipped {
+        let report = calibrate(args.to_rate, Duration::from_secs(2), args.force_overload)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        eprintln!(
+            "[calibrate] loopback @ {:.0} req/s → {:.0} achieved — verdict: {:?}, jitter p99 {} ns",
+            report.target_rate, report.achieved_rate, report.verdict, report.jitter_p99_ns,
+        );
+        if report.poisoned {
+            eprintln!(
+                "[calibrate] --force-overload: gate bypassed; run flagged \
+                 `force_overload=true`."
+            );
+            force_overload = true;
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Archive setup
+    // -------------------------------------------------------------------
+    let archive = ArchiveSession::begin(
+        &base_plan,
+        &target,
+        &[resolved],
+        args.no_archive,
+        Vec::new(),
+        calibration_skipped,
+        force_overload,
+        String::new(),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+
+    // -------------------------------------------------------------------
+    // Harness + rate ladder.
+    //
+    // Geometric spacing: "first doubling that breaks" usually lies
+    // between adjacent decades rather than adjacent linear points.
+    // Rate at step i = from * (to/from)^(i/(n-1)).
+    // -------------------------------------------------------------------
+    let tls_config = if target.tls {
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
+            &opts,
+            &[b"http/1.1"],
+        ))
+    } else {
+        None
+    };
+    // Per-step, `target_rate` is rebuilt from the ladder fraction, so
+    // the harness's own `target_rate` is unused — None is safe.
+    let harness = RunHarness::new_from(
+        &target,
+        &opts,
+        args.threads,
+        args.connections,
+        None,
+        tls_config,
+    );
+
+    let step_duration = args.over / args.steps.max(1);
+    let ratio = args.to_rate / args.from_rate;
+    let mut steps: Vec<StepResult> = Vec::with_capacity(args.steps as usize);
+
+    println!("\ncurve {}", args.url);
+    println!(
+        "{:>4}  {:>12}  {:>12}  {:>10}  {:>12}  {:>10}",
+        "step", "offered", "achieved", "p50", "p99", "err%"
+    );
+
+    for i in 0..args.steps {
+        let frac = i as f64 / (args.steps as f64 - 1.0).max(1.0);
+        let offered = args.from_rate * ratio.powf(frac);
+        let mut plan = base_plan.clone();
+        plan.scenarios[0].rate = RateProfile::Constant(offered);
+        plan.duration = step_duration;
+
+        let t_start = Instant::now();
+        let stats = run_plan_for_step(&plan, &harness, step_duration, Some(offered));
+        let elapsed = t_start.elapsed();
+        let summary = Summary::merge(stats, elapsed);
+
+        let step_result = step_result_for(offered, &summary, elapsed);
+        print_step_row(i, &step_result);
+        steps.push(step_result);
+    }
+
+    // -------------------------------------------------------------------
+    // Knee detection + summary print.
+    // -------------------------------------------------------------------
+    let baseline_p99 = steps.first().map(|s| s.p99_ns).unwrap_or(0);
+    let knee_index = detect_knee(
+        &steps,
+        baseline_p99,
+        args.knee_p99_mult,
+        args.knee_error_rate,
+    );
+    print_knee(&steps, &knee_index, baseline_p99, args.to_rate);
+
+    // -------------------------------------------------------------------
+    // Archive finalisation — synthesise a SummaryExport that carries
+    // per-step metrics in `per_run`, so downstream diff can bootstrap
+    // across rate steps (unusual but mechanically valid).
+    // -------------------------------------------------------------------
+    let total_duration = step_duration.saturating_mul(args.steps);
+    let export = synthesise_summary_export(&steps, total_duration);
+    // ArchiveSession::finalise needs a Summary + separate per_run slice;
+    // build both from `export` so we write the right result.json.
+    let synth_summary = summary_for_archive(&export);
+    archive.finalise(
+        &synth_summary,
+        export.per_run.clone(),
+        &base_plan,
+        total_duration,
+        "zerobench curve",
+        |s, _p| &s.latency,
+    )?;
+
+    Ok(match knee_index {
+        Some(_) => ExitCode::SUCCESS,
+        None => ExitCode::from(0), // No knee found is informational — still exit 0.
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Curve helpers — kept local to curve.rs
+// ---------------------------------------------------------------------------
+
+fn build_transport_opts(args: &CurveArgs) -> TransportOpts {
+    TransportOpts {
         connect_timeout: args.connect_timeout,
         request_timeout: args.request_timeout,
         max_conns: args.connections,
         tcp_nodelay: true,
         insecure_tls: args.insecure,
         ..TransportOpts::default()
-    };
+    }
+}
 
+fn build_curve_plan(
+    args: &CurveArgs,
+    name: &str,
+) -> Result<zerobench_core::plan::Plan, Box<dyn std::error::Error>> {
     let mut builder = PlanBuilder::new();
     builder
-        .name(name.clone())
+        .name(name)
         .duration(args.over)
         .threads(args.threads)
         .mode(Mode::Curve {
@@ -197,172 +322,71 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         RateProfile::Constant(args.from_rate),
         request,
     ));
-    let base_plan = builder.finalize();
+    Ok(builder.finalize())
+}
 
-    let resolved = target.resolve(&opts)?;
-    let resolved_vec = vec![resolved];
-    let plan_h = plan_hash(&base_plan);
-    let url_fp = url_fingerprint(&base_plan, &target, IpFamilyTag::Auto);
-    let target_fp = target_fingerprint(&base_plan, &target, &resolved_vec, &plan_h);
-    let id = run_id(&plan_h, &target_fp, run_start_wall);
-
-    // -------------------------------------------------------------------
-    // Client self-check — calibrate gate.
-    // -------------------------------------------------------------------
-    if !args.no_calibrate {
-        let check = ClientSelfCheck::spawn()?;
-        let cal = check.check(args.to_rate, Duration::from_secs(2), None)?;
-        eprintln!(
-            "[calibrate] loopback @ {:.0} req/s → {:.0} achieved ({:.1}%) verdict={:?}",
-            cal.offered_rate,
-            cal.achieved_rate,
-            cal.sustained_pct * 100.0,
-            cal.verdict,
-        );
-        if matches!(cal.verdict, zerobench_runtime::Verdict::Refuse) && !args.force_overload {
-            return Err(format!(
-                "client cannot sustain top-of-ramp {} req/s (achieved {:.0}). \
-                 Lower --to or pass --force-overload.",
-                args.to_rate, cal.achieved_rate
-            )
-            .into());
-        }
-        // P10 jitter floor — see measure.rs for rationale.
-        const JITTER_P99_FLOOR_NS: u64 = 5_000;
-        if cal.jitter.len() == 0 {
-            return Err(
-                "client self-check produced no jitter samples — calibration \
-                 is broken; cannot verify the scheduler noise floor."
-                    .into(),
-            );
-        }
-        let jitter_p99 = cal.jitter.value_at_percentile(99.0);
-        if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
-            return Err(format!(
-                "client scheduler jitter p99 is {} ns (> {} ns floor); curve \
-                 knee detection would chase noise. Disable CPU frequency \
-                 scaling, or pass --force-overload.",
-                jitter_p99, JITTER_P99_FLOOR_NS
-            )
-            .into());
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Machine fingerprint + archive setup
-    // -------------------------------------------------------------------
-    let machine = MachineFingerprint::collect();
-    let archive_writer = if args.no_archive {
-        None
-    } else {
-        let archive = Archive::resolve();
-        let writer = ArchiveWriter::begin(&archive, &url_fp, &id)?;
-        writer.write_plan(&base_plan)?;
-        writer.write_machine(&machine)?;
-        eprintln!("[archive] run_id = {id}");
-        Some(writer)
+fn run_plan_for_step(
+    plan: &zerobench_core::plan::Plan,
+    harness: &RunHarness,
+    duration: Duration,
+    offered: Option<f64>,
+) -> Vec<zerobench_core::TaskStats> {
+    let (target, opts, duration, threads, connections, _rate, tls, live, stop) =
+        harness.ctx_for(duration, None, None);
+    let ctx = zerobench_backends::RunCtx {
+        target,
+        opts,
+        duration,
+        num_threads: threads,
+        connections,
+        target_rps: offered,
+        tls_config: tls,
+        live,
+        stop,
     };
+    zerobench_backends::run_plan(plan, &ctx)
+}
 
-    let mut env = EnvRecord::started_now(env!("CARGO_PKG_VERSION"));
-    env.resolved_ips = resolved_vec.iter().map(|a| a.to_string()).collect();
-    env.calibration_skipped = args.no_calibrate;
-    env.force_overload = args.force_overload;
-    if let Some(w) = archive_writer.as_ref() {
-        w.write_env(&env)?;
-    }
-
-    // -------------------------------------------------------------------
-    // Step through the rate ladder.
-    //
-    // Geometric spacing feels more informative than linear at most
-    // rate ranges ("first doubling that breaks" is usually between
-    // adjacent decades, not adjacent linear points). Steps at
-    // from * (to/from)^(i/(n-1)).
-    // -------------------------------------------------------------------
-    let step_duration = args.over / args.steps.max(1);
-    let ratio = args.to_rate / args.from_rate;
-    let mut steps: Vec<StepResult> = Vec::with_capacity(args.steps as usize);
-
-    let tls_config = if target.tls {
-        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+fn step_result_for(offered: f64, summary: &Summary, elapsed: Duration) -> StepResult {
+    let p50 = summary.latency.value_at_percentile(50.0);
+    let p99 = summary.latency.value_at_percentile(99.0);
+    let err_total = summary.errors.total();
+    let err_rate = if summary.requests == 0 {
+        1.0
     } else {
-        None
+        err_total as f64 / summary.requests as f64
     };
+    let achieved = summary.requests as f64 / elapsed.as_secs_f64();
+    StepResult {
+        offered,
+        achieved,
+        requests: summary.requests,
+        p50_ns: p50,
+        p99_ns: p99,
+        err_rate,
+    }
+}
 
-    println!("\ncurve {}", args.url);
+fn print_step_row(i: u32, s: &StepResult) {
     println!(
-        "{:>4}  {:>12}  {:>12}  {:>10}  {:>12}  {:>10}",
-        "step", "offered", "achieved", "p50", "p99", "err%"
+        "{:>4}  {:>10.0}/s  {:>10.0}/s  {:>10}  {:>12}  {:>9.2}%",
+        i + 1,
+        s.offered,
+        s.achieved,
+        fmt_ns(s.p50_ns),
+        fmt_ns(s.p99_ns),
+        s.err_rate * 100.0,
     );
+}
 
-    for i in 0..args.steps {
-        let frac = i as f64 / (args.steps as f64 - 1.0).max(1.0);
-        let offered = args.from_rate * ratio.powf(frac);
-        let mut plan = base_plan.clone();
-        plan.scenarios[0].rate = RateProfile::Constant(offered);
-        plan.duration = step_duration;
-
-        let t_start = Instant::now();
-        let stop: Option<Arc<AtomicBool>> = None;
-        let step_ctx = zerobench_backends::RunCtx {
-            target: target.clone(),
-            opts: opts.clone(),
-            duration: step_duration,
-            num_threads: args.threads.max(1),
-            connections: args.connections,
-            target_rps: Some(offered),
-            tls_config: tls_config.clone(),
-            live: None,
-            stop,
-        };
-        let stats = zerobench_backends::run_plan(&plan, &step_ctx);
-        let elapsed = t_start.elapsed();
-        let summary = Summary::merge(stats, elapsed);
-
-        let p50 = summary.latency.value_at_percentile(50.0);
-        let p99 = summary.latency.value_at_percentile(99.0);
-        let err_total = summary.errors.total();
-        let err_rate = if summary.requests == 0 {
-            1.0
-        } else {
-            err_total as f64 / summary.requests as f64
-        };
-        let achieved = summary.requests as f64 / elapsed.as_secs_f64();
-
-        let step_result = StepResult {
-            offered,
-            achieved,
-            requests: summary.requests,
-            p50_ns: p50,
-            p99_ns: p99,
-            err_rate,
-        };
-
-        println!(
-            "{:>4}  {:>10.0}/s  {:>10.0}/s  {:>10}  {:>12}  {:>9.2}%",
-            i + 1,
-            step_result.offered,
-            step_result.achieved,
-            fmt_ns(step_result.p50_ns),
-            fmt_ns(step_result.p99_ns),
-            step_result.err_rate * 100.0,
-        );
-        steps.push(step_result);
-    }
-
-    // -------------------------------------------------------------------
-    // Knee detection.
-    // -------------------------------------------------------------------
-    let baseline_p99 = steps.first().map(|s| s.p99_ns).unwrap_or(0);
-    let knee_index = detect_knee(
-        &steps,
-        baseline_p99,
-        args.knee_p99_mult,
-        args.knee_error_rate,
-    );
-
+fn print_knee(
+    steps: &[StepResult],
+    knee_index: &Option<(usize, String)>,
+    baseline_p99: u64,
+    to_rate: f64,
+) {
     println!();
-    match knee_index.as_ref() {
+    match knee_index {
         Some((idx, reason)) => {
             let s = &steps[*idx];
             println!(
@@ -385,122 +409,76 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         None => {
             println!(
                 "knee       not found up to {:.0} req/s (top-of-ramp; try a higher --to)",
-                args.to_rate
+                to_rate
             );
         }
     }
+}
 
-    // -------------------------------------------------------------------
-    // Archive finalisation.
-    // -------------------------------------------------------------------
-    if let Some(writer) = archive_writer {
-        env.set_ended();
-        writer.write_env(&env)?;
-
-        // Synthesise a SummaryExport from the aggregate of all steps.
-        // result.json for curve runs carries per_run = one entry per
-        // rate step, so downstream diff can bootstrap across steps
-        // (unusual but mechanically valid).
-        let total_requests: u64 = steps.iter().map(|s| s.requests).sum();
-        let total_duration = step_duration.saturating_mul(args.steps);
-        let per_run: Vec<PerRunMetrics> = steps
-            .iter()
-            .enumerate()
-            .map(|(i, s)| PerRunMetrics {
-                index: i as u32,
-                rate_per_s: s.achieved,
-                requests: s.requests,
-                errors_total: (s.err_rate * s.requests as f64) as u64,
-                latency: LatencyExport {
-                    count: s.requests,
-                    min_ns: 0,
-                    p50_ns: s.p50_ns,
-                    p90_ns: 0,
-                    p99_ns: s.p99_ns,
-                    p99_9_ns: 0,
-                    p99_99_ns: 0,
-                    max_ns: 0,
-                    mean_ns: 0.0,
-                    stddev_ns: 0.0,
-                },
-                // Curve is HTTP-only today; protocol_latency unused.
-                protocol_latency: LatencyExport::default(),
-            })
-            .collect();
-
-        let export = SummaryExport {
-            schema_version: SummaryExport::SCHEMA_VERSION,
-            duration_ns: total_duration
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
-            requests: total_requests,
-            rate_per_s: if total_duration.as_secs_f64() > 0.0 {
-                total_requests as f64 / total_duration.as_secs_f64()
-            } else {
-                0.0
-            },
-            bytes_sent: 0,
-            bytes_recv: 0,
+fn synthesise_summary_export(steps: &[StepResult], total_duration: Duration) -> SummaryExport {
+    let total_requests: u64 = steps.iter().map(|s| s.requests).sum();
+    let per_run: Vec<PerRunMetrics> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| PerRunMetrics {
+            index: i as u32,
+            rate_per_s: s.achieved,
+            requests: s.requests,
+            errors_total: (s.err_rate * s.requests as f64) as u64,
             latency: LatencyExport {
-                count: 0,
+                count: s.requests,
                 min_ns: 0,
-                p50_ns: 0,
+                p50_ns: s.p50_ns,
                 p90_ns: 0,
-                p99_ns: 0,
+                p99_ns: s.p99_ns,
                 p99_9_ns: 0,
                 p99_99_ns: 0,
                 max_ns: 0,
                 mean_ns: 0.0,
                 stddev_ns: 0.0,
             },
-            ttfb: LatencyExport {
-                count: 0,
-                min_ns: 0,
-                p50_ns: 0,
-                p90_ns: 0,
-                p99_ns: 0,
-                p99_9_ns: 0,
-                p99_99_ns: 0,
-                max_ns: 0,
-                mean_ns: 0.0,
-                stddev_ns: 0.0,
-            },
-            errors: ErrorCountersExport {
-                connect: 0,
-                read: 0,
-                write: 0,
-                timeout: 0,
-                keepup: 0,
-                status_4xx: 0,
-                status_5xx: 0,
-                assertion_failed: 0,
-            },
-            scenarios: Vec::new(),
-            per_run,
-        };
-        writer.write_result(&export)?;
+            // Curve is HTTP-only today; protocol_latency unused.
+            protocol_latency: LatencyExport::default(),
+        })
+        .collect();
 
-        let index = Index {
-            schema_version: Index::SCHEMA_VERSION,
-            schema_versions: SchemaVersions {
-                plan: 1,
-                machine: MachineFingerprint::SCHEMA_VERSION,
-                env: EnvRecord::SCHEMA_VERSION,
-                index: Index::SCHEMA_VERSION,
-                result: Some(SummaryExport::SCHEMA_VERSION),
-            },
-            plan_hash: plan_h,
-            target_fingerprint: target_fp,
-            url_fingerprint: url_fp,
-            replayed_from: None,
-        };
-        writer.finalise(&index)?;
+    SummaryExport {
+        schema_version: SummaryExport::SCHEMA_VERSION,
+        duration_ns: total_duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+        requests: total_requests,
+        rate_per_s: if total_duration.as_secs_f64() > 0.0 {
+            total_requests as f64 / total_duration.as_secs_f64()
+        } else {
+            0.0
+        },
+        bytes_sent: 0,
+        bytes_recv: 0,
+        latency: LatencyExport::default(),
+        ttfb: LatencyExport::default(),
+        errors: ErrorCountersExport {
+            connect: 0,
+            read: 0,
+            write: 0,
+            timeout: 0,
+            keepup: 0,
+            status_4xx: 0,
+            status_5xx: 0,
+            assertion_failed: 0,
+        },
+        scenarios: Vec::new(),
+        per_run,
     }
+}
 
-    Ok(match knee_index {
-        Some(_) => ExitCode::SUCCESS,
-        None => ExitCode::from(0), // No knee found is informational — still exit 0.
-    })
+/// Build a stand-in Summary so we can feed `ArchiveSession::finalise`.
+/// The closure hand-off only uses `summary.latency` — we give it the
+/// default empty histogram, matching the old code's all-zero result.json
+/// aggregate-latency slot.
+fn summary_for_archive(_export: &SummaryExport) -> Summary {
+    // Empty stats → aggregate latency histogram is the default empty
+    // HDR — matches the old curve flow where the top-level latency
+    // slot in result.json was explicitly zero.
+    Summary::merge(Vec::new(), Duration::from_secs(0))
 }
 
 #[derive(Debug, Clone, Copy)]

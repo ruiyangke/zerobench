@@ -12,6 +12,7 @@
 //!   - [`live_snapshot`] — sharded HDR histogram + counters, read per-tick by TUI
 //!   - [`machine`]       — host fingerprint (CPU, RAM, OS) captured once per run
 //!   - [`recorder`]      — fans one op out to TaskStats + LiveSnapshot (§4.3)
+//!   - [`runner`]        — shared run-loop helpers (calibrate / RunHarness / ArchiveSession)
 //!   - [`stop`]          — shared stop-flag primitive
 //!   - [`tls`]           — shared rustls `ClientConfig` builder
 //!   - [`transport`]     — runtime error taxonomy (`TransportError`, `classify`)
@@ -30,6 +31,7 @@ pub mod json_scan;
 pub mod live_snapshot;
 pub mod machine;
 pub mod recorder;
+pub mod runner;
 pub mod stop;
 pub mod tls;
 pub mod transport;
@@ -46,6 +48,7 @@ pub use json_scan::find_json_u64_field;
 pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use machine::MachineFingerprint;
 pub use recorder::{Recorder, Sample};
+pub use runner::{calibrate, op_label_for, ArchiveSession, CalibrationReport, RunHarness};
 pub use stop::StopSignal;
 pub use tls::tls_client_config;
 pub use transport::{classify, TransportError};

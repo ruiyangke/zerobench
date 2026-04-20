@@ -1,55 +1,31 @@
-//! ARCH STATUS: REWRITE
-//!
-//! Still contains the per-run lifecycle (warmup → measure → cooldown ×
-//! runs, archive, calibration gates) inline in `pub fn run`. Phase 2c
-//! collapsed the 9-arm dispatch matches into `zerobench_backends::run_plan`
-//! (see `ARCH-REVIEW §4.1`). Phase 4b collapsed the per-protocol plan
-//! construction (~200 LoC) into shared `zerobench_core::plan_builder`
-//! constructors. The remaining restructuring:
-//!   - Runs loop / archive finalise belongs in a shared
-//!     `zerobench-runtime::runner` module that probe / curve / compare /
-//!     replay share.
-//!
-//! Target: ~150 LoC total. `measure::run` becomes: build plan →
-//! runner.execute → render. See docs/ARCH-REVIEW-2026-04-20.md §6
-//! Phase 4, §B2, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! `zerobench measure URL` — the headline verb.
 //!
-//! Implements `docs/design-v0.1.0.md` §2.3 and PHILOSOPHY §5. The
-//! flow for every invocation:
+//! Implements `docs/design-v0.1.0.md` §2.3 and PHILOSOPHY §5. The flow
+//! for every invocation is the standard verb-level choreography:
 //!
-//! 1. Build a [`Plan`] with `mode = Mode::Measure`, the caller's
-//!    duration / warmup / cooldown / runs.
-//! 2. Compute `plan_hash`, `url_fingerprint`, `target_fingerprint`,
-//!    `run_id`.
-//! 3. Run the [`ClientSelfCheck`] against loopback — refuse the
-//!    run when the client can't sustain the offered rate, unless
-//!    `--force-overload` was passed.
-//! 4. Collect [`MachineFingerprint`]. Refuse when the monotonic
-//!    clock is coarser than 10 µs unless `--allow-coarse-clock`
-//!    was passed.
-//! 5. Open [`ArchiveWriter`] and write `plan.json`, `machine.json`,
-//!    `env.json` before the real run starts.
-//! 6. Dispatch `runs` consecutive benchmark runs to the protocol-
-//!    appropriate backend (HTTP / SseHold / WsEchoRtt / fanout /
-//!    reconnect-storm / ...), with `cooldown` between runs.
-//! 7. Merge per-run stats into a [`Summary`]; print a compact report.
-//! 8. Emit `result.json` + `.histlog`, stamp `env.ended_at_unix`,
-//!    rewrite `env.json`, finalise `INDEX.json`.
+//! 1. Build a [`Plan`] with `mode = Mode::Measure` from CLI args.
+//! 2. Run the client self-check gate (via
+//!    [`zerobench_runtime::runner::calibrate`]).
+//! 3. Collect [`MachineFingerprint`] and refuse if the monotonic clock
+//!    is coarse.
+//! 4. Open an [`ArchiveSession`] (fingerprints + pre-run sidecars).
+//! 5. For each run: warmup (first run only) → steady-state →
+//!    cooldown (before subsequent runs).
+//! 6. Merge per-run stats into a [`Summary`] and render.
+//! 7. Finalise the archive (env end-time + result.json + .histlog +
+//!    INDEX.json).
+//!
+//! Steps 2, 4, and 7 live in `zerobench-runtime::runner`; measure.rs
+//! owns steps 1, 5, and 6.
 
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use clap::{ArgAction, Args};
 use smallvec::SmallVec;
 
 use zerobench_core::plan::{
-    CorrelateStrategy, FanoutMode, HeartbeatFrame, Mode, Plan, Protocol, RateProfile, RequestPlan,
+    CorrelateStrategy, FanoutMode, HeartbeatFrame, Mode, Plan, RateProfile, RequestPlan,
     TriggerSpec,
 };
 use zerobench_core::plan_builder::{
@@ -57,18 +33,14 @@ use zerobench_core::plan_builder::{
     scenario_sse_reconnect_storm, scenario_ws_echo_rtt, scenario_ws_fanout, scenario_ws_hold,
     scenario_ws_server_push_rtt, PlanBuilder,
 };
-use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
+use zerobench_core::stats::{LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::{Summary, SummaryExport, TaskStats};
+use zerobench_core::Summary;
 use zerobench_report::report::pick_primary_histogram;
 use zerobench_report::ColorChoice;
-use zerobench_runtime::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
-use zerobench_runtime::calibrate::{ClientSelfCheck, Verdict};
-use zerobench_runtime::fingerprint::{
-    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
-};
 use zerobench_runtime::machine::MachineFingerprint;
+use zerobench_runtime::runner::{calibrate, op_label_for, ArchiveSession, RunHarness};
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -401,145 +373,57 @@ fn parse_kv_pair(s: &str) -> Result<(String, String), String> {
 
 /// Execute a `measure` invocation end-to-end.
 pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // -------------------------------------------------------------------
-    // Plan construction
-    // -------------------------------------------------------------------
-
     // TUI is wired for the top-level `zerobench <url>` dispatch path
-    // but not for the `measure` verb's multi-run + archive lifecycle:
-    // the per-run reset / cooldown interaction with a single
-    // long-lived live snapshot is different enough that we reject
-    // the combination explicitly rather than silently rendering
-    // nothing. Users who need live metrics for a one-off should
-    // use the top-level form, which carries the TUI wiring end to
-    // end. The flag is accepted on `measure` so that `zerobench
-    // measure ... --tui` produces a clear, actionable error rather
-    // than a Clap parse failure.
+    // but not for the `measure` verb's multi-run + archive lifecycle.
+    // Reject the combination explicitly so users get a clear, actionable
+    // message rather than silent no-op rendering.
     if args.tui {
         return Err(
             "--tui is not supported by the `measure` verb; use `zerobench <url> --tui` for live metrics".into(),
         );
     }
 
-    // Capture the wall-clock start for .histlog interval timestamps.
-    let run_start_wall = SystemTime::now();
-
+    // -------------------------------------------------------------------
+    // Plan + transport
+    // -------------------------------------------------------------------
     let target = Target::parse(&args.url)?;
-    let name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| target.host.clone());
-
+    let name = args.name.clone().unwrap_or_else(|| target.host.clone());
     let plan = build_measure_plan(&args, &target, &name)?;
-
-    let opts = TransportOpts {
-        connect_timeout: args.connect_timeout,
-        request_timeout: args.request_timeout,
-        max_conns: args.connections,
-        tcp_nodelay: true,
-        insecure_tls: args.insecure,
-        ..TransportOpts::default()
-    };
-
-    // -------------------------------------------------------------------
-    // Fingerprints + run_id
-    // -------------------------------------------------------------------
-
+    let opts = build_transport_opts(&args);
     let resolved = target.resolve(&opts)?;
-    let resolved_vec = vec![resolved];
-
-    let plan_h = plan_hash(&plan);
-    let url_fp = url_fingerprint(&plan, &target, IpFamilyTag::Auto);
-    let target_fp = target_fingerprint(&plan, &target, &resolved_vec, &plan_h);
-    let id = run_id(&plan_h, &target_fp, SystemTime::now());
 
     // -------------------------------------------------------------------
-    // client self-check
+    // Calibration gate
     // -------------------------------------------------------------------
-
     let calibration_skipped = args.no_calibrate;
+    let mut force_overload = args.force_overload;
     if !calibration_skipped {
-        let target_rate = args.rate.unwrap_or_else(|| {
-            // Saturate mode has no nominal rate; calibrate against
-            // a conservative 10k/s baseline to prove the scheduler
-            // isn't the bottleneck on this machine.
-            10_000.0
-        });
+        // Saturate mode has no nominal rate; calibrate against a
+        // conservative 10k/s baseline to prove the scheduler isn't the
+        // bottleneck on this machine.
+        let target_rate = args.rate.unwrap_or(10_000.0);
         eprintln!(
             "[calibrate] self-check at {:.0} req/s against loopback (~2s)...",
             target_rate
         );
-        let check = ClientSelfCheck::spawn()?;
-        let result = check.check(target_rate, Duration::from_secs(2), None)?;
+        let report = calibrate(target_rate, Duration::from_secs(2), args.force_overload)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         eprintln!(
-            "[calibrate] achieved {:.0}/{:.0} req/s ({:.1}%) — verdict: {:?}, jitter p99 {:?} ns",
-            result.achieved_rate,
-            target_rate,
-            result.sustained_pct * 100.0,
-            result.verdict,
-            result
-                .jitter
-                .value_at_percentile(99.0),
+            "[calibrate] achieved {:.0}/{:.0} req/s — verdict: {:?}, jitter p99 {} ns",
+            report.achieved_rate, report.target_rate, report.verdict, report.jitter_p99_ns,
         );
-        if matches!(result.verdict, Verdict::Refuse) && !args.force_overload {
-            return Err(format!(
-                "client cannot sustain {:.0} req/s on this machine (achieved {:.0}). \
-                 Lower --rate, pass --no-calibrate to skip this gate, \
-                 or pass --force-overload to run anyway.",
-                target_rate, result.achieved_rate
-            )
-            .into());
-        }
-        if matches!(result.verdict, Verdict::Refuse) {
+        if report.poisoned {
             eprintln!(
-                "[calibrate] --force-overload: proceeding despite insufficient client ceiling. \
-                 Run is flagged `force_overload=true` and will poison comparisons."
+                "[calibrate] --force-overload: gate bypassed; run will be flagged \
+                 `force_overload=true` and poisons comparisons."
             );
-        }
-
-        // P10 / PHILOSOPHY §9.6.2: hard floor on the client's own
-        // scheduler jitter. If the loopback self-check's p99 is above
-        // 5µs, the client's noise floor dominates any real
-        // measurement — percentile comparisons become meaningless.
-        // Refuse unless --force-overload is passed.
-        //
-        // Guard against an empty jitter histogram: HDR returns 0/1
-        // for value_at_percentile on no samples, which would silently
-        // pass the gate. Treat "no samples" as a broken self-check.
-        const JITTER_P99_FLOOR_NS: u64 = 5_000;
-        if result.jitter.len() == 0 {
-            return Err(
-                "client self-check produced no jitter samples — calibration \
-                 is broken; cannot verify the scheduler noise floor. Pass \
-                 --no-calibrate to skip the gate."
-                    .into(),
-            );
-        }
-        let jitter_p99 = result.jitter.value_at_percentile(99.0);
-        if jitter_p99 > JITTER_P99_FLOOR_NS && !args.force_overload {
-            return Err(format!(
-                "client scheduler jitter p99 is {} ns (> {} ns floor). Real \
-                 percentile deltas this run would be indistinguishable from \
-                 client noise. Disable CPU frequency scaling / pin the \
-                 process, pass --no-calibrate to skip, or --force-overload \
-                 to run anyway.",
-                jitter_p99, JITTER_P99_FLOOR_NS
-            )
-            .into());
-        }
-        if jitter_p99 > JITTER_P99_FLOOR_NS {
-            eprintln!(
-                "[calibrate] --force-overload: jitter p99 {} ns > {} ns floor; \
-                 comparison deltas under ~2× that figure are noise.",
-                jitter_p99, JITTER_P99_FLOOR_NS
-            );
+            force_overload = true;
         }
     }
 
     // -------------------------------------------------------------------
-    // machine fingerprint
+    // Machine-clock gate
     // -------------------------------------------------------------------
-
     let machine = MachineFingerprint::collect();
     if machine.clock_is_coarse() && !args.allow_coarse_clock {
         return Err(format!(
@@ -554,41 +438,39 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     // -------------------------------------------------------------------
-    // archive setup — writes plan/machine/env before the run.
+    // Archive setup
     // -------------------------------------------------------------------
-
-    let archive_writer = if args.no_archive {
-        None
-    } else {
-        let archive = Archive::resolve();
-        let writer = ArchiveWriter::begin(&archive, &url_fp, &id)?;
-        writer.write_plan(&plan)?;
-        writer.write_machine(&machine)?;
-        eprintln!("[archive] run_id = {id}");
-        eprintln!("[archive] dir = {}", writer.dir().display());
-        Some(writer)
-    };
-
-    let mut env = EnvRecord::started_now(env!("CARGO_PKG_VERSION"));
-    env.tool_features = enabled_features();
-    env.resolved_ips = resolved_vec.iter().map(|a| a.to_string()).collect();
-    env.context = args.context.clone();
-    env.force_overload = args.force_overload;
-    env.calibration_skipped = calibration_skipped;
-    if let Some(writer) = archive_writer.as_ref() {
-        writer.write_env(&env)?;
-    }
+    let archive = ArchiveSession::begin(
+        &plan,
+        &target,
+        &[resolved],
+        args.no_archive,
+        args.context.clone(),
+        calibration_skipped,
+        force_overload,
+        enabled_features(),
+        env!("CARGO_PKG_VERSION"),
+    )?;
 
     // -------------------------------------------------------------------
-    // Runs loop
+    // Harness
     // -------------------------------------------------------------------
-
-    let target_rate = args.rate;
     let tls_config = if target.tls {
-        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
+            &opts,
+            &[b"http/1.1"],
+        ))
     } else {
         None
     };
+    let harness = RunHarness::new_from(
+        &target,
+        &opts,
+        args.threads,
+        args.connections,
+        args.rate,
+        tls_config,
+    );
 
     eprintln!(
         "[measure] {} runs × {} (warmup {}, cooldown {}) against {}",
@@ -599,7 +481,10 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         args.url,
     );
 
-    let mut all_stats: Vec<TaskStats> = Vec::new();
+    // -------------------------------------------------------------------
+    // Runs loop — warmup → (steady → cooldown) × runs
+    // -------------------------------------------------------------------
+    let mut all_stats = Vec::new();
     let mut per_run: Vec<PerRunMetrics> = Vec::new();
     for run_idx in 0..args.runs {
         if run_idx > 0 && !args.cooldown.is_zero() {
@@ -610,223 +495,142 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             std::thread::sleep(args.cooldown);
         }
 
-        // Protocol-dispatched: the first scenario's protocol drives
-        // the backend choice. Single-scenario plans in the measure
-        // verb keep this simple; multi-scenario plans (Rhai) go
-        // through a different code path.
-        let scenario_protocol = plan
-            .scenarios
-            .first()
-            .map(|s| s.protocol())
-            .unwrap_or(Protocol::Http);
-
-        // Warmup: fire traffic, discard. Only on iteration 0 — we
-        // amortise the warmup cost across the N runs per PHILOSOPHY
-        // §P8. Mio dispatch doesn't natively separate warmup from
-        // measure yet — we model it as a prefixed short run whose
-        // stats we drop on the floor.
+        // Warmup is amortised across the N runs per PHILOSOPHY §P8 —
+        // only fire on iteration 0.
         if !args.warmup.is_zero() && run_idx == 0 {
-            eprintln!("[warmup] {} (discarded)...", format_duration(args.warmup));
-            let warmup_ctx = zerobench_backends::RunCtx {
-                target: target.clone(),
-                opts: opts.clone(),
-                duration: args.warmup,
-                num_threads: args.threads.max(1),
-                connections: args.connections,
-                target_rps: target_rate,
-                tls_config: tls_config.clone(),
-                live: None,
-                stop: None,
-            };
-            let _ = zerobench_backends::run_plan(&plan, &warmup_ctx);
+            eprintln!(
+                "[warmup] {} (discarded)...",
+                format_duration(args.warmup)
+            );
+            let _ = run_plan_with_harness(&plan, &harness, args.warmup);
         }
 
         eprintln!(
-            "[run {}/{}] starting ({}, {:?})...",
+            "[run {}/{}] starting ({})...",
             run_idx + 1,
             args.runs,
-            format_duration(args.duration),
-            scenario_protocol,
+            format_duration(args.duration)
         );
-        let stop: Option<Arc<AtomicBool>> = None;
-        let steady_ctx = zerobench_backends::RunCtx {
-            target: target.clone(),
-            opts: opts.clone(),
-            duration: args.duration,
-            num_threads: args.threads.max(1),
-            connections: args.connections,
-            target_rps: target_rate,
-            tls_config: tls_config.clone(),
-            live: None,
-            stop,
-        };
-        let stats = zerobench_backends::run_plan(&plan, &steady_ctx);
-
-        // Op count semantics per protocol:
-        //   HTTP → stats.requests is req count
-        //   SSE  → stats.requests is event count (populated by
-        //          run_sse_hold_from_plan_threaded which treats each
-        //          SSE event as an op per PHILOSOPHY §4.3)
+        let stats = run_plan_with_harness(&plan, &harness, args.duration);
         let run_ops: u64 = stats.iter().map(|s| s.requests).sum();
-        // Op-label picks on the FIRST non-Pause step type, not just
-        // protocol, because the protocol-native variants have
-        // distinct unit semantics (e.g. SseHold's op is "event"
-        // whereas SseFanout's op is "broadcast").
-        let first_step_for_label = plan.scenarios.first().and_then(|s| {
-            s.steps.iter().find(|st| {
-                !matches!(
-                    st,
-                    zerobench_core::plan::Step::Pause(_)
-                        | zerobench_core::plan::Step::PauseRandom { .. }
-                )
-            })
-        });
-        let op_label = match first_step_for_label {
-            Some(zerobench_core::plan::Step::HttpColdConnect(_)) => "cold-connects",
-            Some(zerobench_core::plan::Step::SseFanout(_)) => "broadcasts",
-            Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => "events",
-            Some(zerobench_core::plan::Step::SseHold(_)) => "events",
-            Some(zerobench_core::plan::Step::WsHold(_)) => "frames",
-            Some(zerobench_core::plan::Step::WsFanout(_)) => "broadcasts",
-            Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => "messages",
-            Some(zerobench_core::plan::Step::WsEchoRtt(_)) => "messages",
-            _ => match scenario_protocol {
-                Protocol::Http => "requests",
-                Protocol::Sse => "events",
-                Protocol::Ws => "messages",
-            },
-        };
         eprintln!(
             "[run {}/{}] {} {}",
             run_idx + 1,
             args.runs,
             run_ops,
-            op_label
+            op_label_for(&plan)
         );
 
-        // capture per-run metrics before merging into the
-        // aggregate. These are the elementary samples the bootstrap
-        // CI resamples over. Cloning TaskStats here is cheap (HDR
-        // histograms are contiguous u64 arrays; for typical bounds
-        // that's ~30 KiB per stat).
         let run_summary = Summary::merge(stats.clone(), args.duration);
-        // The protocol-native primary histogram per §P7 / §6c of
-        // the design. Compare-engine's `--regress-on` reads this
-        // slot when set; pure-HTTP runs leave it empty and the
-        // engine falls through to the generic `latency` field.
-        let proto_hist = pick_primary_histogram(&run_summary, &plan);
-        let proto_latency = if std::ptr::eq(
-            proto_hist as *const _,
-            &run_summary.latency as *const _,
-        ) {
-            LatencyExport::default()
-        } else {
-            LatencyExport::from_hist(proto_hist)
-        };
-        per_run.push(PerRunMetrics {
-            index: run_idx,
-            rate_per_s: run_summary.requests_per_sec(),
-            requests: run_summary.requests,
-            errors_total: run_summary.errors.total(),
-            latency: LatencyExport::from_hist(&run_summary.latency),
-            protocol_latency: proto_latency,
-        });
-        // Silence unused-import warning when LatencyExport /
-        // ErrorCountersExport / PerRunMetrics happen not to be used
-        // in some build configurations.
-        let _ = std::marker::PhantomData::<(LatencyExport, ErrorCountersExport)>::default();
-
+        per_run.push(build_per_run_metrics(run_idx, &run_summary, &plan));
         all_stats.extend(stats);
     }
 
     // -------------------------------------------------------------------
-    // Merge + render
+    // Merge + render + archive finalise
     // -------------------------------------------------------------------
-
     let total_measured = args.duration.saturating_mul(args.runs);
     let summary = Summary::merge(all_stats, total_measured);
-    {
-        use std::io::{IsTerminal, Write};
-        let is_tty = std::io::stdout().is_terminal();
-        let mut out = std::io::stdout().lock();
-        let _ = zerobench_report::print_terminal(
-            &summary,
-            &plan,
-            ColorChoice::Auto,
-            is_tty,
-            &mut out,
-        );
-        let _ = out.flush();
-    }
+    render_stdout(&summary, &plan);
 
-    // -------------------------------------------------------------------
-    // Archive finalisation
-    // -------------------------------------------------------------------
+    let comment = format!(
+        "zerobench {} · plan={} · target={} · run_id={}",
+        env!("CARGO_PKG_VERSION"),
+        plan.name,
+        args.url,
+        archive.run_id(),
+    );
+    archive.finalise(
+        &summary,
+        per_run,
+        &plan,
+        total_measured,
+        &comment,
+        pick_primary_histogram,
+    )?;
 
-    if let Some(writer) = archive_writer {
-        env.set_ended();
-        writer.write_env(&env)?;
-
-        // emit result.json with the Summary projection.
-        let mut export = summary.to_export();
-        // attach per-run metric vectors so the compare
-        // engine can bootstrap CIs from the elementary samples.
-        export.per_run = per_run;
-        writer.write_result(&export)?;
-
-        // canonical HDR-V2-compressed-log sidecar. Readable
-        // by HdrHistogram Plotter, jHiccup, wrk2 pipeline, any JVM
-        // HDR consumer. Carries the raw bucket counts — where
-        // result.json carries percentile snapshots.
-        let comment = format!(
-            "zerobench {} · plan={} · target={} · run_id={}",
-            env!("CARGO_PKG_VERSION"),
-            plan.name,
-            args.url,
-            id,
-        );
-        // PHILOSOPHY §P7 / design §5c: downstream tooling (HDR
-        // plotter, Grafana) consumes the histlog. For HTTP the main
-        // `summary.latency` is the right histogram; for
-        // protocol-native backends it's empty — the real signal
-        // lives in the per-scenario SseExtras / WsExtras slot.
-        // Pick the primary histogram per the same per-protocol
-        // rules as the terminal report.
-        let primary_hist = pick_primary_histogram(&summary, &plan);
-        writer.write_histlog(
-            "result",
-            primary_hist,
-            run_start_wall,
-            total_measured,
-            Some(&comment),
-        )?;
-
-        let index = Index {
-            schema_version: Index::SCHEMA_VERSION,
-            schema_versions: SchemaVersions {
-                plan: 1,
-                machine: MachineFingerprint::SCHEMA_VERSION,
-                env: EnvRecord::SCHEMA_VERSION,
-                index: Index::SCHEMA_VERSION,
-                result: Some(SummaryExport::SCHEMA_VERSION),
-            },
-            plan_hash: plan_h.clone(),
-            target_fingerprint: target_fp.clone(),
-            url_fingerprint: url_fp.clone(),
-            replayed_from: None,
-        };
-        writer.finalise(&index)?;
-    }
-
-    // Exit code gates on *transport* errors (connect/read/write/
-    // timeout/keepup) only. 4xx/5xx and assertion failures are part
-    // of the benchmark signal — a load test against a route that
-    // legitimately 404s should still exit 0.
+    // Exit code gates on *transport* errors only. 4xx/5xx and assertion
+    // failures are benchmark signal — a load test against a 404 route
+    // should still exit 0.
     let hard_errors = summary.errors.hard_total();
     if summary.requests == 0 || hard_errors > 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — kept local to measure.rs
+// ---------------------------------------------------------------------------
+
+/// Build the `TransportOpts` a `measure` invocation hands to the backend.
+fn build_transport_opts(args: &MeasureArgs) -> TransportOpts {
+    TransportOpts {
+        connect_timeout: args.connect_timeout,
+        request_timeout: args.request_timeout,
+        max_conns: args.connections,
+        tcp_nodelay: true,
+        insecure_tls: args.insecure,
+        ..TransportOpts::default()
+    }
+}
+
+/// Thin wrapper that calls `zerobench_backends::run_plan` with a context
+/// materialised from `harness.ctx_for(...)`. Keeps the verb's loop
+/// readable while respecting the runtime → backends dep direction.
+fn run_plan_with_harness(
+    plan: &Plan,
+    harness: &RunHarness,
+    duration: Duration,
+) -> Vec<zerobench_core::TaskStats> {
+    let (target, opts, duration, threads, connections, rate, tls, live, stop) =
+        harness.ctx_for(duration, None, None);
+    let ctx = zerobench_backends::RunCtx {
+        target,
+        opts,
+        duration,
+        num_threads: threads,
+        connections,
+        target_rps: rate,
+        tls_config: tls,
+        live,
+        stop,
+    };
+    zerobench_backends::run_plan(plan, &ctx)
+}
+
+/// Render the final report to stdout with terminal formatting.
+fn render_stdout(summary: &Summary, plan: &Plan) {
+    use std::io::{IsTerminal, Write};
+    let is_tty = std::io::stdout().is_terminal();
+    let mut out = std::io::stdout().lock();
+    let _ = zerobench_report::print_terminal(summary, plan, ColorChoice::Auto, is_tty, &mut out);
+    let _ = out.flush();
+}
+
+/// Build a `PerRunMetrics` entry from a single-run summary. These are
+/// the elementary samples the diff tool's bootstrap CI resamples over.
+fn build_per_run_metrics(idx: u32, summary: &Summary, plan: &Plan) -> PerRunMetrics {
+    // Protocol-native primary histogram per §P7 / §6c. Compare engine's
+    // `--regress-on` reads this slot when set; pure-HTTP runs leave it
+    // empty and the engine falls through to the generic `latency` field.
+    let proto_hist = pick_primary_histogram(summary, plan);
+    let proto_latency = if std::ptr::eq(
+        proto_hist as *const _,
+        &summary.latency as *const _,
+    ) {
+        LatencyExport::default()
+    } else {
+        LatencyExport::from_hist(proto_hist)
+    };
+    PerRunMetrics {
+        index: idx,
+        rate_per_s: summary.requests_per_sec(),
+        requests: summary.requests,
+        errors_total: summary.errors.total(),
+        latency: LatencyExport::from_hist(&summary.latency),
+        protocol_latency: proto_latency,
     }
 }
 
@@ -1029,7 +833,7 @@ fn enabled_features() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zerobench_core::plan::Step;
+    use zerobench_core::plan::{Protocol, Step};
 
     fn sample_args(url: &str) -> MeasureArgs {
         MeasureArgs {

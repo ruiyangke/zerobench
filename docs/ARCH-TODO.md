@@ -115,14 +115,14 @@ Companions: `ARCH-REVIEW-2026-04-20.md` (the rewrite plan), `ARCH-TAGS.md` (mark
 |---|---|---|
 | `cli_args.rs` | KEEP (prune `#[cfg(feature=…)]`) | |
 | `diff.rs` | KEEP (trim) | Possibly dead code vs verbs/diff.rs |
-| `main.rs` | REWRITE | `ARCH(dispatch)` — THREE 3-way matches → one `backends::run_scenario` |
+| `main.rs` | REWRITTEN (Phase 4c) | `ARCH(dispatch)` collapsed in Phase 2c; ARCH STATUS header trimmed in Phase 4c |
 | `plan_from_cli.rs` | REWRITE | `ARCH(builder-unify)` |
 | `verbs/calibrate.rs` | KEEP | Already minimal |
-| `verbs/curve.rs` | REWRITE | 603 LoC → ~100 via shared runner |
+| `verbs/curve.rs` | REWRITTEN (Phase 4c) | 611 → 589 LoC; `pub fn run` 375 → 149 via `zerobench_runtime::runner` |
 | `verbs/diff.rs` | REWRITE (trim) | |
-| `verbs/measure.rs` | REWRITE | 1,468 LoC → ~150. `ARCH(dispatch)` ×2, `ARCH(builder-unify)`, `ARCH(feature-delete)` |
+| `verbs/measure.rs` | REWRITTEN (Phase 4c) | 1,174 → 978 LoC; `pub fn run` 428 → 187 via `zerobench_runtime::runner` |
 | `verbs/mod.rs` | KEEP | |
-| `verbs/probe.rs` | REWRITE (trim) | |
+| `verbs/probe.rs` | REWRITE (trim) | Not addressed in Phase 4c (uses a different backend path than measure/curve) |
 
 ### `zerobench-tui` (12 files — all KEEP)
 

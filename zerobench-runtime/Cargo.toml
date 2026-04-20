@@ -32,5 +32,9 @@ num_cpus = { workspace = true }
 memchr = { workspace = true }
 base64 = { workspace = true }
 
+[dev-dependencies]
+smallvec = { workspace = true }
+http = { workspace = true }
+
 [lints]
 workspace = true

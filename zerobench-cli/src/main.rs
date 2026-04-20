@@ -1,16 +1,12 @@
 //! zerobench — CLI entry point.
 //!
-//! ARCH STATUS: REWRITE
-//!
-//! Phase 2c collapsed the three protocol-group matches into
-//! `zerobench_backends::run_plan` calls (see ARCH-REVIEW §4.1). Still
-//! carries TUI-thread setup, dry-run output, and two dispatch wrappers
-//! (`run_mio_sync` for the default subcommand, `run_script_sync` for
-//! `zerobench run X.rhai`). Target: <200 LoC — next step is to fold
-//! TUI wiring into a shared runner.
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §6 Phase 4, §7.
-//!
 //! Synchronous, mio/epoll-based. Zero async runtime.
+//!
+//! `run_mio_sync` is the bare-bench path used by `zerobench <url>`;
+//! `run_script_sync` is the Rhai-script path. Both route protocol
+//! dispatch through `zerobench_backends::run_plan` (Phase 2c). The
+//! rigorous verbs (`measure`, `curve`) consume the shared runner in
+//! `zerobench_runtime::runner` (Phase 4c).
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
