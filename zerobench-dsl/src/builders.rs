@@ -27,9 +27,11 @@
 //! finalized, and then the engine is dropped. The resulting [`Plan`] is
 //! a pure Rust data structure — no Rhai traces remain.
 //!
-//! ARCH(builder-unify): the per-protocol construction in [`compile_step`]
-//! duplicates the CLI's `plan_from_cli.rs`. Resolved in Phase 4b
-//! (CLI/DSL unify) — see ARCH-REVIEW §4.5, §B3, §B5.
+//! Per-protocol construction in [`compile_step`] delegates to the shared
+//! typed constructors in `zerobench_core::plan_builder`. Adding a field
+//! to a `*Plan` struct happens in one place there; the CLI's
+//! `plan_from_cli.rs` / `verbs/*` and this DSL both feed the same
+//! constructors (ARCH-REVIEW §4.5, Phase 4b).
 
 use std::time::Duration;
 
@@ -40,6 +42,12 @@ use smallvec::SmallVec;
 
 use zerobench_core::plan::{
     Assertion, BodySource, Extract, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
+    TriggerSpec,
+};
+use zerobench_core::plan_builder::{
+    scenario_http_cold_connect, scenario_http_request, scenario_sse_fanout, scenario_sse_hold,
+    scenario_sse_reconnect_storm, scenario_ws_echo_rtt, scenario_ws_fanout, scenario_ws_hold,
+    scenario_ws_server_push_rtt,
 };
 use zerobench_core::template::{Template, TemplateError};
 use zerobench_core::transport::HttpVersionPref;
@@ -874,11 +882,29 @@ fn compile_headers<const N: usize>(
     Ok(out)
 }
 
+/// Extract the single [`Step`] from a one-step [`Scenario`] built via
+/// `zerobench_core::plan_builder::scenario_*`. Every DSL `StepSource`
+/// maps to exactly one wire step, so the scenario always has exactly
+/// one step; the wrapper Scenario's `name` and `rate` are discarded here
+/// because the owning [`ScenarioBuilder`] already picks both.
+#[inline]
+fn into_step(scenario: Scenario) -> Step {
+    scenario
+        .steps
+        .into_iter()
+        .next()
+        .expect("scenario_* constructor always produces a one-step Scenario")
+}
+
 fn compile_step(
     src: StepSource,
     vars: &mut VarRegistry,
     scenario: &str,
 ) -> Result<Step, ScriptError> {
+    // Rate carried on each intermediate Scenario is irrelevant here —
+    // `finalize_state` overrides it from the ScenarioBuilder's own
+    // rate/weight/saturate resolution. Pick a cheap placeholder.
+    let placeholder_rate = RateProfile::Saturate { max_concurrency: 1 };
     match src {
         StepSource::Pause(d) => Ok(Step::Pause(d)),
         StepSource::PauseRandom { min, max } => Ok(Step::PauseRandom { min, max }),
@@ -890,13 +916,15 @@ fn compile_step(
                 hold_for,
                 reconnect,
             } = sb.take_state();
-            Ok(Step::SseHold(zerobench_core::plan::SseHoldPlan {
-                url: compile_tpl(&url, vars, scenario, format!("sse_hold url {url:?}"))?,
-                headers: compile_headers(headers, vars, scenario, "sse_hold")?,
+            let s = scenario_sse_hold(
+                scenario,
                 subscribers,
                 hold_for,
+                compile_tpl(&url, vars, scenario, format!("sse_hold url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "sse_hold")?,
                 reconnect,
-            }))
+            );
+            Ok(into_step(s))
         }
         StepSource::WsEchoRtt(wb) => {
             let WsEchoRttBuilderState {
@@ -907,14 +935,17 @@ fn compile_step(
                 payload,
                 correlate,
             } = wb.take_state();
-            Ok(Step::WsEchoRtt(zerobench_core::plan::WsEchoRttPlan {
-                url: compile_tpl(&url, vars, scenario, format!("ws_echo_rtt url {url:?}"))?,
-                headers: compile_headers(headers, vars, scenario, "ws_echo_rtt")?,
+            let s = scenario_ws_echo_rtt(
+                scenario,
+                placeholder_rate,
+                compile_tpl(&url, vars, scenario, format!("ws_echo_rtt url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "ws_echo_rtt")?,
                 connections,
                 msg_rate_per_conn,
+                compile_tpl(&payload, vars, scenario, "ws_echo_rtt payload")?,
                 correlate,
-                payload: compile_tpl(&payload, vars, scenario, "ws_echo_rtt payload")?,
-            }))
+            );
+            Ok(into_step(s))
         }
         StepSource::WsHold(hb) => {
             let WsHoldBuilderState {
@@ -925,14 +956,16 @@ fn compile_step(
                 heartbeat_frame,
                 hold_for,
             } = hb.take_state();
-            Ok(Step::WsHold(zerobench_core::plan::WsHoldPlan {
-                url: compile_tpl(&url, vars, scenario, format!("ws_hold url {url:?}"))?,
-                headers: compile_headers(headers, vars, scenario, "ws_hold")?,
+            let s = scenario_ws_hold(
+                scenario,
                 connections,
+                hold_for,
+                compile_tpl(&url, vars, scenario, format!("ws_hold url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "ws_hold")?,
                 heartbeat,
                 heartbeat_frame,
-                hold_for,
-            }))
+            );
+            Ok(into_step(s))
         }
         StepSource::SseFanout(fb) => {
             let SseFanoutBuilderState {
@@ -953,15 +986,14 @@ fn compile_step(
                     ),
                 });
             }
-            Ok(Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
-                subscribers: zerobench_core::plan::SseHoldPlan {
-                    url: compile_tpl(&url, vars, scenario, format!("sse_fanout url {url:?}"))?,
-                    headers: compile_headers(headers, vars, scenario, "sse_fanout")?,
-                    subscribers,
-                    hold_for,
-                    reconnect,
-                },
-                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+            let s = scenario_sse_fanout(
+                scenario,
+                subscribers,
+                hold_for,
+                compile_tpl(&url, vars, scenario, format!("sse_fanout url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "sse_fanout")?,
+                reconnect,
+                TriggerSpec::HttpPost {
                     url: compile_tpl(
                         &trigger_url,
                         vars,
@@ -971,7 +1003,8 @@ fn compile_step(
                     body: None,
                 },
                 mode,
-            }))
+            );
+            Ok(into_step(s))
         }
         StepSource::SseReconnectStorm(sb) => {
             let SseReconnectStormBuilderState {
@@ -982,24 +1015,21 @@ fn compile_step(
                 kill_rate_per_s,
                 verify_last_event_id,
             } = sb.take_state();
-            Ok(Step::SseReconnectStorm(
-                zerobench_core::plan::SseReconnectStormPlan {
-                    subscribers: zerobench_core::plan::SseHoldPlan {
-                        url: compile_tpl(
-                            &url,
-                            vars,
-                            scenario,
-                            format!("sse_reconnect_storm url {url:?}"),
-                        )?,
-                        headers: compile_headers(headers, vars, scenario, "sse_reconnect_storm")?,
-                        subscribers,
-                        hold_for,
-                        reconnect: true,
-                    },
-                    kill_rate_per_s,
-                    verify_last_event_id,
-                },
-            ))
+            let s = scenario_sse_reconnect_storm(
+                scenario,
+                subscribers,
+                hold_for,
+                compile_tpl(
+                    &url,
+                    vars,
+                    scenario,
+                    format!("sse_reconnect_storm url {url:?}"),
+                )?,
+                compile_headers(headers, vars, scenario, "sse_reconnect_storm")?,
+                kill_rate_per_s,
+                verify_last_event_id,
+            );
+            Ok(into_step(s))
         }
         StepSource::WsFanout(fb) => {
             let WsFanoutBuilderState {
@@ -1021,16 +1051,15 @@ fn compile_step(
                     ),
                 });
             }
-            Ok(Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
-                subscribers: zerobench_core::plan::WsHoldPlan {
-                    url: compile_tpl(&url, vars, scenario, format!("ws_fanout url {url:?}"))?,
-                    headers: compile_headers(headers, vars, scenario, "ws_fanout")?,
-                    connections,
-                    heartbeat,
-                    heartbeat_frame,
-                    hold_for,
-                },
-                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
+            let s = scenario_ws_fanout(
+                scenario,
+                connections,
+                hold_for,
+                compile_tpl(&url, vars, scenario, format!("ws_fanout url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "ws_fanout")?,
+                heartbeat,
+                heartbeat_frame,
+                TriggerSpec::HttpPost {
                     url: compile_tpl(
                         &trigger_url,
                         vars,
@@ -1040,7 +1069,8 @@ fn compile_step(
                     body: None,
                 },
                 mode,
-            }))
+            );
+            Ok(into_step(s))
         }
         StepSource::WsServerPush(pb) => {
             let WsServerPushBuilderState {
@@ -1050,15 +1080,15 @@ fn compile_step(
                 expected_rate_per_conn,
                 hold_for,
             } = pb.take_state();
-            Ok(Step::WsServerPushRtt(
-                zerobench_core::plan::WsServerPushRttPlan {
-                    url: compile_tpl(&url, vars, scenario, format!("ws_server_push url {url:?}"))?,
-                    headers: compile_headers(headers, vars, scenario, "ws_server_push")?,
-                    connections,
-                    expected_rate_per_conn,
-                    hold_for,
-                },
-            ))
+            let s = scenario_ws_server_push_rtt(
+                scenario,
+                connections,
+                hold_for,
+                compile_tpl(&url, vars, scenario, format!("ws_server_push url {url:?}"))?,
+                compile_headers(headers, vars, scenario, "ws_server_push")?,
+                expected_rate_per_conn,
+            );
+            Ok(into_step(s))
         }
         StepSource::Request(rb) => {
             let RequestBuilderState {
@@ -1094,11 +1124,12 @@ fn compile_step(
                 checks,
                 expect_streaming: false,
             };
-            Ok(if cold {
-                Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan { request })
+            let s = if cold {
+                scenario_http_cold_connect(scenario, placeholder_rate, request)
             } else {
-                Step::Request(request)
-            })
+                scenario_http_request(scenario, placeholder_rate, request)
+            };
+            Ok(into_step(s))
         }
     }
 }

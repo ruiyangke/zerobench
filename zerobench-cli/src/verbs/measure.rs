@@ -3,8 +3,9 @@
 //! Still contains the per-run lifecycle (warmup → measure → cooldown ×
 //! runs, archive, calibration gates) inline in `pub fn run`. Phase 2c
 //! collapsed the 9-arm dispatch matches into `zerobench_backends::run_plan`
-//! (see `ARCH-REVIEW §4.1`). The remaining restructuring:
-//!   - Plan construction from CLI args (~200 LoC) — see ARCH(builder-unify)
+//! (see `ARCH-REVIEW §4.1`). Phase 4b collapsed the per-protocol plan
+//! construction (~200 LoC) into shared `zerobench_core::plan_builder`
+//! constructors. The remaining restructuring:
 //!   - Runs loop / archive finalise belongs in a shared
 //!     `zerobench-runtime::runner` module that probe / curve / compare /
 //!     replay share.
@@ -48,13 +49,17 @@ use clap::{ArgAction, Args};
 use smallvec::SmallVec;
 
 use zerobench_core::plan::{
-    CorrelateStrategy, Mode, Plan, Protocol, RateProfile, RequestPlan, Scenario, SseHoldPlan,
-    Step, WsEchoRttPlan,
+    CorrelateStrategy, FanoutMode, HeartbeatFrame, Mode, Plan, Protocol, RateProfile, RequestPlan,
+    TriggerSpec,
+};
+use zerobench_core::plan_builder::{
+    scenario_http_cold_connect, scenario_http_request, scenario_sse_fanout, scenario_sse_hold,
+    scenario_sse_reconnect_storm, scenario_ws_echo_rtt, scenario_ws_fanout, scenario_ws_hold,
+    scenario_ws_server_push_rtt, PlanBuilder,
 };
 use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::var::VarRegistry;
 use zerobench_core::{Summary, SummaryExport, TaskStats};
 use zerobench_report::report::pick_primary_histogram;
 use zerobench_report::ColorChoice;
@@ -828,164 +833,125 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 // Plan construction
 // ---------------------------------------------------------------------------
+//
+// Per-protocol plan construction delegates to
+// `zerobench_core::plan_builder::scenario_*`. Adding a field to a
+// `*Plan` struct happens in one place now: the scenario constructor in
+// core. The CLI translator (here) and the Rhai DSL
+// (`zerobench_dsl::builders::compile_step`) both feed it.
 
-// ARCH(builder-unify): ~200 LoC of per-protocol plan construction duplicated
-// with zerobench-dsl/src/builders.rs. Target: one typed PlanBuilder per
-// *Plan struct, called by BOTH this CLI translator AND the Rhai DSL —
-// see ARCH-REVIEW §4.5, §B5.
 fn build_measure_plan(
     args: &MeasureArgs,
     target: &Target,
     name: &str,
 ) -> Result<Plan, Box<dyn std::error::Error>> {
-    let mut vars = VarRegistry::new();
-    let url = Template::compile(&args.url, &mut vars)?;
+    let mut builder = PlanBuilder::new();
+    builder
+        .name(name)
+        .duration(args.duration)
+        .warmup(args.warmup)
+        .cooldown(args.cooldown)
+        .runs(args.runs)
+        .threads(args.threads)
+        .mode(Mode::Measure);
+
+    let url = Template::compile(&args.url, builder.vars_mut())?;
+    let hold_for_default = || args.hold_for.unwrap_or(args.duration);
 
     let scenario = if let Some(subscribers) = args.sse_fanout {
         let Some(trig) = args.trigger_url.as_ref() else {
             return Err("--sse-fanout requires --trigger-url".into());
         };
-        let trigger = Template::compile(trig, &mut vars)?;
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        Scenario {
-            name: "sse-fanout".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: subscribers as usize,
+        let trigger = Template::compile(trig, builder.vars_mut())?;
+        scenario_sse_fanout(
+            "sse-fanout",
+            subscribers,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            true,
+            TriggerSpec::HttpPost {
+                url: trigger,
+                body: None,
             },
-            steps: vec![Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
-                subscribers: SseHoldPlan {
-                    url,
-                    headers: SmallVec::new(),
-                    subscribers,
-                    hold_for,
-                    reconnect: true,
-                },
-                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
-                    url: trigger,
-                    body: None,
-                },
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-            })],
-        }
+            FanoutMode::TriggerRtt,
+        )
     } else if let Some(connections) = args.ws_fanout {
         let Some(trig) = args.trigger_url.as_ref() else {
             return Err("--ws-fanout requires --trigger-url".into());
         };
-        let trigger = Template::compile(trig, &mut vars)?;
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        Scenario {
-            name: "ws-fanout".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: connections as usize,
+        let trigger = Template::compile(trig, builder.vars_mut())?;
+        scenario_ws_fanout(
+            "ws-fanout",
+            connections,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            args.ws_heartbeat.unwrap_or(Duration::from_secs(25)),
+            HeartbeatFrame::Ping,
+            TriggerSpec::HttpPost {
+                url: trigger,
+                body: None,
             },
-            steps: vec![Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
-                subscribers: zerobench_core::plan::WsHoldPlan {
-                    url,
-                    headers: SmallVec::new(),
-                    connections,
-                    heartbeat: args.ws_heartbeat.unwrap_or(Duration::from_secs(25)),
-                    heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-                    hold_for,
-                },
-                trigger: zerobench_core::plan::TriggerSpec::HttpPost {
-                    url: trigger,
-                    body: None,
-                },
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-            })],
-        }
+            FanoutMode::TriggerRtt,
+        )
     } else if let Some(subscribers) = args.sse_reconnect_storm {
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        Scenario {
-            name: "sse-reconnect-storm".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: subscribers as usize,
-            },
-            steps: vec![Step::SseReconnectStorm(
-                zerobench_core::plan::SseReconnectStormPlan {
-                    subscribers: SseHoldPlan {
-                        url,
-                        headers: SmallVec::new(),
-                        subscribers,
-                        hold_for,
-                        reconnect: true,
-                    },
-                    kill_rate_per_s: args.kill_rate,
-                    verify_last_event_id: true,
-                },
-            )],
-        }
+        scenario_sse_reconnect_storm(
+            "sse-reconnect-storm",
+            subscribers,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            args.kill_rate,
+            true,
+        )
     } else if let Some(connections) = args.ws_hold {
         // WsHold — N persistent connections + heartbeat.
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        let heartbeat = args.ws_heartbeat.unwrap_or(Duration::from_secs(25));
-        Scenario {
-            name: "ws-hold".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: connections as usize,
-            },
-            steps: vec![Step::WsHold(zerobench_core::plan::WsHoldPlan {
-                url,
-                headers: SmallVec::new(),
-                connections,
-                heartbeat,
-                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-                hold_for,
-            })],
-        }
+        scenario_ws_hold(
+            "ws-hold",
+            connections,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            args.ws_heartbeat.unwrap_or(Duration::from_secs(25)),
+            HeartbeatFrame::Ping,
+        )
     } else if let Some(connections) = args.ws_push {
         // WsServerPushRtt — read-only, measure inter-message gap.
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        Scenario {
-            name: "ws-push".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: connections as usize,
-            },
-            steps: vec![Step::WsServerPushRtt(
-                zerobench_core::plan::WsServerPushRttPlan {
-                    url,
-                    headers: SmallVec::new(),
-                    connections,
-                    expected_rate_per_conn: args.ws_expected_rate,
-                    hold_for,
-                },
-            )],
-        }
+        scenario_ws_server_push_rtt(
+            "ws-push",
+            connections,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            args.ws_expected_rate,
+        )
     } else if let Some(connections) = args.ws_echo {
-        // WS Echo RTT mode — build Step::WsEchoRtt with
-        // N persistent connections at msg_rate/conn.
-        let payload = Template::compile(&args.ws_payload, &mut vars)?;
-        Scenario {
-            name: "ws-echo-rtt".into(),
-            rate: RateProfile::Saturate {
+        // WS Echo RTT mode — N persistent connections at msg_rate/conn.
+        let payload = Template::compile(&args.ws_payload, builder.vars_mut())?;
+        scenario_ws_echo_rtt(
+            "ws-echo-rtt",
+            RateProfile::Saturate {
                 max_concurrency: connections as usize,
             },
-            steps: vec![Step::WsEchoRtt(WsEchoRttPlan {
-                url,
-                headers: SmallVec::new(),
-                connections,
-                msg_rate_per_conn: args.ws_msg_rate,
-                correlate: CorrelateStrategy::MonotonicIdPrepend,
-                payload,
-            })],
-        }
+            url,
+            SmallVec::new(),
+            connections,
+            args.ws_msg_rate,
+            payload,
+            CorrelateStrategy::MonotonicIdPrepend,
+        )
     } else if let Some(subscribers) = args.sse_hold {
-        // SSE Hold mode — build Step::SseHold with
-        // N subscribers held for `hold_for` (defaults to --duration).
-        let hold_for = args.hold_for.unwrap_or(args.duration);
-        Scenario {
-            name: "sse-hold".into(),
-            rate: RateProfile::Saturate {
-                max_concurrency: subscribers as usize,
-            },
-            steps: vec![Step::SseHold(SseHoldPlan {
-                url,
-                headers: SmallVec::new(),
-                subscribers,
-                hold_for,
-                reconnect: args.sse_reconnect,
-            })],
-        }
+        // SSE Hold mode — N subscribers held for `hold_for`
+        // (defaults to --duration).
+        scenario_sse_hold(
+            "sse-hold",
+            subscribers,
+            hold_for_default(),
+            url,
+            SmallVec::new(),
+            args.sse_reconnect,
+        )
     } else {
         // HTTP — single-step GET. Multi-step scenarios
         // go through `zerobench run` (Rhai).
@@ -1006,17 +972,10 @@ fn build_measure_plan(
             },
         };
 
-        let step = if args.cold_connect {
-            Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan {
-                request,
-            })
+        if args.cold_connect {
+            scenario_http_cold_connect("measure", rate, request)
         } else {
-            Step::Request(request)
-        };
-        Scenario {
-            name: "measure".into(),
-            rate,
-            steps: vec![step],
+            scenario_http_request("measure", rate, request)
         }
     };
 
@@ -1026,17 +985,8 @@ fn build_measure_plan(
     // sibling verb builders and future multi-scenario construction.
     let _ = target;
 
-    Ok(Plan {
-        scenarios: vec![scenario],
-        vars,
-        duration: args.duration,
-        warmup: args.warmup,
-        cooldown: args.cooldown,
-        runs: args.runs,
-        threads: args.threads,
-        mode: Mode::Measure,
-        name: name.to_string(),
-    })
+    builder.push_scenario(scenario);
+    Ok(builder.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1029,7 @@ fn enabled_features() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerobench_core::plan::Step;
 
     fn sample_args(url: &str) -> MeasureArgs {
         MeasureArgs {

@@ -1,34 +1,26 @@
-//! ARCH STATUS: REWRITE
-//!
-//! ARCH(builder-unify): this module and measure.rs::build_measure_plan
-//! are two copies of "CLI flags → Plan". Target: rewrite to delegate
-//! every per-protocol construction to the shared typed PlanBuilder
-//! (also consumed by zerobench-dsl's Rhai bindings). See ARCH-REVIEW
-//! §4.5, §B5.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Convert a parsed [`CliArgs`] into a runnable
 //! ([`Plan`], [`Target`], [`TransportOpts`]) triple.
 //!
 //! The conversion is pure — no IO beyond optional `--body-file` /
 //! `--request-file` / `--requests` reads — which makes it easy to
 //! unit-test without standing up a runtime.
+//!
+//! Plan construction delegates to
+//! [`zerobench_core::plan_builder`] — the typed builder both the CLI
+//! and DSL share (ARCH-REVIEW §4.5, Phase 4b).
 
 use std::fs;
 use std::time::Duration;
 
 use http::Method;
 use smallvec::SmallVec;
-use zerobench_core::plan::{
-    Assertion, BodySource, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
-};
+use zerobench_core::plan::{Assertion, BodySource, Plan, RateProfile, RequestPlan};
+use zerobench_core::plan_builder::{scenario_http_request, PlanBuilder};
 use zerobench_core::request_file::{
     parse_request_bytes, parse_scenario_dir, RequestFileError,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::{HttpVersionPref, Target, TargetError, TransportOpts};
-use zerobench_core::var::VarRegistry;
 
 use crate::cli_args::{CliArgs, CliHttpVersion};
 
@@ -107,7 +99,7 @@ pub fn build(args: &CliArgs) -> Result<(Plan, Target, TransportOpts), BuildError
 }
 
 // ---------------------------------------------------------------------------
-// Single-URL mode 
+// Single-URL mode
 // ---------------------------------------------------------------------------
 
 fn build_from_url(
@@ -143,9 +135,14 @@ fn build_from_url(
         );
     }
 
-    // Build the registry + URL template.
-    let mut vars = VarRegistry::new();
-    let url_tpl = Template::compile(url, &mut vars)?;
+    // `PlanBuilder` owns the VarRegistry; we compile templates against
+    // it in place.
+    let mut builder = PlanBuilder::new();
+    builder
+        .duration(args.duration)
+        .warmup(args.warmup.unwrap_or(Duration::ZERO));
+
+    let url_tpl = Template::compile(url, builder.vars_mut())?;
 
     // Headers — both sides through the template engine. Auth headers
     // derived from --basic-auth / --bearer are appended after the
@@ -159,17 +156,20 @@ fn build_from_url(
 
     let mut headers: SmallVec<[(Template, Template); 8]> = SmallVec::new();
     for (name, value) in &args.headers {
-        let name_tpl = Template::compile(name, &mut vars)?;
-        let value_tpl = Template::compile(value, &mut vars)?;
+        let name_tpl = Template::compile(name, builder.vars_mut())?;
+        let value_tpl = Template::compile(value, builder.vars_mut())?;
         headers.push((name_tpl, value_tpl));
     }
-    push_auth_header(args, user_has_auth_header, &mut vars, &mut headers)?;
+    push_auth_header(args, user_has_auth_header, &mut builder, &mut headers)?;
 
     // Body — precedence: inline --body > --body-file > --json > --form.
     // clap's `conflicts_with` ensures at most one of these is set, so
     // the order here only matters for defensive code review.
     let body = if let Some(inline) = &args.body {
-        Some(BodySource::Template(Template::compile(inline, &mut vars)?))
+        Some(BodySource::Template(Template::compile(
+            inline,
+            builder.vars_mut(),
+        )?))
     } else if let Some(path) = &args.body_file {
         let bytes = fs::read(path)?;
         Some(BodySource::Static(bytes::Bytes::from(bytes)))
@@ -177,18 +177,24 @@ fn build_from_url(
         push_content_type(
             "application/json",
             &args.headers,
-            &mut vars,
+            &mut builder,
             &mut headers,
         )?;
-        Some(BodySource::Template(Template::compile(json, &mut vars)?))
+        Some(BodySource::Template(Template::compile(
+            json,
+            builder.vars_mut(),
+        )?))
     } else if let Some(form) = &args.form {
         push_content_type(
             "application/x-www-form-urlencoded",
             &args.headers,
-            &mut vars,
+            &mut builder,
             &mut headers,
         )?;
-        Some(BodySource::Template(Template::compile(form, &mut vars)?))
+        Some(BodySource::Template(Template::compile(
+            form,
+            builder.vars_mut(),
+        )?))
     } else {
         None
     };
@@ -206,26 +212,12 @@ fn build_from_url(
     };
 
     let rate = pick_rate_profile(args, 1.0);
-    let scenario = Scenario {
-        name: "cli".into(),
-        rate,
-        steps: vec![Step::Request(request)],
-    };
+    builder.push_scenario(scenario_http_request("cli", rate, request));
 
     // NOTE (S1.6): `plan.warmup` is plumbed from the CLI but the mio
     // dispatch layer in zerobench-backends::http doesn't honour it yet —
     // it starts measuring on first request. TODO: wire through.
-    let plan = Plan {
-        scenarios: vec![scenario],
-        vars,
-        duration: args.duration,
-        warmup: args.warmup.unwrap_or(Duration::ZERO),
-        cooldown: Duration::ZERO,
-        runs: 1,
-        threads: 1,
-        mode: Mode::default(),
-        name: String::new(),
-    };
+    let plan = builder.finalize();
 
     Ok((plan, target, opts.clone()))
 }
@@ -235,7 +227,7 @@ fn build_from_url(
 fn push_auth_header(
     args: &CliArgs,
     user_has_auth_header: bool,
-    vars: &mut VarRegistry,
+    builder: &mut PlanBuilder,
     headers: &mut SmallVec<[(Template, Template); 8]>,
 ) -> Result<(), BuildError> {
     use base64::engine::general_purpose::STANDARD as B64;
@@ -257,8 +249,8 @@ fn push_auth_header(
         return Ok(());
     }
     headers.push((
-        Template::compile("Authorization", vars)?,
-        Template::compile(&value, vars)?,
+        Template::compile("Authorization", builder.vars_mut())?,
+        Template::compile(&value, builder.vars_mut())?,
     ));
     Ok(())
 }
@@ -268,7 +260,7 @@ fn push_auth_header(
 fn push_content_type(
     ct: &str,
     user_headers: &[(String, String)],
-    vars: &mut VarRegistry,
+    builder: &mut PlanBuilder,
     headers: &mut SmallVec<[(Template, Template); 8]>,
 ) -> Result<(), BuildError> {
     let already = user_headers
@@ -278,8 +270,8 @@ fn push_content_type(
         return Ok(());
     }
     headers.push((
-        Template::compile("Content-Type", vars)?,
-        Template::compile(ct, vars)?,
+        Template::compile("Content-Type", builder.vars_mut())?,
+        Template::compile(ct, builder.vars_mut())?,
     ));
     Ok(())
 }
@@ -299,8 +291,12 @@ fn build_from_request_file(
         .and_then(|s| s.to_str())
         .unwrap_or("request-file");
 
-    let mut vars = VarRegistry::new();
-    let parsed = parse_request_bytes(&bytes, source_name, &mut vars)?;
+    let mut builder = PlanBuilder::new();
+    builder
+        .duration(args.duration)
+        .warmup(args.warmup.unwrap_or(Duration::ZERO));
+
+    let parsed = parse_request_bytes(&bytes, source_name, builder.vars_mut())?;
     let target = parsed.target.clone();
 
     let checks = build_checks(args);
@@ -321,22 +317,8 @@ fn build_from_request_file(
         .and_then(|s| s.to_str())
         .unwrap_or("request")
         .to_string();
-    let scenario = Scenario {
-        name,
-        rate,
-        steps: vec![Step::Request(request)],
-    };
-    let plan = Plan {
-        scenarios: vec![scenario],
-        vars,
-        duration: args.duration,
-        warmup: args.warmup.unwrap_or(Duration::ZERO),
-        cooldown: Duration::ZERO,
-        runs: 1,
-        threads: 1,
-        mode: Mode::default(),
-        name: String::new(),
-    };
+    builder.push_scenario(scenario_http_request(name, rate, request));
+    let plan = builder.finalize();
 
     Ok((plan, target, opts.clone()))
 }
@@ -369,8 +351,11 @@ fn build_from_request_dir(
     }
 
     let checks = build_checks(args);
-    let mut vars = VarRegistry::new();
-    let mut scenarios: Vec<Scenario> = Vec::with_capacity(entries.len());
+    let mut builder = PlanBuilder::new();
+    builder
+        .duration(args.duration)
+        .warmup(args.warmup.unwrap_or(Duration::ZERO));
+
     let mut first_target: Option<(String, Target)> = None;
     // Collect every scenario's (filename, host:port) so we can report
     // the whole mismatch set in one shot rather than erroring on the
@@ -384,7 +369,7 @@ fn build_from_request_dir(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("request-file");
-        let parsed = parse_request_bytes(&bytes, source_name, &mut vars)?;
+        let parsed = parse_request_bytes(&bytes, source_name, builder.vars_mut())?;
 
         let authority = format_authority(&parsed.target);
         host_summary.push((source_name.to_string(), authority));
@@ -403,11 +388,7 @@ fn build_from_request_dir(
             expect_streaming: false,
         };
         let rate = pick_rate_profile(args, entry.weight as f64);
-        scenarios.push(Scenario {
-            name: entry.name.clone(),
-            rate,
-            steps: vec![Step::Request(request)],
-        });
+        builder.push_scenario(scenario_http_request(entry.name.clone(), rate, request));
     }
 
     // Detect and surface multi-host inconsistency. We compare by
@@ -432,17 +413,7 @@ fn build_from_request_dir(
     }
 
     let target = first;
-    let plan = Plan {
-        scenarios,
-        vars,
-        duration: args.duration,
-        warmup: args.warmup.unwrap_or(Duration::ZERO),
-        cooldown: Duration::ZERO,
-        runs: 1,
-        threads: 1,
-        mode: Mode::default(),
-        name: String::new(),
-    };
+    let plan = builder.finalize();
     Ok((plan, target, opts.clone()))
 }
 
@@ -499,6 +470,7 @@ fn pick_rate_profile(args: &CliArgs, weight: f64) -> RateProfile {
 mod tests {
     use super::*;
     use clap::Parser;
+    use zerobench_core::plan::Step;
 
     fn parse(argv: &[&str]) -> CliArgs {
         CliArgs::try_parse_from(argv).unwrap()

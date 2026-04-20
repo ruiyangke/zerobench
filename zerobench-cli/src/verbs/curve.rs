@@ -1,11 +1,11 @@
 //! ARCH STATUS: REWRITE
 //!
 //! Phase 2c routed the HTTP backend call through
-//! `zerobench_backends::run_plan` — dispatch is now a single call. Still
-//! duplicates plan construction with measure.rs (ARCH(builder-unify))
-//! and its own runs/archive lifecycle. Post-rewrite: ~100 LoC wrapping
-//! runner.execute() in a rate-sweep loop.
-//! See ARCH-REVIEW §6 Phase 4, §B2.
+//! `zerobench_backends::run_plan` — dispatch is now a single call. Phase
+//! 4b collapsed plan construction into `zerobench_core::plan_builder`,
+//! shared with measure.rs and the DSL. Still has its own runs/archive
+//! lifecycle. Post-rewrite: ~100 LoC wrapping runner.execute() in a
+//! rate-sweep loop. See ARCH-REVIEW §6 Phase 4, §B2.
 //!
 //! ----------------------------------------------------------------------
 //!
@@ -27,11 +27,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::Args;
 use smallvec::SmallVec;
-use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
+use zerobench_core::plan::{Mode, RateProfile, RequestPlan};
+use zerobench_core::plan_builder::{scenario_http_request, PlanBuilder};
 use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::var::VarRegistry;
 use zerobench_core::{Summary, SummaryExport};
 use zerobench_runtime::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
 use zerobench_runtime::calibrate::ClientSelfCheck;
@@ -169,38 +169,35 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         ..TransportOpts::default()
     };
 
-    let mut vars = VarRegistry::new();
-    let url_tpl = Template::compile(&args.url, &mut vars)?;
-    let base_plan = Plan {
-        scenarios: vec![Scenario {
-            name: "curve".into(),
-            rate: RateProfile::Constant(args.from_rate),
-            steps: vec![Step::Request(RequestPlan {
-                method: http::Method::GET,
-                url: url_tpl,
-                headers: SmallVec::new(),
-                body: None,
-                extract: Vec::new(),
-                checks: Vec::new(),
-                expect_streaming: false,
-            })],
-        }],
-        vars,
-        duration: args.over,
-        warmup: Duration::ZERO,
-        cooldown: Duration::ZERO,
-        runs: 1,
-        threads: args.threads,
-        mode: Mode::Curve {
+    let mut builder = PlanBuilder::new();
+    builder
+        .name(name.clone())
+        .duration(args.over)
+        .threads(args.threads)
+        .mode(Mode::Curve {
             from_rate: args.from_rate,
             to_rate: args.to_rate,
             ramp_duration: args.over,
             knee: zerobench_core::plan::KneeCriterion::P99Ratio {
                 factor: args.knee_p99_mult,
             },
-        },
-        name: name.clone(),
+        });
+    let url_tpl = Template::compile(&args.url, builder.vars_mut())?;
+    let request = RequestPlan {
+        method: http::Method::GET,
+        url: url_tpl,
+        headers: SmallVec::new(),
+        body: None,
+        extract: Vec::new(),
+        checks: Vec::new(),
+        expect_streaming: false,
     };
+    builder.push_scenario(scenario_http_request(
+        "curve",
+        RateProfile::Constant(args.from_rate),
+        request,
+    ));
+    let base_plan = builder.finalize();
 
     let resolved = target.resolve(&opts)?;
     let resolved_vec = vec![resolved];

@@ -8,6 +8,9 @@
 //!   - [`plan`]             — `Plan`, `Scenario`, `Step` (closed enum), all
 //!                            per-protocol `*Plan` structs, `RateProfile`,
 //!                            `Protocol`, `Mode`, assertions/extracts
+//!   - [`plan_builder`]     — typed `PlanBuilder` + `scenario_*` free
+//!                            functions. The one place CLI + DSL agree on
+//!                            how to pack `*Plan` structs.
 //!   - [`stats`]            — `TaskStats`, `ScenarioStats` with typed
 //!                            `SseExtras`/`WsExtras`, `Summary`, error counters
 //!   - [`template`]         — `Template` + `ExpandCtx` (`{{…}}` substitution)
@@ -30,6 +33,7 @@
 
 pub mod histogram;
 pub mod plan;
+pub mod plan_builder;
 pub mod request_file;
 pub mod rng;
 pub mod scenario_context;
@@ -42,6 +46,7 @@ pub use histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS, HIST_
 pub use plan::{
     Assertion, BodySource, Extract, Plan, Protocol, RateProfile, RequestPlan, Scenario, Step,
 };
+pub use plan_builder::PlanBuilder;
 pub use request_file::{
     parse_request_bytes, parse_request_file, parse_scenario_dir, ParsedRequest, RequestFileError,
     ScenarioEntry,
