@@ -1,3 +1,28 @@
+//! ARCH STATUS: REWRITE
+//!
+//! 2,300 LoC of near-duplicated builder boilerplate. Nine builder types
+//! (PlanBuilder, ScenarioBuilder, RequestBuilder, SseHoldBuilder,
+//! WsEchoRttBuilder, WsHoldBuilder, WsServerPushBuilder, SseFanoutBuilder,
+//! WsFanoutBuilder, SseReconnectStormBuilder) each with identical shape:
+//!   - `struct FooBuilder { inner: Arc<Mutex<FooBuilderState>> }`
+//!   - `struct FooBuilderState { ... }`
+//!   - `impl Default for FooBuilderState`
+//!   - `impl FooBuilder { new / with_state / take_state }`
+//!   - `fn register_foo_builders(engine)` with repeated
+//!     `.header` / `.payload` / `.heartbeat_frame` / etc.
+//!
+//! ARCH(rhai-macro): collapse via a `define_builder!` declarative macro.
+//! ARCH(builder-unify): every protocol-specific builder here duplicates
+//!                      construction logic already in the CLI's plan_from_cli.rs.
+//!                      Post-rewrite: one typed PlanBuilder shared between
+//!                      both (see ARCH-REVIEW §4.5, §B3, §B5).
+//!
+//! Target: ~800 LoC after the macro + shared PlanBuilder consolidation.
+//! DSL surface (user-facing Rhai function names and signatures) stays
+//! byte-identical.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Rhai-side builder types and engine registrations.
 //!
 //! These types are owned by the script during evaluation; once the script

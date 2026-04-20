@@ -1,3 +1,10 @@
+//! ARCH STATUS: REWRITE (trim)
+//!
+//! 196 LoC — lightly duplicated runner glue. Post-rewrite: ~50 LoC.
+//! See ARCH-REVIEW §6 Phase 4.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! `zerobench probe URL` — 5-second smoke test.
 //!
 //! Per PHILOSOPHY §5 / Q1 RESOLVED: the smoke-test verb. Short,

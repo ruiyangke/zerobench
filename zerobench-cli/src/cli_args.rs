@@ -1,3 +1,15 @@
+//! ARCH STATUS: KEEP (prune features)
+//!
+//! 1,192 LoC — clap-derive struct hierarchy for every CLI flag. Stays
+//! in place; post-rewrite it's the same argument parser. Prune:
+//!   - Remove `#[cfg(feature = "…")]` gates on flag definitions — no
+//!     feature flags in target.
+//!   - Remove silent "feature not built" rejections in runtime-arg
+//!     validation — every flag always works.
+//! See ARCH-REVIEW §4 Q-D4, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Command-line argument parsing via `clap` derive.
 //!
 //! Parsing produces a [`CliArgs`]; the conversion to a runnable

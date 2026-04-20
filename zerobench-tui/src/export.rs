@@ -1,3 +1,9 @@
+//! ARCH STATUS: KEEP
+//!
+//! TUI-local JSON export. No architectural changes.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Report export — serializes the TUI's accumulated state to a JSON file.
 //!
 //! Richer than the CLI's `print_json` because it includes the full

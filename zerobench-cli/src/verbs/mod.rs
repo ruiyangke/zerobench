@@ -1,3 +1,12 @@
+//! ARCH STATUS: KEEP
+//!
+//! Post-rewrite each verb (calibrate/curve/diff/measure/probe) is a
+//! thin wrapper ~50-150 LoC: "args → runner.execute → render". mod.rs
+//! stays as the dispatch table.
+//! See ARCH-REVIEW §6 Phase 4.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Per-verb dispatch modules for v0.1.0.
 //!
 //! Each verb module handles one of the seven user-facing verbs

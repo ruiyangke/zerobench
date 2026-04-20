@@ -1,3 +1,12 @@
+//! ARCH STATUS: KEEP (trim)
+//!
+//! Legacy diff helper. Overlaps with verbs/diff.rs — one of them is
+//! dead code. Confirm during Phase 5 cleanup; delete whichever isn't
+//! on the live CLI dispatch path.
+//! See ARCH-REVIEW §6 Phase 5.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! `zerobench diff BASELINE CURRENT` — compare two bench JSON outputs.
 //!
 //! Reads both JSON blobs (the `schema_version: 1` shape emitted by

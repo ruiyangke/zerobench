@@ -1,3 +1,17 @@
+//! ARCH STATUS: REWRITE
+//!
+//! 957 LoC, contains THREE separate "dispatcher" functions — each is a
+//! 3-way Protocol match statement:
+//!   - run_mio_sync               (default subcommand path)
+//!   - dispatch_multi_protocol_plan (multi-scenario Rhai path)
+//!   - run_script_sync            (zerobench run X.rhai path)
+//! All three replaced by one call to
+//! `zerobench_backends::run_scenario(step, ctx)`. main.rs shrinks to
+//! argument routing + TUI-thread setup. Target: <200 LoC.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §6 Phase 4, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench — CLI entry point.
 //!
 //! Synchronous, mio/epoll-based. Zero async runtime.
@@ -539,6 +553,10 @@ fn dispatch_multi_protocol_plan(
     use zerobench_core::plan::Protocol;
     use zerobench_core::stats::TaskStats;
 
+    // ARCH(dispatch): this protocol-group match (+ the sibling one at
+    // ~L806) is the third copy of backend routing in main.rs alone.
+    // Replaced by `zerobench_backends::run_scenario(step, ctx)` —
+    // single exhaustive match on Step. See ARCH-REVIEW §4.1.
     let has_http = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Http);
     let has_sse = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Sse);
     let has_ws = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Ws);

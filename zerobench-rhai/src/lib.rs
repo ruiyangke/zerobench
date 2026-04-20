@@ -1,3 +1,12 @@
+//! ARCH STATUS: RENAME → zerobench-dsl
+//!
+//! Crate rename: `zerobench-rhai` → `zerobench-dsl`. Rhai is an
+//! implementation detail; DSL is the role. File-level modules
+//! (builders, parse, error) keep their names.
+//! See ARCH-REVIEW §4, Q-A.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench-rhai — Rhai scripting front-end.
 //!
 //! Rhai is used **only at compile time** to construct a [`Plan`]. The

@@ -1,3 +1,13 @@
+//! ARCH STATUS: REWRITE
+//!
+//! 603 LoC. Re-implements its own dispatch + plan building that
+//! parallels measure.rs — same ARCH(dispatch) + ARCH(builder-unify)
+//! smells. Post-rewrite: ~100 LoC wrapping runner.execute() in a
+//! rate-sweep loop.
+//! See ARCH-REVIEW §6 Phase 4, §B2.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! `zerobench curve URL` — saturation-curve exploration.
 //!
 //! Per PHILOSOPHY §P4 "load is a curve, not a point": steps offered

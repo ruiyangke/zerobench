@@ -1,3 +1,19 @@
+//! ARCH STATUS: REWRITE
+//!
+//! 1,468 LoC with a 693-LoC god function (`pub fn run`). Contains:
+//!   - Plan construction from CLI args (~200 LoC) — see ARCH(builder-unify)
+//!   - Fingerprint + run_id, calibration, machine probe, archive setup
+//!   - A 9-arm dispatch match DUPLICATED for warmup + steady-state (~200 LoC)
+//!     — see ARCH(dispatch)
+//!   - Runs loop, summary merge, archive finalise, report render
+//!
+//! Target: ~150 LoC total. Extract runner infra into a shared
+//! `zerobench-runtime::runner` module that probe / curve / compare /
+//! replay share. `measure::run` becomes: build plan → runner.execute →
+//! render. See docs/ARCH-REVIEW-2026-04-20.md §6 Phase 4, §B2, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! `zerobench measure URL` — the headline verb.
 //!
 //! Implements `docs/design-v0.1.0.md` §2.3 and PHILOSOPHY §5. The
@@ -618,6 +634,11 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     )
                 })
             });
+            // ARCH(dispatch): 9-arm warmup match. COLLAPSES with the
+            // sibling steady-state match at ~L760 into a single call to
+            // `zerobench_backends::run_scenario(step, ctx)`. See §4.1.
+            // ARCH(feature-delete): every `#[cfg(feature = "sse")]` /
+            // `#[cfg(feature = "ws")]` arm goes away (no features in target).
             match first_step {
                 Some(zerobench_core::plan::Step::HttpColdConnect(_)) => {
                     let _ = zerobench_http::cold_connect::run_cold_connect_from_plan_threaded(
@@ -1070,6 +1091,10 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 // Plan construction
 // ---------------------------------------------------------------------------
 
+// ARCH(builder-unify): ~200 LoC of per-protocol plan construction duplicated
+// with zerobench-rhai/src/builders.rs. Target: one typed PlanBuilder per
+// *Plan struct, called by BOTH this CLI translator AND the Rhai DSL —
+// see ARCH-REVIEW §4.5, §B5.
 fn build_measure_plan(
     args: &MeasureArgs,
     target: &Target,

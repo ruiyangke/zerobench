@@ -1,3 +1,13 @@
+//! ARCH STATUS: REWRITE (trim)
+//!
+//! 749 LoC. Thin wrapper over compare.rs's analysis + custom report
+//! rendering. Post-rewrite consumes zerobench-report's diff renderer;
+//! verb shrinks to argument + archive-load glue. The older duplicate
+//! at cli/src/diff.rs gets deleted.
+//! See ARCH-REVIEW §6 Phase 4, §6 Phase 5.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! `zerobench compare A B` — diff two `result.json` artefacts.
 //!
 //! Per PHILOSOPHY §P2 / §9.3: the comparison-first workflow. This

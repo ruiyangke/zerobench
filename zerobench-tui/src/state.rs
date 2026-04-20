@@ -1,3 +1,11 @@
+//! ARCH STATUS: KEEP
+//!
+//! Consumes LiveTick values produced by the sharded LiveSnapshot
+//! (post-move: zerobench-runtime). No architectural changes.
+//! See ARCH-REVIEW §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Dashboard state — folds [`LiveTick`]s into a bounded ring of
 //! per-second snapshots and exposes the derived figures the renderer
 //! needs (sparkline data, rolling-window latency, progress ratio,

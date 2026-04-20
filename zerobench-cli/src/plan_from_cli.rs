@@ -1,3 +1,13 @@
+//! ARCH STATUS: REWRITE
+//!
+//! ARCH(builder-unify): this module and measure.rs::build_measure_plan
+//! are two copies of "CLI flags → Plan". Target: rewrite to delegate
+//! every per-protocol construction to the shared typed PlanBuilder
+//! (also consumed by zerobench-dsl's Rhai bindings). See ARCH-REVIEW
+//! §4.5, §B5.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Convert a parsed [`CliArgs`] into a runnable
 //! ([`Plan`], [`Target`], [`TransportOpts`]) triple.
 //!

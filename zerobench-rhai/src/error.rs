@@ -1,3 +1,10 @@
+//! ARCH STATUS: MOVE → zerobench-dsl::error (crate rename)
+//!
+//! ScriptError variants for the DSL loader. Moves with rename; no rewrite.
+//! See ARCH-REVIEW §4, Q-A.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Errors returned by the Rhai loader.
 
 use std::io;

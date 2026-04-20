@@ -1,3 +1,11 @@
+//! ARCH STATUS: KEEP — applies to every file under `ui/`
+//!
+//! TUI rendering internals (common, dataset, errors, help, latency,
+//! overview, throughput). None moves, none rewrites. See lib.rs for
+//! the crate-level disposition.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Rendering — one frame per invocation of [`render`].
 //!
 //! The UI is a tabbed, chart-rich dashboard modeled after btop / k9s /
