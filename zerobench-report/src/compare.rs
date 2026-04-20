@@ -1,12 +1,7 @@
-//! ARCH STATUS: MOVE → zerobench-report::compare
-//!
-//! ARCH(keep): CROWN JEWEL — bootstrap CI, exact k=2 Scholz-Stephens AD
-//! variance, KS, Holm-Bonferroni. Relocate byte-for-byte; do not rewrite.
-//! See docs/ARCH-REVIEW-2026-04-20.md §1, §7, docs/ARCH-TAGS.md.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Statistical comparison engine
+//!
+//! CROWN JEWEL: bootstrap CI + exact k=2 Scholz-Stephens AD variance +
+//! KS + Holm-Bonferroni. See PHILOSOPHY §9.3 / design-v0.1.0.md §8.
 //!
 //! Implements the run-level percentile bootstrap from
 //! `docs/PHILOSOPHY.md` §9.3 / `docs/design-v0.1.0.md` §8. Given two

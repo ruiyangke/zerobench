@@ -1,9 +1,8 @@
 //! Shared helpers for raw HTTP/1.1 request building and response parsing.
 //!
-//! ARCH(keep): shared assertion/extraction/header helpers (check_assertions,
-//! apply_extractions, capture_headers, build_raw_request, ConnectionMode,
-//! ContentLength). All three HTTP backends (mio_h1, cold_connect, mio_h2)
-//! call these. See ARCH-REVIEW §7.
+//! Shared by all three HTTP backends (mio_h1, cold_connect, mio_h2):
+//! check_assertions, apply_extractions, capture_headers, build_raw_request,
+//! ConnectionMode, ContentLength.
 //!
 //! Contains request building and response header parsing that is
 //! runtime-agnostic — only synchronous byte manipulation, no I/O.

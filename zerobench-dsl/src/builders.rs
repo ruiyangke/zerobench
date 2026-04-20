@@ -765,7 +765,12 @@ pub(crate) enum StepSource {
     WsHold(WsHoldBuilder),
     WsServerPush(WsServerPushBuilder),
     WsFanout(WsFanoutBuilder),
+    // Pause / PauseRandom: see `register_pause_helpers` for why these are
+    // unconstructed today. Retained so adding pause support later doesn't
+    // require a plan-schema bump.
+    #[allow(dead_code)]
     Pause(Duration),
+    #[allow(dead_code)]
     PauseRandom { min: Duration, max: Duration },
 }
 
@@ -1754,33 +1759,6 @@ fn register_pause_helpers(_engine: &mut Engine) {
     // `Step::Pause` / `Step::PauseRandom` remain in the core Plan
     // enum so a future implementation can wire them without another
     // plan-schema bump.
-    let _ = register_pause_helpers_unreachable;
-}
-
-#[allow(dead_code)]
-fn register_pause_helpers_unreachable(_engine: &mut Engine) {
-    // Dead helper kept for reference — the shape of the registrations
-    // we'd need to restore to re-enable pause/pause_random once the
-    // mio_h1 event loop supports per-connection ready-at tracking.
-    let _ = || {
-        let _ = (|spec: ImmutableString| {
-            let d = parse::parse_duration(&spec)
-                .ok_or_else(|| to_rhai_err(format!("invalid pause duration {spec:?}")))?;
-            Ok::<StepSource, Box<EvalAltResult>>(StepSource::Pause(d))
-        },);
-        let _ = (|lo: ImmutableString, hi: ImmutableString| {
-            let min = parse::parse_duration(&lo)
-                .ok_or_else(|| to_rhai_err(format!("invalid pause min {lo:?}")))?;
-            let max = parse::parse_duration(&hi)
-                .ok_or_else(|| to_rhai_err(format!("invalid pause max {hi:?}")))?;
-            if min > max {
-                return Err(to_rhai_err(format!(
-                    "pause_random: min {lo:?} > max {hi:?}"
-                )));
-            }
-            Ok::<StepSource, Box<EvalAltResult>>(StepSource::PauseRandom { min, max })
-        },);
-    };
 }
 
 // ---------------------------------------------------------------------------

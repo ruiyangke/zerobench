@@ -1,11 +1,3 @@
-//! ARCH STATUS: MOVE → zerobench-runtime::machine
-//!
-//! Pairs with archive (runtime writes machine fingerprint into the
-//! archive at run start). Moves wholesale; no rewrite.
-//! See docs/ARCH-REVIEW-2026-04-20.md §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Machine fingerprint collection — `docs/design-v0.1.0.md` §7.2 and
 //! `docs/PHILOSOPHY.md` §8.3.
 //!

@@ -2,9 +2,8 @@
 //! translator (`plan_from_cli.rs`, `verbs/measure.rs`, `verbs/curve.rs`)
 //! and the Rhai DSL (`zerobench_dsl::builders`) call through.
 //!
-//! ARCH(builder-unify): resolves the duplication between the two
-//! front-ends. Adding a field to a `*Plan` struct happens here; both
-//! CLI flags and DSL methods feed the same constructors.
+//! Adding a field to a `*Plan` struct happens here; both CLI flags
+//! and DSL methods feed the same constructors.
 //!
 //! No Rhai, no clap, no IO. Pure Rust typed setters. Front-ends
 //! translate their own input model into method calls.
@@ -27,8 +26,6 @@
 //! free-function shape lets the DSL pre-build a [`Scenario`], stash it in
 //! a `Vec<StepSource>`, and push it into the aggregator later —
 //! exactly the pattern the Rhai-side builder code already uses.
-//!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.5, §7.
 
 use std::time::Duration;
 

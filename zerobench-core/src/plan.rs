@@ -1,25 +1,3 @@
-//! ARCH STATUS: KEEP — core vocabulary
-//!
-//! Plan, Scenario, Step (closed enum), RateProfile, Protocol, RequestPlan,
-//! BodySource, Extract, Assertion, PlanIdentity, Mode. Plus ALL protocol-
-//! specific Plan structs (SseHoldPlan / SseFanoutPlan / SseReconnectStormPlan /
-//! WsEchoRttPlan / WsHoldPlan / WsServerPushRttPlan / WsFanoutPlan /
-//! ColdConnectPlan / TriggerSpec / FanoutMode / HeartbeatFrame /
-//! CorrelateStrategy).
-//!
-//! This file stays ~900 LoC. That's fine: with static dispatch + closed-
-//! world Step enum, core MUST know every protocol's plan type. The
-//! alternative (opaque Step) was rejected — see ARCH-REVIEW §4.4.
-//!
-//! Sub-concerns that DO move out of core:
-//!  - Per-protocol Backend impls  → zerobench-backends
-//!  - Per-protocol Stats extras   → stay here (stats.rs)
-//!  - Plan-build validation logic → zerobench-backends (backend owns its plan)
-//!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.4, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! The plan data model.
 //!
 //! A [`Plan`] is the frozen, thread-shareable description of what the engine

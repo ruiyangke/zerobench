@@ -1,11 +1,3 @@
-//! ARCH STATUS: KEEP
-//!
-//! Core type helpers (constants + duration_to_hist_ns + new_hist).
-//! Used by every stats type; stays in core alongside plan.rs / stats.rs.
-//! See docs/ARCH-REVIEW-2026-04-20.md §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Shared histogram constants and helpers.
 //!
 //! Every backend that records latency samples into HDR histograms

@@ -1,25 +1,3 @@
-//! ARCH STATUS: KEEP — core vocabulary
-//!
-//! TaskStats, ScenarioStats, Summary, SummaryExport, ErrorCounters,
-//! ErrorKind, Sample (to be added), plus typed protocol extras:
-//! SseExtras, WsExtras. All stay in core because:
-//!  - Closed-world dispatch (§4.4) requires core to know each protocol's
-//!    plan AND stats shape so backends can produce typed output without
-//!    string-keyed metadata (rejected in favour of typed Option<…>).
-//!  - Report reads typed extras via `match stats.sse { Some(_) => ... }`,
-//!    not string maps.
-//!
-//! Splits that DO happen on move:
-//!  - live-recording (LiveSnapshot) already lives in live_snapshot.rs,
-//!    which MOVES → zerobench-runtime. This file stays.
-//!  - The triple-record pattern at backend hot paths collapses into a
-//!    `Recorder` struct in zerobench-runtime (§4.3) that writes both
-//!    TaskStats (typed) AND LiveSnapshot (typed) through one call.
-//!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.3, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Per-task statistics and end-of-run summary.
 //!
 //! Each worker owns a [`TaskStats`]; there is no contention on the hot

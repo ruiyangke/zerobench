@@ -1,12 +1,3 @@
-//! ARCH STATUS: KEEP — core vocabulary
-//!
-//! ARCH(keep): template engine is Plan-adjacent (every RequestPlan.url is
-//! a Template; every header value is a Template). Stays in core. No
-//! rewrite of the {{...}} expansion logic.
-//! See docs/ARCH-REVIEW-2026-04-20.md §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Compiled string templates with `{{...}}` substitution.
 //!
 //! # Compilation

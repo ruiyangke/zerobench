@@ -1,11 +1,3 @@
-//! ARCH STATUS: KEEP — thin wrapper around runtime::calibrate
-//!
-//! Already minimal (~121 LoC). Post-rewrite uses the shared runner
-//! infra for archive/report; stays small.
-//! See ARCH-REVIEW §6 Phase 4.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! `zerobench calibrate` — find the client's in-process loopback
 //! ceiling.
 //!

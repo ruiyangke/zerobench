@@ -1,7 +1,7 @@
 //! RFC 6455 §4 HTTP/1.1 Upgrade handshake.
 //!
-//! ARCH(keep): RFC 6455 §4 Upgrade handshake — Sec-WebSocket-Key/Accept
-//! computation, header validation. See ARCH-REVIEW §1, §7.
+//! Client-side Upgrade handshake — Sec-WebSocket-Key/Accept computation
+//! and header validation. RFC 6455 §4.
 //!
 //! The client half is what we need: generate a Sec-WebSocket-Key, send
 //! an Upgrade request, verify the server's 101 + Sec-WebSocket-Accept.

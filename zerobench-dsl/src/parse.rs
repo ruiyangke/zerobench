@@ -1,11 +1,3 @@
-//! ARCH STATUS: MOVE → zerobench-dsl::parse (crate rename)
-//!
-//! Self-contained string-parser helpers. Moves with the crate rename;
-//! no rewrite.
-//! See ARCH-REVIEW §4, Q-A.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Duration / rate spec parsers used by the Rhai DSL.
 //!
 //! Kept separate from [`crate::builders`] so unit tests don't need to touch

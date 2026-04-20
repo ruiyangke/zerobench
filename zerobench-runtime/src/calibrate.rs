@@ -1,11 +1,3 @@
-//! ARCH STATUS: MOVE → zerobench-runtime::calibrate
-//!
-//! Calibration spawns an in-process echo server — that's runtime behaviour,
-//! not a core type. Moves wholesale; no rewrite. See
-//! docs/ARCH-REVIEW-2026-04-20.md §7, docs/ARCH-TAGS.md.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Client-side calibration — P5 / §9.6.2 / §5.1 of the v0.1.0 docs.
 //!
 //! Before every `measure` / `compare` / `curve` / `soak` run, zerobench

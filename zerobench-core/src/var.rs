@@ -1,11 +1,3 @@
-//! ARCH STATUS: KEEP — Plan-adjacent
-//!
-//! VarSlot + VarRegistry + VarError. Used by Template + RequestPlan
-//! (extracts populate VarSlot; {{var:NAME}} reads it). Stays in core.
-//! See docs/ARCH-REVIEW-2026-04-20.md §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Variable registry — slot allocation for response-extracted values.
 //!
 //! Each named variable gets an 8-bit slot. During execution, a

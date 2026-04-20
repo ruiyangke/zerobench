@@ -1,12 +1,3 @@
-//! ARCH STATUS: KEEP
-//!
-//! Consumes LiveSnapshot+LiveTick from (post-move) zerobench-runtime.
-//! No architectural changes. The `#[cfg(feature = "tui")]` gate in the
-//! CLI goes away — TUI always available (no feature flags in target).
-//! See ARCH-REVIEW §4 Q-D4, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! zerobench-tui — live terminal dashboard.
 //!
 //! Feeds from the same [`LiveSnapshot`] aggregator the JSONL streaming

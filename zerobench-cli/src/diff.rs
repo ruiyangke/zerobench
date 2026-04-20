@@ -1,13 +1,9 @@
-//! ARCH STATUS: KEEP (trim)
-//!
-//! Legacy diff helper. Overlaps with verbs/diff.rs — one of them is
-//! dead code. Confirm during Phase 5 cleanup; delete whichever isn't
-//! on the live CLI dispatch path.
-//! See ARCH-REVIEW §6 Phase 5.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! `zerobench diff BASELINE CURRENT` — compare two bench JSON outputs.
+//!
+//! TODO: consolidate with src/verbs/diff.rs (pre-existing duplication,
+//! pre-rewrite) — both subcommands read archive JSON and render deltas,
+//! but this one is the `diff` verb (regression-gate presets) and the
+//! other is the `compare` verb (statistical comparison).
 //!
 //! Reads both JSON blobs (the `schema_version: 1` shape emitted by
 //! `print_json`), computes a per-metric delta, and writes a human or

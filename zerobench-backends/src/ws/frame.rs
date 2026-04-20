@@ -1,7 +1,8 @@
 //! RFC 6455 §5.2 frame codec.
 //!
-//! ARCH(keep): CROWN JEWEL — RFC 6455 §5.2 compliant codec (masking,
-//! fragmentation, close codes, control-frame rules). See ARCH-REVIEW §1, §7.
+//! CROWN JEWEL — RFC 6455 §5.2 compliant (masking, fragmentation, close
+//! codes, control-frame rules). Do not rewrite without re-reading the
+//! spec and the existing tests.
 //!
 //! This module implements the wire format for WebSocket frames — the
 //! client-side view, with two thin APIs:

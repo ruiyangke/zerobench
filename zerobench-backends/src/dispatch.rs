@@ -6,8 +6,8 @@
 //! scenarios in one Plan) fan out to one thread per protocol and
 //! join.
 //!
-//! ARCH(dispatch): resolves the four-copy antipattern. See
-//! `docs/ARCH-REVIEW-2026-04-20.md` §4.1.
+//! Every caller (CLI verbs, DSL runner, test harness) routes through
+//! this one function — no per-protocol branches outside this file.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

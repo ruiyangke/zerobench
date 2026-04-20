@@ -1,8 +1,8 @@
 //! SSE line framer.
 //!
-//! ARCH(keep): CROWN JEWEL — WHATWG EventSource-correct line framer,
-//! including the Id(Cow<[u8]>) event variant that handles chunk-boundary
-//! id: reassembly (fixes B4 from the prior review loop). See ARCH-REVIEW §1, §7.
+//! CROWN JEWEL — WHATWG EventSource-correct line framer, including the
+//! Id(Cow<[u8]>) event variant that handles chunk-boundary id: reassembly.
+//! Do not rewrite without re-reading the spec and the existing tests.
 //!
 //! Consumes byte chunks from an already-dechunked HTTP body (hyper does
 //! `Transfer-Encoding: chunked` decoding internally, so by the time bytes

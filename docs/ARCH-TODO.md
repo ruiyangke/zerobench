@@ -1,177 +1,44 @@
-# ARCH-TODO — live index of rewrite markers
+# ARCH-TODO — rewrite phase log
 
-**Generated from `grep ARCH(` after the Phase 0 annotation pass.**
-Not hand-authored — regenerate with the grep recipes at the bottom
-of `docs/ARCH-TAGS.md` or the commands at the end of this file.
+**STATUS (2026-04-20):** all phases complete. This file is retained as
+a historical record of the rewrite; for the current architecture see
+`docs/ARCH-REVIEW-2026-04-20.md` §4 and the module-level docs in each
+crate.
 
-Companions: `ARCH-REVIEW-2026-04-20.md` (the rewrite plan), `ARCH-TAGS.md` (marker scheme).
-
----
-
-## Counts
-
-### File-level dispositions
-
-| Disposition | Files | Meaning |
-|---|---|---|
-| `KEEP` | **15** | No architectural change (crown jewels + infra already in the right place) |
-| `MOVE` | **30** | Moves wholesale to a new crate |
-| `SPLIT` | **1** | Type splits across crates |
-| `REWRITE` | **8** | Significant rewrite in its phase |
-| `DELETE` | **3** | Removed entirely (the three lib.rs files whose crates dissolve into backends) |
-| `RENAME` | **1** | `zerobench-rhai` → `zerobench-dsl` |
-| **Total** | **58** | Every source file touched by the rewrite |
-
-### Inline action markers
-
-| Tag | Sites | Concern |
-|---|---|---|
-| `ARCH(recorder)` | **11** | Triple-record antipattern — collapses to `recorder.record(sid, sample)` |
-| `ARCH(error-unify)` | **5** | Ad-hoc `ColdErr`/`SessionErr`/`RecvErr` → core's `TransportError` |
-| `ARCH(dispatch)` | **4** | N-way protocol match → one call to `backends::run_scenario` |
-| `ARCH(builder-unify)` | **5** | CLI + Rhai duplicate plan construction → shared typed `PlanBuilder` |
-| `ARCH(fanout-core)` | **4** | SSE / WS fanout duplicated helpers → `backends::fanout_core` |
-| `ARCH(feature-delete)` | **2** | `#[cfg(feature = "…")]` guards that disappear |
-| `ARCH(rhai-macro)` | **1** | 2,300-LoC builders.rs → macro-collapse to ~800 |
-| `ARCH(keep)` | **8** | Crown-jewel markers — do not rewrite on move |
-| **Total markers** | **40** | |
+Companions: `ARCH-REVIEW-2026-04-20.md` (the rewrite plan, historical),
+`ARCH-TAGS.md` (marker scheme, historical).
 
 ---
 
-## Dispositions by crate
+## Completion log
 
-### `zerobench-core` (20 files — vocabulary crate, stays lean)
-
-| File | Disposition |
-|---|---|
-| `archive.rs` | MOVE → zerobench-runtime::archive |
-| `calibrate.rs` | MOVE → zerobench-runtime::calibrate |
-| `compare.rs` | MOVE → zerobench-report::compare (crown jewel — no rewrite) |
-| `fingerprint.rs` | MOVE → zerobench-runtime::fingerprint |
-| `histogram.rs` | KEEP |
-| `json_scan.rs` | MOVE → zerobench-runtime::json_scan |
-| `lib.rs` | REWRITE — public surface shrinks to vocabulary only |
-| `live_snapshot.rs` | MOVE → zerobench-runtime::live_snapshot (crown jewel — no rewrite of the sharding) |
-| `machine.rs` | MOVE → zerobench-runtime::machine |
-| `plan.rs` | KEEP — closed-enum Step + all *Plan structs stay here |
-| `report.rs` | MOVE → zerobench-report (split into terminal/json/prometheus) |
-| `request_file.rs` | KEEP — Plan-adjacent |
-| `rng.rs` | KEEP — stays in core; `template` + `scenario_context` depend on `BenchRng` |
-| `scenario_context.rs` | KEEP — Plan-adjacent |
-| `stats.rs` | KEEP — TaskStats + typed SseExtras/WsExtras |
-| `stop.rs` | MOVE → zerobench-runtime::stop |
-| `template.rs` | KEEP |
-| `tls.rs` | MOVE → zerobench-runtime::tls |
-| `transport.rs` | SPLIT — Target/TransportOpts stay; TransportError → runtime |
-| `var.rs` | KEEP — Plan-adjacent |
-
-### `zerobench-http` (7 files, all → zerobench-backends::http)
-
-| File | Disposition | Notes |
+| Phase | Commit | Description |
 |---|---|---|
-| `cold_connect.rs` | MOVE → backends::http::cold_connect | `ARCH(error-unify)` on `ColdErr`; `ARCH(recorder)` on hot path |
-| `lib.rs` | DELETE | Crate dissolves; `ARCH(feature-delete)` removes mio-h1/mio-h2 cfg gates |
-| `mio_h1.rs` | MOVE → backends::http::mio_h1 | `ARCH(recorder)` on response-complete site |
-| `mio_h2.rs` | MOVE → backends::http::mio_h2 | `ARCH(recorder)` on body-done site |
-| `mio_tls.rs` | MOVE → backends::http::mio_tls | |
-| `raw_h1_common.rs` | MOVE → backends::http::raw_h1_common | Crown jewel helpers (assertions, extractions, CL parsing) |
-| `simple_post.rs` | MOVE → backends::http::simple_post | `ARCH(fanout-core)` — primary caller is fanout triggers |
+| Phase 0 — annotate | `af7f3ed`, `4689726`, `4d68add`, `b9a11ad`, `d1d08bf` | ARCH-TAGS scheme + file-level dispositions across all crates |
+| Phase 1 — split core | `2e0d358` | zerobench-core split into core + runtime + report |
+| Phase 1c — transport split | `5164722` | TransportError extracted into zerobench-runtime |
+| Phase 2a — backends crate | `d909c9b` | http + sse + ws consolidated into zerobench-backends |
+| Phase 2b — Recorder | `9264423` | Recorder struct collapses the triple-record antipattern |
+| Phase 2b.fix — cold_connect | `a937dff` | route errors through Recorder for per-scenario live writes |
+| Phase 2c — dispatch | `3fd583b` | `run_plan` becomes the single protocol-dispatch entry point |
+| Phase 3a — error-unify | `763f922` | ad-hoc backend error enums → core's `TransportError` |
+| Phase 3b — fanout-core | `056c259` | SSE/WS fanout share `backends::fanout_core` |
+| Phase 4a.1 — rhai → dsl | `67e8cbe` | crate rename: zerobench-rhai → zerobench-dsl |
+| Phase 4a.2 — define_builder! | `8a5c24b` | builders.rs collapsed via macro (2,300 → ~800 LoC) |
+| Phase 4b — PlanBuilder | `446146a` | CLI + DSL unified on shared `PlanBuilder` |
+| Phase 4c — runner | `2c5e6aa` | measure/curve/main extract into `zerobench_runtime::runner` |
+| Phase 5 — polish | (this commit) | strip stale ARCH markers; dead-code sweep |
 
-### `zerobench-sse` (5 files, all → zerobench-backends::sse)
-
-| File | Disposition | Notes |
-|---|---|---|
-| `fanout.rs` | MOVE → backends::sse::fanout | `ARCH(fanout-core)` — extract run_trigger_loop / fire_trigger / render_template |
-| `hold.rs` | MOVE → backends::sse::hold | `ARCH(recorder)` on event path |
-| `lib.rs` | DELETE | Crate dissolves |
-| `line_parser.rs` | MOVE → backends::sse::line_parser | CROWN JEWEL — WHATWG line framer |
-| `reconnect_storm.rs` | MOVE → backends::sse::reconnect_storm | `ARCH(error-unify)` on SessionErr |
-
-### `zerobench-ws` (7 files, all → zerobench-backends::ws)
-
-| File | Disposition | Notes |
-|---|---|---|
-| `conn.rs` | MOVE → backends::ws::conn | |
-| `echo_rtt.rs` | MOVE → backends::ws::echo_rtt | `ARCH(error-unify)` on RecvErr; `ARCH(recorder)` on RTT path |
-| `fanout.rs` | MOVE → backends::ws::fanout | `ARCH(fanout-core)` — duplicates sse/fanout.rs |
-| `frame.rs` | MOVE → backends::ws::frame | CROWN JEWEL — RFC 6455 §5.2 codec |
-| `handshake.rs` | MOVE → backends::ws::handshake | CROWN JEWEL — RFC 6455 §4 Upgrade |
-| `hold.rs` | MOVE → backends::ws::hold | `ARCH(recorder)` |
-| `lib.rs` | DELETE | Crate dissolves |
-| `server_push_rtt.rs` | MOVE → backends::ws::server_push_rtt | `ARCH(recorder)` |
-
-### `zerobench-rhai` → `zerobench-dsl` (crate rename, 4 files)
-
-| File | Disposition | Notes |
-|---|---|---|
-| `lib.rs` | RENAME → zerobench-dsl | |
-| `builders.rs` | REWRITE | `ARCH(rhai-macro)` — 2,300 → ~800 LoC via `define_builder!`. `ARCH(builder-unify)` — consume shared PlanBuilder |
-| `parse.rs` | MOVE → zerobench-dsl::parse | |
-| `error.rs` | MOVE → zerobench-dsl::error | |
-
-### `zerobench-cli` (10 files)
-
-| File | Disposition | Notes |
-|---|---|---|
-| `cli_args.rs` | KEEP (prune `#[cfg(feature=…)]`) | |
-| `diff.rs` | KEEP (trim) | Possibly dead code vs verbs/diff.rs |
-| `main.rs` | REWRITTEN (Phase 4c) | `ARCH(dispatch)` collapsed in Phase 2c; ARCH STATUS header trimmed in Phase 4c |
-| `plan_from_cli.rs` | REWRITE | `ARCH(builder-unify)` |
-| `verbs/calibrate.rs` | KEEP | Already minimal |
-| `verbs/curve.rs` | REWRITTEN (Phase 4c) | 611 → 589 LoC; `pub fn run` 375 → 149 via `zerobench_runtime::runner` |
-| `verbs/diff.rs` | REWRITE (trim) | |
-| `verbs/measure.rs` | REWRITTEN (Phase 4c) | 1,174 → 978 LoC; `pub fn run` 428 → 187 via `zerobench_runtime::runner` |
-| `verbs/mod.rs` | KEEP | |
-| `verbs/probe.rs` | REWRITE (trim) | Not addressed in Phase 4c (uses a different backend path than measure/curve) |
-
-### `zerobench-tui` (12 files — all KEEP)
-
-| File | Disposition |
-|---|---|
-| `lib.rs` | KEEP |
-| `state.rs` | KEEP (consumes runtime::LiveTick) |
-| `export.rs` | KEEP |
-| `ui/*.rs` (8 files) | KEEP (single marker on `ui/mod.rs` covers the subdir) |
+Every inline `ARCH(recorder|error-unify|dispatch|builder-unify|fanout-core|rhai-macro|feature-delete|keep)` marker is now gone; the `ARCH STATUS` module headers have been cleaned. `grep -r 'ARCH(' zerobench-*/src/` returns nothing.
 
 ---
 
-## Phase roadmap → marker clearance
+## Final state
 
-Every phase removes the markers it completes. `grep ARCH(` at the end of the rewrite must return zero.
-
-| Phase | Work | Markers cleared |
-|---|---|---|
-| **Phase 1** (week 1) | Split core. Create zerobench-types, zerobench-runtime, zerobench-report. | All `MOVE → zerobench-runtime::*` (9 files). All `MOVE → zerobench-report::*` (2 files). 1 `SPLIT` (transport). 1 `REWRITE` (lib.rs). |
-| **Phase 2** (week 2) | Create zerobench-backends crate. Dispatch function. Recorder struct. Port mio_h1 as reference. | 0 markers cleared; infrastructure for phase 3. |
-| **Phase 3** (week 3) | Port all backends. Extract fanout-core. Unify errors. | All `MOVE → zerobench-backends::*` (17 files). 3 `DELETE` (http/sse/ws lib.rs). All `ARCH(recorder)` (11). All `ARCH(error-unify)` (5). All `ARCH(fanout-core)` (4). All `ARCH(dispatch)` inside backends. |
-| **Phase 4** (week 4) | Rewrite measure/curve/probe/diff verbs. Unify PlanBuilder. Rename rhai → dsl. Collapse rhai-macro. | All `ARCH(dispatch)` in CLI. All `ARCH(builder-unify)` (5). `ARCH(rhai-macro)` (1). RENAME (1). 4 `REWRITE` (main.rs + 3 verbs). |
-| **Phase 5** (week 5) | Polish. Kill feature flags. Error strictness. Delete core facade. | All `ARCH(feature-delete)` (2). All `ARCH(keep)` markers get promoted to normal module docs (markers themselves removed). Remaining `REWRITE` / `KEEP (prune)` items. |
-| **Phase 6+** (optional) | StatsD exporter. JSONL sink. OTel (maybe). | New code, no markers to clear. |
+- Crates: `zerobench-core` (vocabulary), `zerobench-runtime` (runtime infra, crown jewels), `zerobench-backends` (http/sse/ws), `zerobench-report` (rendering), `zerobench-dsl` (Rhai DSL), `zerobench-tui` (terminal dashboard), `zerobench-cli` (user-facing binary).
+- The only remaining Cargo feature flag is `tui` on `zerobench-cli` (optional dashboard front-end).
+- Crown jewels marked in the module docs (not via a tag): `runtime::live_snapshot` (16-shard sharded mutex), `backends::sse::line_parser` (WHATWG line framer), `backends::ws::frame` (RFC 6455 §5.2 codec).
 
 ---
 
-## Verification recipes
-
-Run from the workspace root.
-
-```bash
-# Which files are affected, and how
-grep -rn "^//! ARCH STATUS:" zerobench-*/src/
-
-# Phase-by-phase clearance check (should approach zero as rewrite progresses)
-grep -rc "ARCH(" zerobench-*/src/ | awk -F: '{s+=$2} END {print "inline markers:", s}'
-
-# By concern
-for tag in recorder dispatch error-unify fanout-core builder-unify rhai-macro feature-delete keep; do
-  n=$(grep -rh "ARCH($tag)" zerobench-*/src/ | wc -l)
-  printf "%-18s %d\n" "$tag" "$n"
-done
-
-# Zero-check at end of rewrite
-test -z "$(grep -r 'ARCH(' zerobench-*/src/)" && echo "Phase 0 markers all cleared" \
-  || echo "Still outstanding."
-```
-
----
-
-*Index regenerated on Phase 0 completion. Keep updated at every phase boundary so the "done" line converges toward zero.*
+*Original roadmap regenerated on Phase 0 completion; supersede by this completion log.*

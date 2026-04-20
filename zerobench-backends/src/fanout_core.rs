@@ -4,11 +4,8 @@
 //! same trigger skeleton: fire an HTTP POST every `TRIGGER_INTERVAL_MS`
 //! ms, record each send instant, correlate later against the frames
 //! / events the held subscribers observed. The subscriber side is
-//! protocol-specific; the trigger side is identical. This module is
-//! the trigger side.
-//!
-//! ARCH(fanout-core): resolves the duplication flagged in sse/fanout.rs
-//! and ws/fanout.rs. See `docs/ARCH-REVIEW-2026-04-20.md` §4.6.
+//! protocol-specific; the trigger side is identical — this module is
+//! the shared trigger side.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

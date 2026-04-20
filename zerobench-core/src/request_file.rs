@@ -1,11 +1,3 @@
-//! ARCH STATUS: KEEP — Plan-adjacent
-//!
-//! Produces RequestPlan values from parsed .http files. Stays in core
-//! alongside plan.rs because its output type (RequestPlan) lives there.
-//! See docs/ARCH-REVIEW-2026-04-20.md §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! `.http` request-file parser (curl `--trace-ascii` compatible).
 //!
 //! Accepts the raw HTTP/1.1 wire format produced by `curl --trace-ascii`,
