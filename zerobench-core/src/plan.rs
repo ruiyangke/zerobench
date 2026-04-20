@@ -536,7 +536,7 @@ pub enum TriggerSpec {
 }
 
 /// Accuracy regime for fanout measurements.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FanoutMode {
     /// Server embeds `emit_ns` in the broadcast payload (requires
@@ -551,6 +551,7 @@ pub enum FanoutMode {
     /// Proxy: measures the time from the trigger HTTP response 2xx to
     /// the first broadcast event. Subject to the approximation caveats
     /// documented in `PHILOSOPHY.md` §4.3 and §15 Q4.
+    #[default]
     TriggerRtt,
 }
 
@@ -576,7 +577,7 @@ impl Default for HeartbeatFrame {
 
 /// Strategy for matching a server echo to the client's send in
 /// `WsEchoRttPlan`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CorrelateStrategy {
     /// Zero-intrusion default: client sends a WebSocket Ping frame
@@ -586,6 +587,7 @@ pub enum CorrelateStrategy {
     /// Prepend a 16-byte monotonic id to the application text-frame
     /// payload; match echo by prefix. Use when the app-layer format
     /// tolerates a prefix and the server echoes verbatim.
+    #[default]
     MonotonicIdPrepend,
     /// Echo must contain the literal marker. Used when the server
     /// transforms payload but preserves a known substring.

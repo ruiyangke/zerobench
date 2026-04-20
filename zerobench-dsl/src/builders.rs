@@ -1,28 +1,3 @@
-//! ARCH STATUS: REWRITE
-//!
-//! 2,300 LoC of near-duplicated builder boilerplate. Nine builder types
-//! (PlanBuilder, ScenarioBuilder, RequestBuilder, SseHoldBuilder,
-//! WsEchoRttBuilder, WsHoldBuilder, WsServerPushBuilder, SseFanoutBuilder,
-//! WsFanoutBuilder, SseReconnectStormBuilder) each with identical shape:
-//!   - `struct FooBuilder { inner: Arc<Mutex<FooBuilderState>> }`
-//!   - `struct FooBuilderState { ... }`
-//!   - `impl Default for FooBuilderState`
-//!   - `impl FooBuilder { new / with_state / take_state }`
-//!   - `fn register_foo_builders(engine)` with repeated
-//!     `.header` / `.payload` / `.heartbeat_frame` / etc.
-//!
-//! ARCH(rhai-macro): collapse via a `define_builder!` declarative macro.
-//! ARCH(builder-unify): every protocol-specific builder here duplicates
-//!                      construction logic already in the CLI's plan_from_cli.rs.
-//!                      Post-rewrite: one typed PlanBuilder shared between
-//!                      both (see ARCH-REVIEW §4.5, §B3, §B5).
-//!
-//! Target: ~800 LoC after the macro + shared PlanBuilder consolidation.
-//! DSL surface (user-facing Rhai function names and signatures) stays
-//! byte-identical.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Rhai-side builder types and engine registrations.
 //!
 //! These types are owned by the script during evaluation; once the script
@@ -35,6 +10,9 @@
 //! also `Send + Sync`. Every builder here is an [`Arc`]`<`[`Mutex`]`<State>>`
 //! newtype — cloning the builder clones the `Arc`, so method chains like
 //! `.header("a", "b").json(...)` all mutate the same underlying state.
+//! The [`define_builder!`] macro collapses this pattern: each invocation
+//! produces the wrapper struct, an `Arc<Mutex<..>>`-backed `Default` impl,
+//! and the `modify`/`with_state`/`take_state` helper surface.
 //!
 //! # Fluent chaining
 //!
@@ -48,8 +26,11 @@
 //! the script is evaluated into a [`PlanBuilder`], the builder is
 //! finalized, and then the engine is dropped. The resulting [`Plan`] is
 //! a pure Rust data structure — no Rhai traces remain.
+//!
+//! ARCH(builder-unify): the per-protocol construction in [`compile_step`]
+//! duplicates the CLI's `plan_from_cli.rs`. Resolved in Phase 4b
+//! (CLI/DSL unify) — see ARCH-REVIEW §4.5, §B3, §B5.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -60,7 +41,7 @@ use smallvec::SmallVec;
 use zerobench_core::plan::{
     Assertion, BodySource, Extract, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
 };
-use zerobench_core::template::Template;
+use zerobench_core::template::{Template, TemplateError};
 use zerobench_core::transport::HttpVersionPref;
 use zerobench_core::var::{VarRegistry, VarSlot};
 
@@ -68,70 +49,225 @@ use crate::error::ScriptError;
 use crate::parse;
 
 // ---------------------------------------------------------------------------
+// define_builder! — collapses the Arc<Mutex<State>> newtype pattern.
+//
+// Every Rhai-facing builder has the same shape:
+//   - `Clone` wrapper around `Arc<Mutex<State>>`
+//   - a `Default` state (auto-derived; the Default is only consumed by
+//     `std::mem::take` at finalize, so field-level defaults are not
+//     semantically meaningful — `new(args)` overrides them)
+//   - `with_state(state) -> Self` constructor (handy when we want to
+//     consume a state we built piece-wise)
+//   - `modify(|s| ...) -> R` — a scoped mutex guard that centralises the
+//     `.lock().expect(...)` boilerplate
+//   - `take_state() -> State` — `mem::take`-based extraction used by
+//     `finalize` / `compile_step`
+//
+// The macro is crate-private (no `#[macro_export]`); it's only used by
+// this module.
+// ---------------------------------------------------------------------------
+
+macro_rules! define_builder {
+    (
+        $(#[$outer:meta])*
+        $vis:vis struct $Name:ident [ $State:ident ] {
+            $(
+                $(#[$field_meta:meta])*
+                pub $field:ident : $ty:ty
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$outer])*
+        #[derive(Clone)]
+        $vis struct $Name {
+            inner: ::std::sync::Arc<::std::sync::Mutex<$State>>,
+        }
+
+        #[derive(Default)]
+        pub(crate) struct $State {
+            $(
+                $(#[$field_meta])*
+                pub $field: $ty,
+            )*
+        }
+
+        impl Default for $Name {
+            fn default() -> Self {
+                Self {
+                    inner: ::std::sync::Arc::new(::std::sync::Mutex::new($State::default())),
+                }
+            }
+        }
+
+        impl $Name {
+            /// Wrap an already-constructed state in the shared-mutex
+            /// newtype. Used by the per-builder `new(args)` shims to
+            /// install script-supplied required parameters (url,
+            /// connections, duration).
+            ///
+            /// Kept `pub(crate)` because `$State` is `pub(crate)` — the
+            /// builder types are `pub` but their state is an
+            /// implementation detail.
+            #[inline]
+            #[allow(dead_code)]
+            pub(crate) fn with_state(state: $State) -> Self {
+                Self {
+                    inner: ::std::sync::Arc::new(::std::sync::Mutex::new(state)),
+                }
+            }
+
+            /// Acquire the mutex and apply `f` to the state. Used by
+            /// every fluent method; centralises the `.lock().unwrap()`
+            /// boilerplate.
+            ///
+            /// Panics only if a previous call panicked while holding
+            /// the lock — none of our call sites panic past the `?`
+            /// return paths, and a panic would abort the script anyway.
+            #[inline]
+            pub(crate) fn modify<R>(&self, f: impl FnOnce(&mut $State) -> R) -> R {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .expect(concat!(stringify!($Name), " mutex poisoned"));
+                f(&mut guard)
+            }
+
+            /// Swap the state out of the mutex with `std::mem::take` and
+            /// hand it back. See [`PlanBuilder::finalize`] for why we
+            /// can't just `Arc::try_unwrap` (Rhai's engine keeps
+            /// `Arc` clones alive via registered closures until the
+            /// engine itself drops).
+            #[inline]
+            #[allow(dead_code)]
+            pub(crate) fn take_state(&self) -> $State {
+                ::std::mem::take(
+                    &mut *self
+                        .inner
+                        .lock()
+                        .expect(concat!(stringify!($Name), " mutex poisoned")),
+                )
+            }
+        }
+    };
+}
+
+/// Register the common `.header(name, value)` method on a builder type
+/// whose state has a `pub headers: Vec<(String, String)>` field. Every
+/// protocol builder reuses the exact same body, so the boilerplate goes
+/// into this helper macro.
+macro_rules! register_header_fn {
+    ($engine:expr, $Builder:ty) => {
+        $engine.register_fn(
+            "header",
+            move |b: $Builder, name: ImmutableString, value: ImmutableString| {
+                b.modify(|s| s.headers.push((name.to_string(), value.to_string())));
+                b
+            },
+        );
+    };
+}
+
+/// Register a string-parsed setter — `parser` is a fn that turns
+/// `ImmutableString` into `Result<T, String>`, and the resulting `T` is
+/// assigned to `state.$field`. Used by `correlate`, `mode`, and
+/// `heartbeat_frame`, which all share this shape.
+macro_rules! register_parsed_setter_fn {
+    ($engine:expr, $method:literal, $Builder:ty, $field:ident, $parser:expr) => {
+        $engine.register_fn(
+            $method,
+            move |ctx: NativeCallContext, b: $Builder, kind: ImmutableString|
+                -> Result<$Builder, Box<EvalAltResult>> {
+                let parsed = $parser(&kind).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
+                })?;
+                b.modify(|s| s.$field = parsed);
+                Ok(b)
+            },
+        );
+    };
+}
+
+/// Register a plain `(b, x) -> b` setter with a pre-transform. Used for
+/// the fluent setters that assign a single value to `state.$field`
+/// (e.g. `.reconnect(bool)`, `.expected_rate(f64)`,
+/// `.trigger_url(str)`).
+macro_rules! register_setter_fn {
+    // Setter with an identity transform: `state.field = value`.
+    ($engine:expr, $method:literal, $Builder:ty, $field:ident, $ArgTy:ty) => {
+        $engine.register_fn($method, move |b: $Builder, value: $ArgTy| {
+            b.modify(|s| s.$field = value);
+            b
+        });
+    };
+    // Setter with a transform closure: `state.field = transform(value)`.
+    (
+        $engine:expr, $method:literal, $Builder:ty, $field:ident,
+        $ArgTy:ty, $transform:expr
+    ) => {
+        $engine.register_fn($method, move |b: $Builder, value: $ArgTy| {
+            let v = $transform(value);
+            b.modify(|s| s.$field = v);
+            b
+        });
+    };
+}
+
+// ---------------------------------------------------------------------------
 // PlanBuilder — the root aggregator
 // ---------------------------------------------------------------------------
 
-/// Shared-state wrapper around [`PlanBuilderState`]. The public handle Rhai
-/// scripts interact with via the `scenario`, `rate`, `duration`, `warmup`,
-/// `transport`, `saturate`, `env`, and `var` top-level functions.
-#[derive(Clone)]
-pub struct PlanBuilder {
-    inner: Arc<Mutex<PlanBuilderState>>,
+define_builder! {
+    /// Shared-state wrapper around [`PlanBuilderState`]. The public handle
+    /// Rhai scripts interact with via the `scenario`, `rate`, `duration`,
+    /// `warmup`, `transport`, `saturate`, `env`, and `var` top-level
+    /// functions.
+    pub struct PlanBuilder[PlanBuilderState] {
+        /// Scenarios collected in declaration order. `weight` on the inner
+        /// builder is optional; absent means "auto-weight evenly".
+        pub scenarios: Vec<ScenarioBuilder>,
+        /// Variable registry — templates allocate via `{{var:NAME}}` and the
+        /// script itself allocates via `var("NAME")`.
+        pub vars: VarRegistry,
+        /// Global rate, if `rate("...")` was called. Mutually exclusive with
+        /// per-scenario `.rate(...)` — checked at finalize.
+        pub global_rate: Option<RateProfile>,
+        /// Global saturate setting — set by `saturate(n)`. If both
+        /// `global_rate` and `saturate_concurrency` are set, `global_rate`
+        /// wins (the script explicitly asked for open-loop); saturate is the
+        /// default when no rate is given.
+        pub saturate_concurrency: Option<usize>,
+        /// Measurement duration — required.
+        pub duration: Option<Duration>,
+        /// Optional warmup period.
+        pub warmup: Option<Duration>,
+        /// Cooldown between `runs()` iterations. Defaults to zero when the
+        /// script does not call `cooldown()`.
+        pub cooldown: Option<Duration>,
+        /// Total number of measure iterations. Defaults to 1 when unset
+        /// (single-run plan); larger values feed the bootstrap CI
+        /// aggregator just like `measure --runs N`.
+        pub runs: Option<u32>,
+        /// Client-side worker threads. Defaults to 1 — the CLI and
+        /// top-level runners may override, but the script can pin a
+        /// specific fan-out.
+        pub threads: Option<usize>,
+        /// Human-friendly plan name. Folds into `url_fingerprint` per §7.1.
+        pub name: Option<String>,
+        /// Preferred HTTP protocol version — `transport("h1"|"h2")` sets this.
+        /// Carried out of the Plan and returned separately; the dispatcher
+        /// threads it into `TransportOpts`.
+        pub transport: HttpVersionPref,
+    }
 }
 
-/// The full state accumulated during a script run. Finalized into a
-/// [`Plan`] by [`PlanBuilder::finalize`] and then discarded.
-///
-/// Implements [`Default`] so [`std::mem::take`] can swap it out of the
-/// mutex at finalize time without needing to `Arc::try_unwrap` (Rhai
-/// leaves reference cycles in its symbol table until the engine itself
-/// drops, so unwrapping the Arc would always fail while the engine is
-/// alive).
-#[derive(Default)]
-pub(crate) struct PlanBuilderState {
-    /// Scenarios collected in declaration order. `weight` on the inner
-    /// builder is optional; absent means "auto-weight evenly".
-    pub scenarios: Vec<ScenarioBuilder>,
-    /// Variable registry — templates allocate via `{{var:NAME}}` and the
-    /// script itself allocates via `var("NAME")`.
-    pub vars: VarRegistry,
-    /// Global rate, if `rate("...")` was called. Mutually exclusive with
-    /// per-scenario `.rate(...)` — checked at finalize.
-    pub global_rate: Option<RateProfile>,
-    /// Global saturate setting — set by `saturate(n)`. If both
-    /// `global_rate` and `saturate_concurrency` are set, `global_rate`
-    /// wins (the script explicitly asked for open-loop); saturate is the
-    /// default when no rate is given.
-    pub saturate_concurrency: Option<usize>,
-    /// Measurement duration — required.
-    pub duration: Option<Duration>,
-    /// Optional warmup period.
-    pub warmup: Option<Duration>,
-    /// Cooldown between `runs()` iterations. Defaults to zero when the
-    /// script does not call `cooldown()`.
-    pub cooldown: Option<Duration>,
-    /// Total number of measure iterations. Defaults to 1 when unset
-    /// (single-run plan); larger values feed the bootstrap CI
-    /// aggregator just like `measure --runs N`.
-    pub runs: Option<u32>,
-    /// Client-side worker threads. Defaults to 1 — the CLI and
-    /// top-level runners may override, but the script can pin a
-    /// specific fan-out.
-    pub threads: Option<usize>,
-    /// Human-friendly plan name. Folds into `url_fingerprint` per §7.1.
-    pub name: Option<String>,
-    /// Preferred HTTP protocol version — `transport("h1"|"h2")` sets this.
-    /// Carried out of the Plan and returned separately; the dispatcher
-    /// threads it into `TransportOpts`.
-    pub transport: HttpVersionPref,
-}
-
+// PlanBuilder's public Rust API (in addition to the macro-generated
+// surface): `new()` for symmetry with the existing callers in `lib.rs`,
+// plus two bespoke operations — `first_request_url` (URL peek before
+// finalize) and `finalize` (state → `(Plan, HttpVersionPref)`).
 impl PlanBuilder {
     /// Create an empty builder.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(PlanBuilderState::default())),
-        }
+        Self::default()
     }
 
     /// Peek at the raw URL source of the first wire-step (Request, SSE,
@@ -143,39 +279,20 @@ impl PlanBuilder {
     /// must either strip them (cheap case: user wrote a literal URL with
     /// templated path) or reject the script (host is templated).
     pub fn first_request_url(&self) -> Option<String> {
-        self.with_state(|s| {
+        self.modify(|s| {
             for scn in &s.scenarios {
-                let url = scn.with_state(|st| {
-                    st.steps
-                        .iter()
-                        .find_map(|step| match step {
-                            StepSource::Request(rb) => {
-                                Some(rb.with_state(|r| r.url.clone()))
-                            }
-                            StepSource::SseHold(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::SseFanout(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::SseReconnectStorm(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::WsEchoRtt(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::WsHold(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::WsServerPush(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::WsFanout(b) => {
-                                Some(b.with_state(|s| s.url.clone()))
-                            }
-                            StepSource::Pause(_)
-                            | StepSource::PauseRandom { .. } => None,
-                        })
+                let url = scn.modify(|st| {
+                    st.steps.iter().find_map(|step| match step {
+                        StepSource::Request(rb) => Some(rb.modify(|r| r.url.clone())),
+                        StepSource::SseHold(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::SseFanout(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::SseReconnectStorm(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::WsEchoRtt(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::WsHold(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::WsServerPush(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::WsFanout(b) => Some(b.modify(|s| s.url.clone())),
+                        StepSource::Pause(_) | StepSource::PauseRandom { .. } => None,
+                    })
                 });
                 if let Some(u) = url {
                     return Some(u);
@@ -183,21 +300,6 @@ impl PlanBuilder {
             }
             None
         })
-    }
-
-    /// Borrow the underlying state mutably. `.unwrap()` is safe here — the
-    /// mutex is only poisoned if a `panic!` fired while holding the lock,
-    /// which our code never does (all `?` paths release the guard before
-    /// returning, and panics would abort the script anyway).
-    pub(crate) fn with_state<R>(
-        &self,
-        f: impl FnOnce(&mut PlanBuilderState) -> R,
-    ) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("plan builder mutex poisoned — a panic escaped an earlier Rhai call");
-        f(&mut guard)
     }
 
     /// Finalize into a real plan + transport preference.
@@ -218,14 +320,8 @@ impl PlanBuilder {
     /// the engine is alive. Taking the state lets us keep ownership of
     /// the owned data without freeing the shared `Arc<Mutex<...>>`.
     pub fn finalize(self) -> Result<(Plan, HttpVersionPref), ScriptError> {
-        let inner = self.with_state(std::mem::take);
+        let inner = self.take_state();
         finalize_state(inner)
-    }
-}
-
-impl Default for PlanBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -241,7 +337,7 @@ fn finalize_state(
     let any_scenario_rate = state
         .scenarios
         .iter()
-        .any(|s| s.with_state(|st| st.rate.is_some()));
+        .any(|s| s.modify(|st| st.rate.is_some()));
     if state.global_rate.is_some() && any_scenario_rate {
         return Err(ScriptError::ConflictingRate);
     }
@@ -258,7 +354,7 @@ fn finalize_state(
         let mut total = 0.0f64;
         let mut explicit = 0usize;
         for s in &state.scenarios {
-            s.with_state(|st| {
+            s.modify(|st| {
                 if let Some(w) = st.weight {
                     total += w;
                     explicit += 1;
@@ -387,49 +483,25 @@ fn scale_rate(global: &RateProfile, share: f64) -> RateProfile {
 // ScenarioBuilder
 // ---------------------------------------------------------------------------
 
-/// Handed to the scenario body closure as its `s` argument. Scripts call
-/// `s.step(...)` to enqueue steps, and (optionally) `s.rate("X")` to set a
-/// per-scenario rate.
-#[derive(Clone)]
-pub(crate) struct ScenarioBuilder {
-    inner: Arc<Mutex<ScenarioBuilderState>>,
-}
-
-#[derive(Default)]
-pub(crate) struct ScenarioBuilderState {
-    pub name: String,
-    pub weight: Option<f64>,
-    pub rate: Option<RateProfile>,
-    pub steps: Vec<StepSource>,
+define_builder! {
+    /// Handed to the scenario body closure as its `s` argument. Scripts call
+    /// `s.step(...)` to enqueue steps, and (optionally) `s.rate("X")` to set
+    /// a per-scenario rate.
+    pub(crate) struct ScenarioBuilder[ScenarioBuilderState] {
+        pub name: String,
+        pub weight: Option<f64>,
+        pub rate: Option<RateProfile>,
+        pub steps: Vec<StepSource>,
+    }
 }
 
 impl ScenarioBuilder {
     fn new(name: String, weight: Option<f64>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ScenarioBuilderState {
-                name,
-                weight,
-                rate: None,
-                steps: Vec::new(),
-            })),
-        }
-    }
-
-    pub(crate) fn with_state<R>(
-        &self,
-        f: impl FnOnce(&mut ScenarioBuilderState) -> R,
-    ) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("scenario builder mutex poisoned");
-        f(&mut guard)
-    }
-
-    /// Take the state out of the Arc by swapping `Default`. See
-    /// [`PlanBuilder::finalize`] for why we don't try to unwrap the Arc.
-    fn take_state(&self) -> ScenarioBuilderState {
-        self.with_state(std::mem::take)
+        Self::with_state(ScenarioBuilderState {
+            name,
+            weight,
+            ..Default::default()
+        })
     }
 }
 
@@ -437,41 +509,29 @@ impl ScenarioBuilder {
 // RequestBuilder
 // ---------------------------------------------------------------------------
 
-/// Returned by `GET(url)`, `POST(url)`, etc. and passed through the chained
-/// `.header`, `.json`, `.body`, `.expect_status`, etc. methods.
-#[derive(Clone)]
-pub(crate) struct RequestBuilder {
-    inner: Arc<Mutex<RequestBuilderState>>,
+define_builder! {
+    /// Returned by `GET(url)`, `POST(url)`, etc. and passed through the
+    /// chained `.header`, `.json`, `.body`, `.expect_status`, etc. methods.
+    pub(crate) struct RequestBuilder[RequestBuilderState] {
+        pub method: Method,
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub body: Option<BodySourceSpec>,
+        pub extract: Vec<Extract>,
+        pub checks: Vec<Assertion>,
+        /// If true, the finalize step emits `Step::HttpColdConnect` — one
+        /// fresh TCP+TLS+HTTP connection per request, no pool reuse.
+        pub cold: bool,
+    }
 }
 
-pub(crate) struct RequestBuilderState {
-    pub method: Method,
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Option<BodySourceSpec>,
-    pub extract: Vec<Extract>,
-    pub checks: Vec<Assertion>,
-    /// If true, the finalize step emits `Step::HttpColdConnect` — one
-    /// fresh TCP+TLS+HTTP connection per request, no pool reuse.
-    pub cold: bool,
-}
-
-impl Default for RequestBuilderState {
-    // `http::Method` has no Default impl, so we provide one. `GET` is the
-    // benign "empty" request; this value is only read if someone swaps
-    // the state out (at finalize) and we want to reconstruct a blank
-    // state behind them — which never happens in practice because
-    // finalize drains and drops each RequestBuilder.
-    fn default() -> Self {
-        Self {
-            method: Method::GET,
-            url: String::new(),
-            headers: Vec::new(),
-            body: None,
-            extract: Vec::new(),
-            checks: Vec::new(),
-            cold: false,
-        }
+impl RequestBuilder {
+    fn new(method: Method, url: String) -> Self {
+        Self::with_state(RequestBuilderState {
+            method,
+            url,
+            ..Default::default()
+        })
     }
 }
 
@@ -488,34 +548,217 @@ pub(crate) enum BodySourceSpec {
     JsonTemplate(String),
 }
 
-impl RequestBuilder {
-    fn new(method: Method, url: String) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(RequestBuilderState {
-                method,
-                url,
-                headers: Vec::new(),
-                body: None,
-                extract: Vec::new(),
-                checks: Vec::new(),
-                cold: false,
-            })),
-        }
-    }
+// ---------------------------------------------------------------------------
+// Protocol-native builders (SSE + WebSocket)
+//
+// Construction is one-shot — users pass the essential parameters at call
+// time (e.g. `sse_hold(url, n, for)`) instead of chained setters. The
+// macro supplies the Arc<Mutex> plumbing; each `new(...)` just pipes the
+// required fields into `with_state`.
+// ---------------------------------------------------------------------------
 
-    fn with_state<R>(&self, f: impl FnOnce(&mut RequestBuilderState) -> R) -> R {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("request builder mutex poisoned");
-        f(&mut guard)
+define_builder! {
+    /// Returned by `sse_hold(url, subscribers, hold_for)`. Finalised into
+    /// [`Step::SseHold`] during plan finalization.
+    pub(crate) struct SseHoldBuilder[SseHoldBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub subscribers: u32,
+        pub hold_for: Duration,
+        pub reconnect: bool,
     }
+}
 
-    /// Take the state out of the Arc by swapping `Default`. See
-    /// [`PlanBuilder::finalize`] for why we don't try to unwrap the Arc.
-    fn take_state(&self) -> RequestBuilderState {
-        self.with_state(std::mem::take)
+impl SseHoldBuilder {
+    fn new(url: String, subscribers: u32, hold_for: Duration) -> Self {
+        Self::with_state(SseHoldBuilderState {
+            url,
+            subscribers: subscribers.max(1),
+            hold_for,
+            // The default-false bool flips to true here because the
+            // SSE `reconnect: on` behaviour is the zero-intrusion
+            // norm; a script opts OUT via `.reconnect(false)`.
+            reconnect: true,
+            ..Default::default()
+        })
     }
+}
+
+define_builder! {
+    /// Returned by `ws_echo_rtt(url, connections, msg_rate_per_conn)`.
+    /// Finalised into [`Step::WsEchoRtt`] during plan finalization.
+    pub(crate) struct WsEchoRttBuilder[WsEchoRttBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub connections: u32,
+        pub msg_rate_per_conn: f64,
+        pub payload: String,
+        pub correlate: zerobench_core::plan::CorrelateStrategy,
+    }
+}
+
+impl WsEchoRttBuilder {
+    fn new(url: String, connections: u32, msg_rate_per_conn: f64) -> Self {
+        Self::with_state(WsEchoRttBuilderState {
+            url,
+            connections: connections.max(1),
+            msg_rate_per_conn,
+            payload: "ping".into(),
+            ..Default::default()
+        })
+    }
+}
+
+define_builder! {
+    /// Returned by `ws_hold(url, connections, hold_for)`. Finalised into
+    /// [`Step::WsHold`] during plan finalization.
+    pub(crate) struct WsHoldBuilder[WsHoldBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub connections: u32,
+        pub heartbeat: Duration,
+        pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
+        pub hold_for: Duration,
+    }
+}
+
+impl WsHoldBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self::with_state(WsHoldBuilderState {
+            url,
+            connections: connections.max(1),
+            heartbeat: Duration::from_secs(25),
+            hold_for,
+            ..Default::default()
+        })
+    }
+}
+
+define_builder! {
+    /// Returned by `ws_server_push(url, connections, hold_for)`. Finalised
+    /// into [`Step::WsServerPushRtt`] during plan finalization.
+    pub(crate) struct WsServerPushBuilder[WsServerPushBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub connections: u32,
+        pub expected_rate_per_conn: f64,
+        pub hold_for: Duration,
+    }
+}
+
+impl WsServerPushBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self::with_state(WsServerPushBuilderState {
+            url,
+            connections: connections.max(1),
+            hold_for,
+            ..Default::default()
+        })
+    }
+}
+
+define_builder! {
+    /// Returned by `sse_fanout(url, subs, hold_for)`. Compiles to
+    /// [`Step::SseFanout`] at finalize. Requires `.trigger_url(...)`.
+    pub(crate) struct SseFanoutBuilder[SseFanoutBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub subscribers: u32,
+        pub hold_for: Duration,
+        pub reconnect: bool,
+        pub trigger_url: String,
+        pub mode: zerobench_core::plan::FanoutMode,
+    }
+}
+
+impl SseFanoutBuilder {
+    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
+        Self::with_state(SseFanoutBuilderState {
+            url,
+            subscribers: subs.max(1),
+            hold_for,
+            reconnect: true,
+            ..Default::default()
+        })
+    }
+}
+
+define_builder! {
+    /// Returned by `ws_fanout(url, conns, hold_for)`. Compiles to
+    /// [`Step::WsFanout`] at finalize.
+    pub(crate) struct WsFanoutBuilder[WsFanoutBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub connections: u32,
+        pub hold_for: Duration,
+        pub heartbeat: Duration,
+        pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
+        pub trigger_url: String,
+        pub mode: zerobench_core::plan::FanoutMode,
+    }
+}
+
+impl WsFanoutBuilder {
+    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
+        Self::with_state(WsFanoutBuilderState {
+            url,
+            connections: connections.max(1),
+            hold_for,
+            heartbeat: Duration::from_secs(25),
+            ..Default::default()
+        })
+    }
+}
+
+define_builder! {
+    /// Returned by `sse_reconnect_storm(url, subs, hold_for)`.
+    pub(crate) struct SseReconnectStormBuilder[SseReconnectStormBuilderState] {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub subscribers: u32,
+        pub hold_for: Duration,
+        pub kill_rate_per_s: f64,
+        pub verify_last_event_id: bool,
+    }
+}
+
+impl SseReconnectStormBuilder {
+    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
+        Self::with_state(SseReconnectStormBuilderState {
+            url,
+            subscribers: subs.max(1),
+            hold_for,
+            kill_rate_per_s: 0.1,
+            verify_last_event_id: true,
+            ..Default::default()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StepSource — intermediate form before template compilation
+// ---------------------------------------------------------------------------
+
+/// Un-compiled step; held by ScenarioBuilder.steps and compiled into a
+/// real [`Step`] during plan finalization.
+///
+/// `Clone` is required so Rhai can pass values of this type through
+/// `Dynamic` (the engine clones types on the way in/out of the value
+/// slot). Cloning a `Request` clones the inner `Arc`, so the two copies
+/// share state — but by the time `s.step(req)` runs, the originating
+/// `req` temporary has already been consumed, so no sharing matters.
+#[derive(Clone)]
+pub(crate) enum StepSource {
+    Request(RequestBuilder),
+    SseHold(SseHoldBuilder),
+    SseFanout(SseFanoutBuilder),
+    SseReconnectStorm(SseReconnectStormBuilder),
+    WsEchoRtt(WsEchoRttBuilder),
+    WsHold(WsHoldBuilder),
+    WsServerPush(WsServerPushBuilder),
+    WsFanout(WsFanoutBuilder),
+    Pause(Duration),
+    PauseRandom { min: Duration, max: Duration },
 }
 
 // ---------------------------------------------------------------------------
@@ -590,446 +833,72 @@ fn parse_fanout_mode(s: &str) -> Result<zerobench_core::plan::FanoutMode, String
 }
 
 // ---------------------------------------------------------------------------
-// Protocol-native builders
-//
-// SseHoldBuilder / WsEchoRttBuilder wrap the SseHoldPlan /
-// WsEchoRttPlan state. Construction is one-shot — users pass the
-// essential parameters at call time (sse_hold(url, n, for)) instead
-// of chained setters.
-// ---------------------------------------------------------------------------
-
-/// Returned by `sse_hold(url, subscribers, hold_for)`. Finalised into
-/// [`Step::SseHold`] during plan finalization.
-#[derive(Clone)]
-pub(crate) struct SseHoldBuilder {
-    inner: Arc<Mutex<SseHoldBuilderState>>,
-}
-
-pub(crate) struct SseHoldBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub subscribers: u32,
-    pub hold_for: Duration,
-    pub reconnect: bool,
-}
-
-impl Default for SseHoldBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            subscribers: 1,
-            hold_for: Duration::from_secs(60),
-            reconnect: true,
-        }
-    }
-}
-
-impl SseHoldBuilder {
-    fn new(url: String, subscribers: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SseHoldBuilderState {
-                url,
-                headers: Vec::new(),
-                subscribers: subscribers.max(1),
-                hold_for,
-                reconnect: true,
-            })),
-        }
-    }
-
-    fn with_state<R>(&self, f: impl FnOnce(&mut SseHoldBuilderState) -> R) -> R {
-        let mut guard = self.inner.lock().expect("sse_hold builder mutex poisoned");
-        f(&mut guard)
-    }
-
-    fn take_state(&self) -> SseHoldBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `ws_echo_rtt(url, connections, msg_rate_per_conn)`.
-/// Finalised into [`Step::WsEchoRtt`] during plan finalization.
-#[derive(Clone)]
-pub(crate) struct WsEchoRttBuilder {
-    inner: Arc<Mutex<WsEchoRttBuilderState>>,
-}
-
-pub(crate) struct WsEchoRttBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub connections: u32,
-    pub msg_rate_per_conn: f64,
-    pub payload: String,
-    pub correlate: zerobench_core::plan::CorrelateStrategy,
-}
-
-impl Default for WsEchoRttBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            connections: 1,
-            msg_rate_per_conn: 100.0,
-            payload: "ping".into(),
-            correlate: zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend,
-        }
-    }
-}
-
-impl WsEchoRttBuilder {
-    fn new(url: String, connections: u32, msg_rate_per_conn: f64) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(WsEchoRttBuilderState {
-                url,
-                headers: Vec::new(),
-                connections: connections.max(1),
-                msg_rate_per_conn,
-                payload: "ping".into(),
-                correlate: zerobench_core::plan::CorrelateStrategy::MonotonicIdPrepend,
-            })),
-        }
-    }
-
-    fn with_state<R>(&self, f: impl FnOnce(&mut WsEchoRttBuilderState) -> R) -> R {
-        let mut guard = self.inner.lock().expect("ws_echo_rtt builder mutex poisoned");
-        f(&mut guard)
-    }
-
-    fn take_state(&self) -> WsEchoRttBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `ws_hold(url, connections, hold_for)`. Finalised into
-/// [`Step::WsHold`] during plan finalization.
-#[derive(Clone)]
-pub(crate) struct WsHoldBuilder {
-    inner: Arc<Mutex<WsHoldBuilderState>>,
-}
-
-pub(crate) struct WsHoldBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub connections: u32,
-    pub heartbeat: Duration,
-    pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
-    pub hold_for: Duration,
-}
-
-impl Default for WsHoldBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            connections: 1,
-            heartbeat: Duration::from_secs(25),
-            heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-            hold_for: Duration::from_secs(60),
-        }
-    }
-}
-
-impl WsHoldBuilder {
-    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(WsHoldBuilderState {
-                url,
-                headers: Vec::new(),
-                connections: connections.max(1),
-                heartbeat: Duration::from_secs(25),
-                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-                hold_for,
-            })),
-        }
-    }
-    fn with_state<R>(&self, f: impl FnOnce(&mut WsHoldBuilderState) -> R) -> R {
-        let mut g = self.inner.lock().expect("ws_hold builder mutex poisoned");
-        f(&mut g)
-    }
-    fn take_state(&self) -> WsHoldBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `ws_server_push(url, connections, hold_for)`. Finalised
-/// into [`Step::WsServerPushRtt`] during plan finalization.
-#[derive(Clone)]
-pub(crate) struct WsServerPushBuilder {
-    inner: Arc<Mutex<WsServerPushBuilderState>>,
-}
-
-pub(crate) struct WsServerPushBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub connections: u32,
-    pub expected_rate_per_conn: f64,
-    pub hold_for: Duration,
-}
-
-impl Default for WsServerPushBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            connections: 1,
-            expected_rate_per_conn: 0.0,
-            hold_for: Duration::from_secs(60),
-        }
-    }
-}
-
-impl WsServerPushBuilder {
-    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(WsServerPushBuilderState {
-                url,
-                headers: Vec::new(),
-                connections: connections.max(1),
-                expected_rate_per_conn: 0.0,
-                hold_for,
-            })),
-        }
-    }
-    fn with_state<R>(&self, f: impl FnOnce(&mut WsServerPushBuilderState) -> R) -> R {
-        let mut g = self.inner.lock().expect("ws_server_push builder mutex poisoned");
-        f(&mut g)
-    }
-    fn take_state(&self) -> WsServerPushBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `sse_fanout(url, subs, hold_for)`. Compiles to
-/// [`Step::SseFanout`] at finalize. Requires `.trigger_url(...)`.
-#[derive(Clone)]
-pub(crate) struct SseFanoutBuilder {
-    inner: Arc<Mutex<SseFanoutBuilderState>>,
-}
-pub(crate) struct SseFanoutBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub subscribers: u32,
-    pub hold_for: Duration,
-    pub reconnect: bool,
-    pub trigger_url: String,
-    pub mode: zerobench_core::plan::FanoutMode,
-}
-impl Default for SseFanoutBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            subscribers: 1,
-            hold_for: Duration::from_secs(60),
-            reconnect: true,
-            trigger_url: String::new(),
-            mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-        }
-    }
-}
-impl SseFanoutBuilder {
-    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SseFanoutBuilderState {
-                url,
-                headers: Vec::new(),
-                subscribers: subs.max(1),
-                hold_for,
-                reconnect: true,
-                trigger_url: String::new(),
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-            })),
-        }
-    }
-    fn with_state<R>(&self, f: impl FnOnce(&mut SseFanoutBuilderState) -> R) -> R {
-        let mut g = self.inner.lock().expect("sse_fanout builder mutex poisoned");
-        f(&mut g)
-    }
-    fn take_state(&self) -> SseFanoutBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `ws_fanout(url, conns, hold_for)`. Compiles to
-/// [`Step::WsFanout`] at finalize.
-#[derive(Clone)]
-pub(crate) struct WsFanoutBuilder {
-    inner: Arc<Mutex<WsFanoutBuilderState>>,
-}
-pub(crate) struct WsFanoutBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub connections: u32,
-    pub hold_for: Duration,
-    pub heartbeat: Duration,
-    pub heartbeat_frame: zerobench_core::plan::HeartbeatFrame,
-    pub trigger_url: String,
-    pub mode: zerobench_core::plan::FanoutMode,
-}
-impl Default for WsFanoutBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            connections: 1,
-            hold_for: Duration::from_secs(60),
-            heartbeat: Duration::from_secs(25),
-            heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-            trigger_url: String::new(),
-            mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-        }
-    }
-}
-impl WsFanoutBuilder {
-    fn new(url: String, connections: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(WsFanoutBuilderState {
-                url,
-                headers: Vec::new(),
-                connections: connections.max(1),
-                hold_for,
-                heartbeat: Duration::from_secs(25),
-                heartbeat_frame: zerobench_core::plan::HeartbeatFrame::Ping,
-                trigger_url: String::new(),
-                mode: zerobench_core::plan::FanoutMode::TriggerRtt,
-            })),
-        }
-    }
-    fn with_state<R>(&self, f: impl FnOnce(&mut WsFanoutBuilderState) -> R) -> R {
-        let mut g = self.inner.lock().expect("ws_fanout builder mutex poisoned");
-        f(&mut g)
-    }
-    fn take_state(&self) -> WsFanoutBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-/// Returned by `sse_reconnect_storm(url, subs, hold_for)`.
-#[derive(Clone)]
-pub(crate) struct SseReconnectStormBuilder {
-    inner: Arc<Mutex<SseReconnectStormBuilderState>>,
-}
-pub(crate) struct SseReconnectStormBuilderState {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub subscribers: u32,
-    pub hold_for: Duration,
-    pub kill_rate_per_s: f64,
-    pub verify_last_event_id: bool,
-}
-impl Default for SseReconnectStormBuilderState {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            headers: Vec::new(),
-            subscribers: 1,
-            hold_for: Duration::from_secs(60),
-            kill_rate_per_s: 0.1,
-            verify_last_event_id: true,
-        }
-    }
-}
-impl SseReconnectStormBuilder {
-    fn new(url: String, subs: u32, hold_for: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(SseReconnectStormBuilderState {
-                url,
-                headers: Vec::new(),
-                subscribers: subs.max(1),
-                hold_for,
-                kill_rate_per_s: 0.1,
-                verify_last_event_id: true,
-            })),
-        }
-    }
-    fn with_state<R>(&self, f: impl FnOnce(&mut SseReconnectStormBuilderState) -> R) -> R {
-        let mut g = self.inner.lock().expect("sse_reconnect_storm builder mutex poisoned");
-        f(&mut g)
-    }
-    fn take_state(&self) -> SseReconnectStormBuilderState {
-        self.with_state(std::mem::take)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// StepSource — intermediate form before template compilation
-// ---------------------------------------------------------------------------
-
-/// Un-compiled step; held by ScenarioBuilder.steps and compiled into a
-/// real [`Step`] during plan finalization.
-///
-/// `Clone` is required so Rhai can pass values of this type through
-/// `Dynamic` (the engine clones types on the way in/out of the value
-/// slot). Cloning a `Request` clones the inner `Arc`, so the two copies
-/// share state — but by the time `s.step(req)` runs, the originating
-/// `req` temporary has already been consumed, so no sharing matters.
-#[derive(Clone)]
-pub(crate) enum StepSource {
-    Request(RequestBuilder),
-    SseHold(SseHoldBuilder),
-    SseFanout(SseFanoutBuilder),
-    SseReconnectStorm(SseReconnectStormBuilder),
-    WsEchoRtt(WsEchoRttBuilder),
-    WsHold(WsHoldBuilder),
-    WsServerPush(WsServerPushBuilder),
-    WsFanout(WsFanoutBuilder),
-    Pause(Duration),
-    PauseRandom { min: Duration, max: Duration },
-}
-
-// ---------------------------------------------------------------------------
 // Compilation: StepSource -> Step
+//
+// The per-variant compilation used to hand-roll the same template-compile
+// + header-compile boilerplate nine times. `compile_tpl` /
+// `compile_headers` centralise the error-wrapping so each arm of the
+// match is a one-shot destructure + compile + construct.
 // ---------------------------------------------------------------------------
+
+fn compile_tpl(
+    src: &str,
+    vars: &mut VarRegistry,
+    scenario: &str,
+    field: impl Into<String>,
+) -> Result<Template, ScriptError> {
+    Template::compile(src, vars).map_err(|e| ScriptError::Template {
+        scenario: scenario.to_string(),
+        field: field.into(),
+        error: e,
+    })
+}
+
+fn compile_headers<const N: usize>(
+    raw: Vec<(String, String)>,
+    vars: &mut VarRegistry,
+    scenario: &str,
+    kind: &str,
+) -> Result<SmallVec<[(Template, Template); N]>, ScriptError> {
+    let mut out: SmallVec<[(Template, Template); N]> = SmallVec::new();
+    for (name, value) in raw {
+        let n = compile_tpl(&name, vars, scenario, format!("{kind} header name {name:?}"))?;
+        let v = compile_tpl(
+            &value,
+            vars,
+            scenario,
+            format!("{kind} header {name:?} value {value:?}"),
+        )?;
+        out.push((n, v));
+    }
+    Ok(out)
+}
 
 fn compile_step(
     src: StepSource,
     vars: &mut VarRegistry,
-    scenario_name: &str,
+    scenario: &str,
 ) -> Result<Step, ScriptError> {
     match src {
         StepSource::Pause(d) => Ok(Step::Pause(d)),
         StepSource::PauseRandom { min, max } => Ok(Step::PauseRandom { min, max }),
         StepSource::SseHold(sb) => {
-            let state = sb.take_state();
             let SseHoldBuilderState {
                 url,
                 headers,
                 subscribers,
                 hold_for,
                 reconnect,
-            } = state;
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("sse_hold url {url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let name_tpl =
-                    Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("sse_hold header name {name:?}"),
-                        error: e,
-                    })?;
-                let value_tpl =
-                    Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("sse_hold header {name:?} value {value:?}"),
-                        error: e,
-                    })?;
-                hdr_out.push((name_tpl, value_tpl));
-            }
+            } = sb.take_state();
             Ok(Step::SseHold(zerobench_core::plan::SseHoldPlan {
-                url: url_tpl,
-                headers: hdr_out,
+                url: compile_tpl(&url, vars, scenario, format!("sse_hold url {url:?}"))?,
+                headers: compile_headers(headers, vars, scenario, "sse_hold")?,
                 subscribers,
                 hold_for,
                 reconnect,
             }))
         }
         StepSource::WsEchoRtt(wb) => {
-            let state = wb.take_state();
             let WsEchoRttBuilderState {
                 url,
                 headers,
@@ -1037,41 +906,14 @@ fn compile_step(
                 msg_rate_per_conn,
                 payload,
                 correlate,
-            } = state;
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("ws_echo_rtt url {url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let name_tpl =
-                    Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("ws_echo_rtt header name {name:?}"),
-                        error: e,
-                    })?;
-                let value_tpl =
-                    Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("ws_echo_rtt header {name:?} value {value:?}"),
-                        error: e,
-                    })?;
-                hdr_out.push((name_tpl, value_tpl));
-            }
-            let payload_tpl =
-                Template::compile(&payload, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: "ws_echo_rtt payload".into(),
-                    error: e,
-                })?;
+            } = wb.take_state();
             Ok(Step::WsEchoRtt(zerobench_core::plan::WsEchoRttPlan {
-                url: url_tpl,
-                headers: hdr_out,
+                url: compile_tpl(&url, vars, scenario, format!("ws_echo_rtt url {url:?}"))?,
+                headers: compile_headers(headers, vars, scenario, "ws_echo_rtt")?,
                 connections,
                 msg_rate_per_conn,
                 correlate,
-                payload: payload_tpl,
+                payload: compile_tpl(&payload, vars, scenario, "ws_echo_rtt payload")?,
             }))
         }
         StepSource::WsHold(hb) => {
@@ -1083,28 +925,9 @@ fn compile_step(
                 heartbeat_frame,
                 hold_for,
             } = hb.take_state();
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("ws_hold url {url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_hold header name {name:?}"),
-                    error: e,
-                })?;
-                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_hold header {name:?} value {value:?}"),
-                    error: e,
-                })?;
-                hdr_out.push((n, v));
-            }
             Ok(Step::WsHold(zerobench_core::plan::WsHoldPlan {
-                url: url_tpl,
-                headers: hdr_out,
+                url: compile_tpl(&url, vars, scenario, format!("ws_hold url {url:?}"))?,
+                headers: compile_headers(headers, vars, scenario, "ws_hold")?,
                 connections,
                 heartbeat,
                 heartbeat_frame,
@@ -1123,47 +946,28 @@ fn compile_step(
             } = fb.take_state();
             if trigger_url.is_empty() {
                 return Err(ScriptError::Template {
-                    scenario: scenario_name.to_string(),
+                    scenario: scenario.to_string(),
                     field: "sse_fanout trigger_url".into(),
-                    error: zerobench_core::template::TemplateError::NotYetSupported(
+                    error: TemplateError::NotYetSupported(
                         "sse_fanout requires .trigger_url(...)".into(),
                     ),
                 });
             }
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("sse_fanout url {url:?}"),
-                error: e,
-            })?;
-            let trig_tpl = Template::compile(&trigger_url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("sse_fanout trigger_url {trigger_url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("sse_fanout header name {name:?}"),
-                    error: e,
-                })?;
-                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("sse_fanout header {name:?} value {value:?}"),
-                    error: e,
-                })?;
-                hdr_out.push((n, v));
-            }
             Ok(Step::SseFanout(zerobench_core::plan::SseFanoutPlan {
                 subscribers: zerobench_core::plan::SseHoldPlan {
-                    url: url_tpl,
-                    headers: hdr_out,
+                    url: compile_tpl(&url, vars, scenario, format!("sse_fanout url {url:?}"))?,
+                    headers: compile_headers(headers, vars, scenario, "sse_fanout")?,
                     subscribers,
                     hold_for,
                     reconnect,
                 },
                 trigger: zerobench_core::plan::TriggerSpec::HttpPost {
-                    url: trig_tpl,
+                    url: compile_tpl(
+                        &trigger_url,
+                        vars,
+                        scenario,
+                        format!("sse_fanout trigger_url {trigger_url:?}"),
+                    )?,
                     body: None,
                 },
                 mode,
@@ -1178,30 +982,16 @@ fn compile_step(
                 kill_rate_per_s,
                 verify_last_event_id,
             } = sb.take_state();
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("sse_reconnect_storm url {url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("sse_reconnect_storm header name {name:?}"),
-                    error: e,
-                })?;
-                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("sse_reconnect_storm header {name:?} value {value:?}"),
-                    error: e,
-                })?;
-                hdr_out.push((n, v));
-            }
             Ok(Step::SseReconnectStorm(
                 zerobench_core::plan::SseReconnectStormPlan {
                     subscribers: zerobench_core::plan::SseHoldPlan {
-                        url: url_tpl,
-                        headers: hdr_out,
+                        url: compile_tpl(
+                            &url,
+                            vars,
+                            scenario,
+                            format!("sse_reconnect_storm url {url:?}"),
+                        )?,
+                        headers: compile_headers(headers, vars, scenario, "sse_reconnect_storm")?,
                         subscribers,
                         hold_for,
                         reconnect: true,
@@ -1224,48 +1014,29 @@ fn compile_step(
             } = fb.take_state();
             if trigger_url.is_empty() {
                 return Err(ScriptError::Template {
-                    scenario: scenario_name.to_string(),
+                    scenario: scenario.to_string(),
                     field: "ws_fanout trigger_url".into(),
-                    error: zerobench_core::template::TemplateError::NotYetSupported(
+                    error: TemplateError::NotYetSupported(
                         "ws_fanout requires .trigger_url(...)".into(),
                     ),
                 });
             }
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("ws_fanout url {url:?}"),
-                error: e,
-            })?;
-            let trig_tpl = Template::compile(&trigger_url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("ws_fanout trigger_url {trigger_url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_fanout header name {name:?}"),
-                    error: e,
-                })?;
-                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_fanout header {name:?} value {value:?}"),
-                    error: e,
-                })?;
-                hdr_out.push((n, v));
-            }
             Ok(Step::WsFanout(zerobench_core::plan::WsFanoutPlan {
                 subscribers: zerobench_core::plan::WsHoldPlan {
-                    url: url_tpl,
-                    headers: hdr_out,
+                    url: compile_tpl(&url, vars, scenario, format!("ws_fanout url {url:?}"))?,
+                    headers: compile_headers(headers, vars, scenario, "ws_fanout")?,
                     connections,
                     heartbeat,
                     heartbeat_frame,
                     hold_for,
                 },
                 trigger: zerobench_core::plan::TriggerSpec::HttpPost {
-                    url: trig_tpl,
+                    url: compile_tpl(
+                        &trigger_url,
+                        vars,
+                        scenario,
+                        format!("ws_fanout trigger_url {trigger_url:?}"),
+                    )?,
                     body: None,
                 },
                 mode,
@@ -1279,29 +1050,10 @@ fn compile_step(
                 expected_rate_per_conn,
                 hold_for,
             } = pb.take_state();
-            let url_tpl = Template::compile(&url, vars).map_err(|e| ScriptError::Template {
-                scenario: scenario_name.to_string(),
-                field: format!("ws_server_push url {url:?}"),
-                error: e,
-            })?;
-            let mut hdr_out: SmallVec<[(Template, Template); 4]> = SmallVec::new();
-            for (name, value) in headers {
-                let n = Template::compile(&name, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_server_push header name {name:?}"),
-                    error: e,
-                })?;
-                let v = Template::compile(&value, vars).map_err(|e| ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("ws_server_push header {name:?} value {value:?}"),
-                    error: e,
-                })?;
-                hdr_out.push((n, v));
-            }
             Ok(Step::WsServerPushRtt(
                 zerobench_core::plan::WsServerPushRttPlan {
-                    url: url_tpl,
-                    headers: hdr_out,
+                    url: compile_tpl(&url, vars, scenario, format!("ws_server_push url {url:?}"))?,
+                    headers: compile_headers(headers, vars, scenario, "ws_server_push")?,
                     connections,
                     expected_rate_per_conn,
                     hold_for,
@@ -1309,7 +1061,6 @@ fn compile_step(
             ))
         }
         StepSource::Request(rb) => {
-            let state = rb.take_state();
             let RequestBuilderState {
                 method,
                 url,
@@ -1318,48 +1069,18 @@ fn compile_step(
                 extract,
                 checks,
                 cold,
-            } = state;
+            } = rb.take_state();
 
-            let url_tpl = Template::compile(&url, vars).map_err(|e| {
-                ScriptError::Template {
-                    scenario: scenario_name.to_string(),
-                    field: format!("url {url:?}"),
-                    error: e,
-                }
-            })?;
-
-            let mut compiled_headers: SmallVec<[(Template, Template); 8]> =
-                SmallVec::new();
-            for (name, value) in headers {
-                let name_tpl = Template::compile(&name, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("header name {name:?}"),
-                        error: e,
-                    }
-                })?;
-                let value_tpl = Template::compile(&value, vars).map_err(|e| {
-                    ScriptError::Template {
-                        scenario: scenario_name.to_string(),
-                        field: format!("header {name:?} value {value:?}"),
-                        error: e,
-                    }
-                })?;
-                compiled_headers.push((name_tpl, value_tpl));
-            }
+            let url_tpl = compile_tpl(&url, vars, scenario, format!("url {url:?}"))?;
+            let compiled_headers: SmallVec<[(Template, Template); 8]> =
+                compile_headers::<8>(headers, vars, scenario, "request")?;
 
             let body = match body {
                 None => None,
                 Some(BodySourceSpec::Raw(bytes)) => Some(BodySource::Static(bytes)),
                 Some(BodySourceSpec::Template(src))
                 | Some(BodySourceSpec::JsonTemplate(src)) => {
-                    let tpl = Template::compile(&src, vars).map_err(|e| {
-                        ScriptError::Template {
-                            scenario: scenario_name.to_string(),
-                            field: "body".into(),
-                            error: e,
-                        }
-                    })?;
+                    let tpl = compile_tpl(&src, vars, scenario, "body")?;
                     Some(BodySource::Template(tpl))
                 }
             };
@@ -1374,9 +1095,7 @@ fn compile_step(
                 expect_streaming: false,
             };
             Ok(if cold {
-                Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan {
-                    request,
-                })
+                Step::HttpColdConnect(zerobench_core::plan::ColdConnectPlan { request })
             } else {
                 Step::Request(request)
             })
@@ -1422,110 +1141,90 @@ fn register_types(engine: &mut Engine) {
 }
 
 fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
-    // scenario("name", body)  — auto weight.
+    // scenario("name", [weight,] body) — three overloads:
+    // - no weight (auto — split evenly)
+    // - f64 weight
+    // - i64 weight (Rhai int-literal fallback; `scenario("a", 1, ...)`
+    //   otherwise fails fn resolution against the f64 variant).
     //
-    // Returns `()` rather than `ScenarioBuilder`. Scripts call this at the
-    // top level (`scenario(...);`) as a statement; returning a builder
-    // would force every call to be a discarded expression. Rhai's
-    // `engine.run()` also expects the overall script to yield `()`, so
-    // top-level helpers that return `()` keep that invariant automatic.
+    // All three return `()` rather than `ScenarioBuilder`. Scripts call
+    // `scenario(...);` as a statement; `engine.run()` also expects the
+    // overall script to yield `()`, so top-level helpers that return
+    // `()` keep that invariant automatic.
+    macro_rules! scenario_fn {
+        ($weight_ty:ty, $weight_expr:expr) => {{
+            let r = root.clone();
+            engine.register_fn(
+                "scenario",
+                move |ctx: NativeCallContext,
+                      name: ImmutableString,
+                      weight: $weight_ty,
+                      body: FnPtr| {
+                    let scn = ScenarioBuilder::new(name.to_string(), Some($weight_expr(weight)));
+                    r.modify(|s| s.scenarios.push(scn.clone()));
+                    body.call_within_context::<()>(&ctx, (Dynamic::from(scn),))?;
+                    Ok::<(), Box<EvalAltResult>>(())
+                },
+            );
+        }};
+    }
+    // No-weight overload — cannot use the macro above because it has a
+    // different arity.
     let r = root.clone();
     engine.register_fn(
         "scenario",
         move |ctx: NativeCallContext, name: ImmutableString, body: FnPtr| {
             let scn = ScenarioBuilder::new(name.to_string(), None);
-            r.with_state(|s| s.scenarios.push(scn.clone()));
+            r.modify(|s| s.scenarios.push(scn.clone()));
             body.call_within_context::<()>(&ctx, (Dynamic::from(scn),))?;
             Ok::<(), Box<EvalAltResult>>(())
         },
     );
-
-    // scenario("name", weight, body)  — explicit float weight
-    let r = root.clone();
-    engine.register_fn(
-        "scenario",
-        move |ctx: NativeCallContext,
-              name: ImmutableString,
-              weight: f64,
-              body: FnPtr| {
-            let scn = ScenarioBuilder::new(name.to_string(), Some(weight));
-            r.with_state(|s| s.scenarios.push(scn.clone()));
-            body.call_within_context::<()>(&ctx, (Dynamic::from(scn),))?;
-            Ok::<(), Box<EvalAltResult>>(())
-        },
-    );
-    // Integer-weight overload because Rhai literals `1` come in as i64;
-    // without this, `scenario("a", 1, ...)` fails fn resolution (the
-    // float variant wants `f64`).
-    let r = root.clone();
-    engine.register_fn(
-        "scenario",
-        move |ctx: NativeCallContext,
-              name: ImmutableString,
-              weight: i64,
-              body: FnPtr| {
-            let scn =
-                ScenarioBuilder::new(name.to_string(), Some(weight as f64));
-            r.with_state(|s| s.scenarios.push(scn.clone()));
-            body.call_within_context::<()>(&ctx, (Dynamic::from(scn),))?;
-            Ok::<(), Box<EvalAltResult>>(())
-        },
-    );
+    scenario_fn!(f64, |w: f64| w);
+    scenario_fn!(i64, |w: i64| w as f64);
 
     // rate("10k/s")  — global open-loop rate
     let r = root.clone();
     engine.register_fn("rate", move |spec: ImmutableString| {
         let rate = parse::parse_rate_with_unit(&spec).map_err(to_rhai_err)?;
-        r.with_state(|s| s.global_rate = Some(RateProfile::Constant(rate)));
+        r.modify(|s| s.global_rate = Some(RateProfile::Constant(rate)));
         Ok::<(), Box<EvalAltResult>>(())
     });
 
     // saturate(n)  — closed-loop concurrency
     let r = root.clone();
     engine.register_fn("saturate", move |n: i64| {
-        let n = if n <= 0 { 1usize } else { n as usize };
-        r.with_state(|s| s.saturate_concurrency = Some(n));
+        r.modify(|s| s.saturate_concurrency = Some(n.max(1) as usize));
     });
 
-    // duration("30s")
-    let r = root.clone();
-    engine.register_fn("duration", move |spec: ImmutableString| {
-        let d = parse::parse_duration(&spec)
-            .ok_or_else(|| to_rhai_err(format!("invalid duration {spec:?}")))?;
-        r.with_state(|s| s.duration = Some(d));
-        Ok::<(), Box<EvalAltResult>>(())
-    });
-
-    // warmup("2s")
-    let r = root.clone();
-    engine.register_fn("warmup", move |spec: ImmutableString| {
-        let d = parse::parse_duration(&spec)
-            .ok_or_else(|| to_rhai_err(format!("invalid warmup {spec:?}")))?;
-        r.with_state(|s| s.warmup = Some(d));
-        Ok::<(), Box<EvalAltResult>>(())
-    });
-
-    // cooldown("10s") — TIME_WAIT drain between runs.
-    let r = root.clone();
-    engine.register_fn("cooldown", move |spec: ImmutableString| {
-        let d = parse::parse_duration(&spec)
-            .ok_or_else(|| to_rhai_err(format!("invalid cooldown {spec:?}")))?;
-        r.with_state(|s| s.cooldown = Some(d));
-        Ok::<(), Box<EvalAltResult>>(())
-    });
+    // duration("30s") / warmup("2s") / cooldown("10s") — every plan-level
+    // duration knob shares the same parse-then-assign shape. `$field` is
+    // the `Option<Duration>` field on `PlanBuilderState` to set.
+    macro_rules! plan_duration_fn {
+        ($method:literal, $field:ident) => {{
+            let r = root.clone();
+            engine.register_fn($method, move |spec: ImmutableString| {
+                let d = parse::parse_duration(&spec)
+                    .ok_or_else(|| to_rhai_err(format!(concat!("invalid ", $method, " {:?}"), spec)))?;
+                r.modify(|s| s.$field = Some(d));
+                Ok::<(), Box<EvalAltResult>>(())
+            });
+        }};
+    }
+    plan_duration_fn!("duration", duration);
+    plan_duration_fn!("warmup", warmup);
+    plan_duration_fn!("cooldown", cooldown);
 
     // runs(3) — iterations per plan. Feeds the bootstrap CI aggregator.
     let r = root.clone();
     engine.register_fn("runs", move |n: i64| {
-        let n = if n < 1 { 1u32 } else { n as u32 };
-        r.with_state(|s| s.runs = Some(n));
+        r.modify(|s| s.runs = Some(n.max(1) as u32));
     });
 
     // threads(8) — client-side worker thread count.
     let r = root.clone();
     engine.register_fn("threads", move |n: i64| {
-        let n = if n < 1 { 1usize } else { n as usize };
-        r.with_state(|s| s.threads = Some(n));
+        r.modify(|s| s.threads = Some(n.max(1) as usize));
     });
 
     // plan_name("chat-burst") — overrides the default Target-host name
@@ -1533,7 +1232,7 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
     // multiple logical profiles.
     let r = root.clone();
     engine.register_fn("plan_name", move |name: ImmutableString| {
-        r.with_state(|s| s.name = Some(name.to_string()));
+        r.modify(|s| s.name = Some(name.to_string()));
     });
 
     // transport("h1" | "h2")
@@ -1549,7 +1248,7 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
                 )))
             }
         };
-        r.with_state(|s| s.transport = ver);
+        r.modify(|s| s.transport = ver);
         Ok::<(), Box<EvalAltResult>>(())
     });
 
@@ -1570,11 +1269,9 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
     // env("NAME", "default") — with fallback
     engine.register_fn(
         "env",
-        move |name: ImmutableString, default: ImmutableString| {
-            match std::env::var(name.as_str()) {
-                Ok(v) => ImmutableString::from(v),
-                Err(_) => default,
-            }
+        move |name: ImmutableString, default: ImmutableString| match std::env::var(name.as_str()) {
+            Ok(v) => ImmutableString::from(v),
+            Err(_) => default,
         },
     );
 
@@ -1589,8 +1286,11 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
     let r = root.clone();
     engine.register_fn("slot", move |name: ImmutableString| {
         let name_str = name.to_string();
-        let handle = r.with_state(|s| match s.vars.allocate(&name_str) {
-            Ok(slot) => Ok(VarSlotHandle { slot, name: name_str }),
+        let handle = r.modify(|s| match s.vars.allocate(&name_str) {
+            Ok(slot) => Ok(VarSlotHandle {
+                slot,
+                name: name_str,
+            }),
             Err(e) => Err(e),
         });
         handle.map_err(|e| to_rhai_err(format!("slot allocation: {e}")))
@@ -1614,17 +1314,11 @@ fn register_request_builders(engine: &mut Engine) {
     }
 
     // .header(name, value)
-    engine.register_fn(
-        "header",
-        move |b: RequestBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
+    register_header_fn!(engine, RequestBuilder);
 
     // .body(string)  — template if it contains `{{`, else raw bytes.
     engine.register_fn("body", move |b: RequestBuilder, body: ImmutableString| {
-        b.with_state(|s| {
+        b.modify(|s| {
             let body_str = body.to_string();
             if body_str.contains("{{") {
                 s.body = Some(BodySourceSpec::Template(body_str));
@@ -1645,7 +1339,7 @@ fn register_request_builders(engine: &mut Engine) {
                     ctx.call_position(),
                 ))
             })?;
-            b.with_state(|s| s.body = Some(BodySourceSpec::Raw(Bytes::from(bytes))));
+            b.modify(|s| s.body = Some(BodySourceSpec::Raw(Bytes::from(bytes))));
             Ok::<RequestBuilder, Box<EvalAltResult>>(b)
         },
     );
@@ -1660,7 +1354,7 @@ fn register_request_builders(engine: &mut Engine) {
                     ctx.call_position(),
                 ))
             })?;
-            b.with_state(|s| {
+            b.modify(|s| {
                 // JSON bodies always go through the template engine so
                 // values like "{{uuid}}" nested in the map expand per
                 // iteration. If there were no templates at all, the
@@ -1672,10 +1366,8 @@ fn register_request_builders(engine: &mut Engine) {
                     .iter()
                     .any(|(n, _)| n.eq_ignore_ascii_case("content-type"));
                 if !has_ct {
-                    s.headers.push((
-                        "Content-Type".into(),
-                        "application/json".into(),
-                    ));
+                    s.headers
+                        .push(("Content-Type".into(), "application/json".into()));
                 }
             });
             Ok::<RequestBuilder, Box<EvalAltResult>>(b)
@@ -1684,7 +1376,7 @@ fn register_request_builders(engine: &mut Engine) {
 
     // .expect_status(n)
     engine.register_fn("expect_status", move |b: RequestBuilder, code: i64| {
-        b.with_state(|s| s.checks.push(Assertion::StatusEq(clamp_u16(code))));
+        b.modify(|s| s.checks.push(Assertion::StatusEq(clamp_u16(code))));
         b
     });
 
@@ -1703,7 +1395,7 @@ fn register_request_builders(engine: &mut Engine) {
                 })?;
                 codes.push(clamp_u16(code));
             }
-            b.with_state(|s| s.checks.push(Assertion::StatusIn(codes)));
+            b.modify(|s| s.checks.push(Assertion::StatusIn(codes)));
             Ok::<RequestBuilder, Box<EvalAltResult>>(b)
         },
     );
@@ -1712,10 +1404,9 @@ fn register_request_builders(engine: &mut Engine) {
     engine.register_fn(
         "expect_latency_under",
         move |b: RequestBuilder, spec: ImmutableString| {
-            let d = parse::parse_duration(&spec).ok_or_else(|| {
-                to_rhai_err(format!("invalid latency duration {spec:?}"))
-            })?;
-            b.with_state(|s| s.checks.push(Assertion::LatencyUnder(d)));
+            let d = parse::parse_duration(&spec)
+                .ok_or_else(|| to_rhai_err(format!("invalid latency duration {spec:?}")))?;
+            b.modify(|s| s.checks.push(Assertion::LatencyUnder(d)));
             Ok::<RequestBuilder, Box<EvalAltResult>>(b)
         },
     );
@@ -1729,11 +1420,14 @@ fn register_request_builders(engine: &mut Engine) {
               slot: VarSlotHandle| {
             let name = HeaderName::from_bytes(header.as_bytes()).map_err(|e| {
                 Box::new(EvalAltResult::ErrorRuntime(
-                    Dynamic::from(format!("invalid header name {:?}: {e}", header.as_str())),
+                    Dynamic::from(format!(
+                        "invalid header name {:?}: {e}",
+                        header.as_str()
+                    )),
                     ctx.call_position(),
                 ))
             })?;
-            b.with_state(|s| {
+            b.modify(|s| {
                 s.extract.push(Extract::Header {
                     name,
                     into: slot.slot,
@@ -1747,7 +1441,7 @@ fn register_request_builders(engine: &mut Engine) {
     engine.register_fn(
         "extract_status",
         move |b: RequestBuilder, slot: VarSlotHandle| {
-            b.with_state(|s| s.extract.push(Extract::StatusCode { into: slot.slot }));
+            b.modify(|s| s.extract.push(Extract::StatusCode { into: slot.slot }));
             b
         },
     );
@@ -1755,7 +1449,7 @@ fn register_request_builders(engine: &mut Engine) {
     // .cold_connect()  — fresh TCP+TLS+HTTP connection per request,
     // no pool reuse. Compiles to Step::HttpColdConnect at finalize.
     engine.register_fn("cold_connect", move |b: RequestBuilder| {
-        b.with_state(|s| s.cold = true);
+        b.modify(|s| s.cold = true);
         b
     });
 }
@@ -1765,140 +1459,85 @@ fn register_sse_hold_builders(engine: &mut Engine) {
     engine.register_fn(
         "sse_hold",
         move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let subs_u: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let subs_u = clamp_u32_min1(subs);
             SseHoldBuilder::new(url.to_string(), subs_u, secs)
         },
     );
-
     // Overload that takes a raw seconds int for `hold_for`.
     engine.register_fn(
         "sse_hold",
         move |url: ImmutableString, subs: i64, hold_for_secs: i64| {
-            let secs = if hold_for_secs <= 0 { 60 } else { hold_for_secs as u64 };
-            let subs_u: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
-            SseHoldBuilder::new(url.to_string(), subs_u, Duration::from_secs(secs))
+            SseHoldBuilder::new(
+                url.to_string(),
+                clamp_u32_min1(subs),
+                hold_for_from_secs(hold_for_secs),
+            )
         },
     );
 
-    // .header(name, value)
-    engine.register_fn(
-        "header",
-        move |b: SseHoldBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
-
-    // .reconnect(bool)
-    engine.register_fn("reconnect", move |b: SseHoldBuilder, on: bool| {
-        b.with_state(|s| s.reconnect = on);
-        b
-    });
+    register_header_fn!(engine, SseHoldBuilder);
+    register_setter_fn!(engine, "reconnect", SseHoldBuilder, reconnect, bool);
 }
 
 fn register_ws_echo_rtt_builders(engine: &mut Engine) {
-    // ws_echo_rtt(url, connections, msg_rate_per_conn)
     engine.register_fn(
         "ws_echo_rtt",
         move |url: ImmutableString, conns: i64, rate: f64| {
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            let c = clamp_u32_min1(conns);
             WsEchoRttBuilder::new(url.to_string(), c, rate)
         },
     );
-    // Overload with i64 rate (msg/sec whole number).
     engine.register_fn(
         "ws_echo_rtt",
         move |url: ImmutableString, conns: i64, rate: i64| {
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            let c = clamp_u32_min1(conns);
             WsEchoRttBuilder::new(url.to_string(), c, rate as f64)
         },
     );
 
-    // .header(name, value)
-    engine.register_fn(
-        "header",
-        move |b: WsEchoRttBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
+    register_header_fn!(engine, WsEchoRttBuilder);
+    register_setter_fn!(
+        engine, "payload", WsEchoRttBuilder, payload, ImmutableString,
+        |t: ImmutableString| t.to_string()
     );
-
-    // .payload(text)
-    engine.register_fn(
-        "payload",
-        move |b: WsEchoRttBuilder, text: ImmutableString| {
-            b.with_state(|s| s.payload = text.to_string());
-            b
-        },
-    );
-
     // .correlate(strategy) — how to match server echoes to client sends.
     // Accepts "pingpong", "prepend" (default), "first_text", or
     // "substring:<marker>". Unknown values fail at plan build time.
-    engine.register_fn(
-        "correlate",
-        move |ctx: NativeCallContext,
-              b: WsEchoRttBuilder,
-              strategy: ImmutableString|
-              -> Result<WsEchoRttBuilder, Box<EvalAltResult>> {
-            let parsed = parse_correlate(&strategy).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
-            })?;
-            b.with_state(|s| s.correlate = parsed);
-            Ok(b)
-        },
+    register_parsed_setter_fn!(
+        engine, "correlate", WsEchoRttBuilder, correlate, parse_correlate
     );
 }
 
 fn register_ws_hold_builders(engine: &mut Engine) {
-    // ws_hold(url, connections, hold_for) — idle-capacity test.
     engine.register_fn(
         "ws_hold",
         move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let c = clamp_u32_min1(conns);
             WsHoldBuilder::new(url.to_string(), c, secs)
         },
     );
     engine.register_fn(
         "ws_hold",
         move |url: ImmutableString, conns: i64, hold_for_secs: i64| {
-            let secs = if hold_for_secs <= 0 { 60 } else { hold_for_secs as u64 };
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
-            WsHoldBuilder::new(url.to_string(), c, Duration::from_secs(secs))
+            WsHoldBuilder::new(
+                url.to_string(),
+                clamp_u32_min1(conns),
+                hold_for_from_secs(hold_for_secs),
+            )
         },
     );
-    engine.register_fn(
-        "heartbeat",
-        move |b: WsHoldBuilder, interval: ImmutableString| {
-            let d = parse_duration_str(&interval).unwrap_or(Duration::from_secs(25));
-            b.with_state(|s| s.heartbeat = d);
-            b
-        },
+    register_setter_fn!(
+        engine, "heartbeat", WsHoldBuilder, heartbeat, ImmutableString,
+        |i: ImmutableString| parse_duration_str(&i).unwrap_or(Duration::from_secs(25))
     );
-    engine.register_fn(
-        "header",
-        move |b: WsHoldBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
+    register_header_fn!(engine, WsHoldBuilder);
     // .heartbeat_frame(kind) — "ping" (RFC 6455 Ping, default) or
     // "text" (app-level text frame, for servers that don't reply to
     // Ping).
-    engine.register_fn(
-        "heartbeat_frame",
-        move |ctx: NativeCallContext,
-              b: WsHoldBuilder,
-              kind: ImmutableString|
-              -> Result<WsHoldBuilder, Box<EvalAltResult>> {
-            let parsed = parse_heartbeat_frame(&kind).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
-            })?;
-            b.with_state(|s| s.heartbeat_frame = parsed);
-            Ok(b)
-        },
+    register_parsed_setter_fn!(
+        engine, "heartbeat_frame", WsHoldBuilder, heartbeat_frame, parse_heartbeat_frame
     );
 }
 
@@ -1906,47 +1545,22 @@ fn register_sse_fanout_builders(engine: &mut Engine) {
     engine.register_fn(
         "sse_fanout",
         move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let s: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let s = clamp_u32_min1(subs);
             SseFanoutBuilder::new(url.to_string(), s, secs)
         },
     );
-    engine.register_fn(
-        "trigger_url",
-        move |b: SseFanoutBuilder, url: ImmutableString| {
-            b.with_state(|s| s.trigger_url = url.to_string());
-            b
-        },
+    register_setter_fn!(
+        engine, "trigger_url", SseFanoutBuilder, trigger_url, ImmutableString,
+        |u: ImmutableString| u.to_string()
     );
-    engine.register_fn(
-        "reconnect",
-        move |b: SseFanoutBuilder, on: bool| {
-            b.with_state(|s| s.reconnect = on);
-            b
-        },
-    );
-    engine.register_fn(
-        "header",
-        move |b: SseFanoutBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
+    register_setter_fn!(engine, "reconnect", SseFanoutBuilder, reconnect, bool);
+    register_header_fn!(engine, SseFanoutBuilder);
     // .mode(kind) — "trigger_rtt" (default, proxy from trigger 2xx)
     // or "timestamp[:<field>]" (read emit ns from the broadcast
     // payload; requires server cooperation).
-    engine.register_fn(
-        "mode",
-        move |ctx: NativeCallContext,
-              b: SseFanoutBuilder,
-              kind: ImmutableString|
-              -> Result<SseFanoutBuilder, Box<EvalAltResult>> {
-            let parsed = parse_fanout_mode(&kind).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
-            })?;
-            b.with_state(|s| s.mode = parsed);
-            Ok(b)
-        },
+    register_parsed_setter_fn!(
+        engine, "mode", SseFanoutBuilder, mode, parse_fanout_mode
     );
 }
 
@@ -1954,58 +1568,25 @@ fn register_ws_fanout_builders(engine: &mut Engine) {
     engine.register_fn(
         "ws_fanout",
         move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let c = clamp_u32_min1(conns);
             WsFanoutBuilder::new(url.to_string(), c, secs)
         },
     );
-    engine.register_fn(
-        "trigger_url",
-        move |b: WsFanoutBuilder, url: ImmutableString| {
-            b.with_state(|s| s.trigger_url = url.to_string());
-            b
-        },
+    register_setter_fn!(
+        engine, "trigger_url", WsFanoutBuilder, trigger_url, ImmutableString,
+        |u: ImmutableString| u.to_string()
     );
-    engine.register_fn(
-        "heartbeat",
-        move |b: WsFanoutBuilder, interval: ImmutableString| {
-            let d = parse_duration_str(&interval).unwrap_or(Duration::from_secs(25));
-            b.with_state(|s| s.heartbeat = d);
-            b
-        },
+    register_setter_fn!(
+        engine, "heartbeat", WsFanoutBuilder, heartbeat, ImmutableString,
+        |i: ImmutableString| parse_duration_str(&i).unwrap_or(Duration::from_secs(25))
     );
-    engine.register_fn(
-        "header",
-        move |b: WsFanoutBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
+    register_header_fn!(engine, WsFanoutBuilder);
+    register_parsed_setter_fn!(
+        engine, "heartbeat_frame", WsFanoutBuilder, heartbeat_frame, parse_heartbeat_frame
     );
-    engine.register_fn(
-        "heartbeat_frame",
-        move |ctx: NativeCallContext,
-              b: WsFanoutBuilder,
-              kind: ImmutableString|
-              -> Result<WsFanoutBuilder, Box<EvalAltResult>> {
-            let parsed = parse_heartbeat_frame(&kind).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
-            })?;
-            b.with_state(|s| s.heartbeat_frame = parsed);
-            Ok(b)
-        },
-    );
-    engine.register_fn(
-        "mode",
-        move |ctx: NativeCallContext,
-              b: WsFanoutBuilder,
-              kind: ImmutableString|
-              -> Result<WsFanoutBuilder, Box<EvalAltResult>> {
-            let parsed = parse_fanout_mode(&kind).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
-            })?;
-            b.with_state(|s| s.mode = parsed);
-            Ok(b)
-        },
+    register_parsed_setter_fn!(
+        engine, "mode", WsFanoutBuilder, mode, parse_fanout_mode
     );
 }
 
@@ -2013,66 +1594,44 @@ fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
     engine.register_fn(
         "sse_reconnect_storm",
         move |url: ImmutableString, subs: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let s: u32 = if subs < 0 { 1 } else { (subs as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let s = clamp_u32_min1(subs);
             SseReconnectStormBuilder::new(url.to_string(), s, secs)
         },
     );
-    engine.register_fn(
-        "kill_rate",
-        move |b: SseReconnectStormBuilder, rate: f64| {
-            b.with_state(|s| s.kill_rate_per_s = rate);
-            b
-        },
+    register_setter_fn!(
+        engine, "kill_rate", SseReconnectStormBuilder, kill_rate_per_s, f64
     );
-    engine.register_fn(
-        "verify_last_event_id",
-        move |b: SseReconnectStormBuilder, on: bool| {
-            b.with_state(|s| s.verify_last_event_id = on);
-            b
-        },
+    register_setter_fn!(
+        engine, "verify_last_event_id", SseReconnectStormBuilder,
+        verify_last_event_id, bool
     );
-    engine.register_fn(
-        "header",
-        move |b: SseReconnectStormBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
+    register_header_fn!(engine, SseReconnectStormBuilder);
 }
 
 fn register_ws_server_push_builders(engine: &mut Engine) {
-    // ws_server_push(url, connections, hold_for) — read-only RTT.
     engine.register_fn(
         "ws_server_push",
         move |url: ImmutableString, conns: i64, hold_for: ImmutableString| {
-            let secs = parse_duration_str(&hold_for).unwrap_or(Duration::from_secs(60));
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
+            let secs = hold_for_from_str(&hold_for);
+            let c = clamp_u32_min1(conns);
             WsServerPushBuilder::new(url.to_string(), c, secs)
         },
     );
     engine.register_fn(
         "ws_server_push",
         move |url: ImmutableString, conns: i64, hold_for_secs: i64| {
-            let secs = if hold_for_secs <= 0 { 60 } else { hold_for_secs as u64 };
-            let c: u32 = if conns < 0 { 1 } else { (conns as u32).max(1) };
-            WsServerPushBuilder::new(url.to_string(), c, Duration::from_secs(secs))
+            WsServerPushBuilder::new(
+                url.to_string(),
+                clamp_u32_min1(conns),
+                hold_for_from_secs(hold_for_secs),
+            )
         },
     );
-    engine.register_fn(
-        "expected_rate",
-        move |b: WsServerPushBuilder, rate: f64| {
-            b.with_state(|s| s.expected_rate_per_conn = rate);
-            b
-        },
+    register_setter_fn!(
+        engine, "expected_rate", WsServerPushBuilder, expected_rate_per_conn, f64
     );
-    engine.register_fn(
-        "header",
-        move |b: WsServerPushBuilder, name: ImmutableString, value: ImmutableString| {
-            b.with_state(|s| s.headers.push((name.to_string(), value.to_string())));
-            b
-        },
-    );
+    register_header_fn!(engine, WsServerPushBuilder);
 }
 
 /// Parse a human duration like "60s", "5m", "500ms", or fall back to
@@ -2100,60 +1659,32 @@ fn register_scenario_builder(engine: &mut Engine) {
     // require `scenario` to declare a `ScenarioBuilder` return type.
     // Returning `()` keeps the closure body's return type as `()` and
     // matches how the top-level `scenario(...)` helper is registered.
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, req: RequestBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::Request(req)));
-        },
-    );
+    engine.register_fn("step", move |s: ScenarioBuilder, req: RequestBuilder| {
+        s.modify(|st| st.steps.push(StepSource::Request(req)));
+    });
 
-    // Protocol-native v0.1.0 step variants.
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: SseHoldBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::SseHold(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: WsEchoRttBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::WsEchoRtt(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: WsHoldBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::WsHold(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: WsServerPushBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::WsServerPush(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: SseFanoutBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::SseFanout(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: SseReconnectStormBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::SseReconnectStorm(b)));
-        },
-    );
-    engine.register_fn(
-        "step",
-        move |s: ScenarioBuilder, b: WsFanoutBuilder| {
-            s.with_state(|st| st.steps.push(StepSource::WsFanout(b)));
-        },
-    );
+    // Protocol-native v0.1.0 step variants. Every `s.step(b)` closure
+    // has the same shape — enqueue the builder wrapped in the matching
+    // StepSource variant — so collapse the eight registrations into a
+    // macro loop.
+    macro_rules! step_fn {
+        ($Builder:ty, $Variant:ident) => {
+            engine.register_fn("step", move |s: ScenarioBuilder, b: $Builder| {
+                s.modify(|st| st.steps.push(StepSource::$Variant(b)));
+            });
+        };
+    }
+    step_fn!(SseHoldBuilder, SseHold);
+    step_fn!(WsEchoRttBuilder, WsEchoRtt);
+    step_fn!(WsHoldBuilder, WsHold);
+    step_fn!(WsServerPushBuilder, WsServerPush);
+    step_fn!(SseFanoutBuilder, SseFanout);
+    step_fn!(SseReconnectStormBuilder, SseReconnectStorm);
+    step_fn!(WsFanoutBuilder, WsFanout);
 
     // s.step(pause(...))  — Pause / PauseRandom step (StepSource directly)
     engine.register_fn("step", move |s: ScenarioBuilder, step: StepSource| {
-        s.with_state(|st| st.steps.push(step));
+        s.modify(|st| st.steps.push(step));
     });
 
     // s.rate("3k/s")  — per-scenario open-loop rate
@@ -2161,19 +1692,15 @@ fn register_scenario_builder(engine: &mut Engine) {
         "rate",
         move |s: ScenarioBuilder, spec: ImmutableString| {
             let rate = parse::parse_rate_with_unit(&spec).map_err(to_rhai_err)?;
-            s.with_state(|st| st.rate = Some(RateProfile::Constant(rate)));
+            s.modify(|st| st.rate = Some(RateProfile::Constant(rate)));
             Ok::<(), Box<EvalAltResult>>(())
         },
     );
 
     // s.saturate(n)  — per-scenario closed-loop concurrency
     engine.register_fn("saturate", move |s: ScenarioBuilder, n: i64| {
-        let n = if n <= 0 { 1usize } else { n as usize };
-        s.with_state(|st| {
-            st.rate = Some(RateProfile::Saturate {
-                max_concurrency: n,
-            })
-        });
+        let max_concurrency = n.max(1) as usize;
+        s.modify(|st| st.rate = Some(RateProfile::Saturate { max_concurrency }));
     });
 }
 
@@ -2220,10 +1747,7 @@ fn register_pause_helpers_unreachable(_engine: &mut Engine) {
                     "pause_random: min {lo:?} > max {hi:?}"
                 )));
             }
-            Ok::<StepSource, Box<EvalAltResult>>(StepSource::PauseRandom {
-                min,
-                max,
-            })
+            Ok::<StepSource, Box<EvalAltResult>>(StepSource::PauseRandom { min, max })
         },);
     };
 }
@@ -2251,6 +1775,28 @@ fn to_rhai_err(msg: impl Into<String>) -> Box<EvalAltResult> {
         Dynamic::from(msg.into()),
         rhai::Position::NONE,
     ))
+}
+
+/// Clamp a user-supplied i64 count to at least 1 u32. Applied to the
+/// `connections` / `subscribers` arguments at every protocol builder
+/// entry point.
+#[inline]
+fn clamp_u32_min1(n: i64) -> u32 {
+    if n < 1 { 1 } else { (n as u32).max(1) }
+}
+
+/// Parse a `hold_for` spec. The DSL accepts either a duration string
+/// ("30s") or a bare integer seconds count; this folds both shapes into
+/// a single `Duration`, defaulting to 60 s on parse failure or non-
+/// positive integers.
+#[inline]
+fn hold_for_from_str(spec: &str) -> Duration {
+    parse_duration_str(spec).unwrap_or(Duration::from_secs(60))
+}
+
+#[inline]
+fn hold_for_from_secs(secs: i64) -> Duration {
+    Duration::from_secs(if secs <= 0 { 60 } else { secs as u64 })
 }
 
 fn clamp_u16(code: i64) -> u16 {
@@ -2294,14 +1840,12 @@ fn dynamic_to_serde(v: &Dynamic) -> Result<serde_json::Value, String> {
         return Ok(Value::String(c.to_string()));
     }
     if v.is_string() {
-        return Ok(Value::String(v.clone().into_string().map_err(|t| {
-            format!("expected string, got {t}")
-        })?));
+        return Ok(Value::String(
+            v.clone().into_string().map_err(|t| format!("expected string, got {t}"))?,
+        ));
     }
     if v.is_array() {
-        let arr = v.clone().into_array().map_err(|t| {
-            format!("expected array, got {t}")
-        })?;
+        let arr = v.clone().into_array().map_err(|t| format!("expected array, got {t}"))?;
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             out.push(dynamic_to_serde(&item)?);
@@ -2309,9 +1853,10 @@ fn dynamic_to_serde(v: &Dynamic) -> Result<serde_json::Value, String> {
         return Ok(Value::Array(out));
     }
     if v.is_map() {
-        let m = v.clone().try_cast::<rhai::Map>().ok_or_else(|| {
-            format!("expected map, got {}", v.type_name())
-        })?;
+        let m = v
+            .clone()
+            .try_cast::<rhai::Map>()
+            .ok_or_else(|| format!("expected map, got {}", v.type_name()))?;
         let mut obj = serde_json::Map::with_capacity(m.len());
         for (k, val) in m {
             obj.insert(k.to_string(), dynamic_to_serde(&val)?);
@@ -2323,3 +1868,4 @@ fn dynamic_to_serde(v: &Dynamic) -> Result<serde_json::Value, String> {
         v.type_name()
     ))
 }
+
