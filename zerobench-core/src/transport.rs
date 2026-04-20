@@ -1,30 +1,15 @@
-//! ARCH STATUS: SPLIT
-//!
-//! Target + TransportOpts + AddrFamily + HttpVersionPref + TargetError
-//!   → STAY in core (Plan-adjacent vocabulary)
-//! TransportError (+ classify helper)
-//!   → MOVE to zerobench-runtime (runtime error taxonomy; used by
-//!     every backend to produce ErrorKind via one shared classifier —
-//!     see ARCH-REVIEW §4.7 error-unify).
-//!
-//! ARCH(error-unify): today every backend invents its own ColdErr /
-//! SessionErr / RecvErr. Target: each backend returns
-//! Result<Sample, TransportError>; runtime's `classify(&TransportError)
-//! -> ErrorKind` is the only mapping.
-//!
-//! See docs/ARCH-REVIEW-2026-04-20.md §4.7, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
-//! Transport types — target, options, response, errors.
+//! Transport vocabulary — target, options, address-family preference.
 //!
 //! - [`Target`] describes the remote endpoint (host, port, TLS).
 //! - [`TransportOpts`] carries the knobs shared across all transports
 //!   (timeouts, pool size, TCP_NODELAY, TLS-insecure toggle).
-//! - [`Response`] is a completed exchange — status, headers, buffered
-//!   body, and the four numbers every benchmark cares about: bytes sent,
-//!   bytes received, TTFB, total duration.
-//! - [`TransportError`] is the error type every transport backend uses.
+//! - [`TargetError`] is returned by [`Target::parse`] only — it's a
+//!   plan-construction error, not a runtime error.
+//!
+//! The *runtime* error taxonomy every backend produces
+//! (`TransportError`: connect/timeout/protocol/io/build/tls) lives in
+//! `zerobench_runtime::transport` because it's a runtime concern and
+//! `zerobench-core` is type-vocabulary only.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -198,7 +183,7 @@ impl Target {
     ///
     /// Returns [`io::ErrorKind::NotFound`] / [`io::ErrorKind::AddrNotAvailable`]
     /// when no address matches the request — callers map this to
-    /// [`TransportError::Connect`] at the wire layer.
+    /// `zerobench_runtime::transport::TransportError::Connect` at the wire layer.
     pub fn resolve(&self, opts: &TransportOpts) -> std::io::Result<SocketAddr> {
         use std::net::ToSocketAddrs;
 
@@ -321,7 +306,7 @@ impl Default for TransportOpts {
 ///
 /// The enum carries *all* variants regardless of feature flags so
 /// downstream code (the CLI parser, front-ends) can use a single type;
-/// `HttpTransport::build_client` returns [`TransportError::Protocol`] if
+/// `HttpTransport::build_client` returns a `TransportError::Protocol` if
 /// the request variant isn't wired up in the current build (e.g. `Http2`
 /// was requested but the `h2` feature wasn't enabled).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,51 +321,6 @@ pub enum HttpVersionPref {
     /// `zerobench-http`; the dispatcher surfaces a clear error if the
     /// feature is absent rather than silently downgrading.
     Http2,
-}
-
-// ---------------------------------------------------------------------------
-// TransportError
-// ---------------------------------------------------------------------------
-
-/// The error type every `Transport` uses.
-///
-/// Variants map one-to-one onto the [`crate::stats::ErrorKind`] counters
-/// so the dispatcher can roll them up without re-inspecting the error.
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    /// TCP/TLS connect failed. The contained string carries the
-    /// underlying cause (DNS failure, ECONNREFUSED, TLS handshake
-    /// reject, etc) — we don't split them further because the
-    /// benchmark reporter collapses them into a single counter anyway.
-    #[error("connect failed: {0}")]
-    Connect(String),
-
-    /// A deadline fired. Covers both connect-timeout and
-    /// request-timeout per [`TransportOpts`].
-    #[error("timeout")]
-    Timeout,
-
-    /// Protocol-level error — header
-    /// parsing, frame decode, invalid Content-Length, etc.
-    #[error("protocol error: {0}")]
-    Protocol(String),
-
-    /// Bare IO error bubbled up from the socket. Autoconverted from
-    /// `std::io::Error` so transport impls can use `?` freely.
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Template expansion, header construction, or body encoding
-    /// produced an invalid request before anything reached the wire.
-    /// Treated as fatal — a broken plan isn't retryable.
-    #[error("request build failed: {0}")]
-    RequestBuild(String),
-
-    /// TLS-specific failure (certificate rejection, ALPN mismatch,
-    /// handshake abort). Split from [`TransportError::Connect`] so the
-    /// reporter can surface TLS issues distinctly when we care to.
-    #[error("tls error: {0}")]
-    Tls(String),
 }
 
 // ---------------------------------------------------------------------------

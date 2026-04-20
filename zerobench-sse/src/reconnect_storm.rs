@@ -1,7 +1,7 @@
 //! ARCH STATUS: MOVE → zerobench-backends::sse::reconnect_storm
 //!
 //! Becomes one arm of the dispatch match. ARCH(error-unify): SessionErr
-//! goes away — replace with core's TransportError. Consumes SseEvent::Id
+//! goes away — replace with `zerobench_runtime::TransportError`. Consumes SseEvent::Id
 //! via the shared line_parser (the crown jewel).
 //! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.7, §7.
 //!

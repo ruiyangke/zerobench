@@ -13,6 +13,7 @@
 //!   - [`machine`]       — host fingerprint (CPU, RAM, OS) captured once per run
 //!   - [`stop`]          — shared stop-flag primitive
 //!   - [`tls`]           — shared rustls `ClientConfig` builder
+//!   - [`transport`]     — runtime error taxonomy (`TransportError`)
 //!
 //! `BenchRng` lives in `zerobench_core::rng` because `template` and
 //! `scenario_context` (in core) need it. Everything here is downstream of
@@ -29,6 +30,7 @@ pub mod live_snapshot;
 pub mod machine;
 pub mod stop;
 pub mod tls;
+pub mod transport;
 
 pub use archive::{
     load_histogram_from_histlog, Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions,
@@ -43,3 +45,4 @@ pub use live_snapshot::{LiveSnapshot, LiveTick, ScenarioTick};
 pub use machine::MachineFingerprint;
 pub use stop::StopSignal;
 pub use tls::tls_client_config;
+pub use transport::TransportError;

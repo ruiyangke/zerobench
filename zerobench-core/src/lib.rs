@@ -15,7 +15,8 @@
 //!   - [`scenario_context`] — per-iteration execution context
 //!   - [`request_file`]     — `.http` request-file parser
 //!   - [`transport`]        — `Target`, `TransportOpts`, `HttpVersionPref`,
-//!                            `TransportError`
+//!                            `TargetError` (runtime `TransportError` lives in
+//!                            `zerobench-runtime::transport`)
 //!   - [`histogram`]        — HDR histogram constants + helpers
 //!   - [`rng`]              — per-worker `BenchRng` (entropy-seeded Xoshiro)
 //!
@@ -53,5 +54,5 @@ pub use stats::{
     WsExtrasExport,
 };
 pub use template::{ExpandCtx, Template, TemplateError};
-pub use transport::{HttpVersionPref, Target, TargetError, TransportError, TransportOpts};
+pub use transport::{HttpVersionPref, Target, TargetError, TransportOpts};
 pub use var::{VarError, VarRegistry, VarSlot};

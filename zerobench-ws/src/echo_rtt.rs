@@ -2,7 +2,7 @@
 //!
 //! Becomes one arm of the dispatch match. ARCH(error-unify): RecvErr
 //! (Timeout / Transport / ProtocolMismatch) disappears — replaces with
-//! core's TransportError. ARCH(recorder) at the RTT-recorded site.
+//! `zerobench_runtime::TransportError`. ARCH(recorder) at the RTT-recorded site.
 //! The 4-variant CorrelateStrategy + MatchKey dispatch stays — that's
 //! load-bearing for the recent review-loop fixes.
 //! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §4.7, §7.

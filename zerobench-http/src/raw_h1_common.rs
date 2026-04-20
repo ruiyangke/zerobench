@@ -20,7 +20,8 @@ use bytes::Bytes;
 use zerobench_core::plan::{Assertion, BodySource, Extract, RequestPlan};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::template::ExpandCtx;
-use zerobench_core::transport::{Target, TransportError};
+use zerobench_core::transport::Target;
+use zerobench_runtime::transport::TransportError;
 
 /// Whether the generated request carries `Connection: keep-alive` or
 /// `Connection: close`. Callers pick based on their session model:

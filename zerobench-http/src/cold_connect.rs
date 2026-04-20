@@ -351,10 +351,9 @@ struct OpOutcome {
     extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-// ARCH(error-unify): replace with core's TransportError (post-move:
-// zerobench-runtime::TransportError). Every backend's op-level error
-// becomes one shared type; runtime's classify() is the single mapping
-// to ErrorKind. See ARCH-REVIEW §4.7.
+// ARCH(error-unify): replace with zerobench_runtime::TransportError.
+// Every backend's op-level error becomes one shared type; runtime's
+// classify() is the single mapping to ErrorKind. See ARCH-REVIEW §4.7.
 /// Categorised errors from a single cold-connect op.
 ///
 /// Each hard-failure variant carries enough context (the underlying
