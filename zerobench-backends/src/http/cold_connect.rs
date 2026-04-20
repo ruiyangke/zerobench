@@ -219,13 +219,15 @@ fn run_worker(
                 }
             } else {
                 // Falling behind — record keep-up miss.
-                task.record_error(scenario_id, ErrorKind::Keepup);
+                Recorder::new(&mut task, live)
+                    .record_error(scenario_id, ErrorKind::Keepup);
             }
             target_at
         };
 
         let Some(addr) = cached_addr else {
-            task.record_error(scenario_id, ErrorKind::Connect);
+            Recorder::new(&mut task, live)
+                .record_error(scenario_id, ErrorKind::Connect);
             continue;
         };
 
@@ -272,15 +274,11 @@ fn run_worker(
                 }
                 // Classify 4xx/5xx.
                 if (400..500).contains(&outcome.status) {
-                    task.record_error(scenario_id, ErrorKind::Status4xx);
-                    if let Some(live) = live {
-                        live.record_error(ErrorKind::Status4xx);
-                    }
+                    Recorder::new(&mut task, live)
+                        .record_error(scenario_id, ErrorKind::Status4xx);
                 } else if (500..600).contains(&outcome.status) {
-                    task.record_error(scenario_id, ErrorKind::Status5xx);
-                    if let Some(live) = live {
-                        live.record_error(ErrorKind::Status5xx);
-                    }
+                    Recorder::new(&mut task, live)
+                        .record_error(scenario_id, ErrorKind::Status5xx);
                 }
 
                 // Run user-declared assertions + extractions. Matches
@@ -295,10 +293,8 @@ fn run_worker(
                 let assertion_failures =
                     check_assertions(req_plan, outcome.status, total);
                 for _ in 0..assertion_failures {
-                    task.record_error(scenario_id, ErrorKind::AssertionFailed);
-                    if let Some(live) = live {
-                        live.record_error(ErrorKind::AssertionFailed);
-                    }
+                    Recorder::new(&mut task, live)
+                        .record_error(scenario_id, ErrorKind::AssertionFailed);
                 }
                 apply_extractions(
                     req_plan,
@@ -310,10 +306,7 @@ fn run_worker(
             }
             Err(e) => {
                 let kind = classify_err(&e);
-                task.record_error(scenario_id, kind);
-                if let Some(live) = live {
-                    live.record_error(kind);
-                }
+                Recorder::new(&mut task, live).record_error(scenario_id, kind);
             }
         }
     }
