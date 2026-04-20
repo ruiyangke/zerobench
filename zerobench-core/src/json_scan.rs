@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::json_scan
+//!
+//! Used only by the fanout backends (FanoutMode::Timestamp payload
+//! scanning). Belongs in runtime, not core vocabulary. No rewrite.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Tiny fixed-purpose JSON scanner — pulls a single numeric field
 //! out of a payload without pulling in `serde_json`.
 //!

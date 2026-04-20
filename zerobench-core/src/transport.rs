@@ -1,3 +1,21 @@
+//! ARCH STATUS: SPLIT
+//!
+//! Target + TransportOpts + AddrFamily + HttpVersionPref + TargetError
+//!   → STAY in core (Plan-adjacent vocabulary)
+//! TransportError (+ classify helper)
+//!   → MOVE to zerobench-runtime (runtime error taxonomy; used by
+//!     every backend to produce ErrorKind via one shared classifier —
+//!     see ARCH-REVIEW §4.7 error-unify).
+//!
+//! ARCH(error-unify): today every backend invents its own ColdErr /
+//! SessionErr / RecvErr. Target: each backend returns
+//! Result<Sample, TransportError>; runtime's `classify(&TransportError)
+//! -> ErrorKind` is the only mapping.
+//!
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.7, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Transport types — target, options, response, errors.
 //!
 //! - [`Target`] describes the remote endpoint (host, port, TLS).

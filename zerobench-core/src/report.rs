@@ -1,3 +1,22 @@
+//! ARCH STATUS: MOVE → zerobench-report (split into submodules)
+//!
+//! 1,480 LoC god-file. Split on move:
+//!   - zerobench-report::terminal  (print_terminal + formatting)
+//!   - zerobench-report::json      (print_json)
+//!   - zerobench-report::prometheus (print_prometheus)
+//!   - (future) zerobench-report::statsd  — see ARCH-REVIEW §Phase 6
+//!   - (future) zerobench-report::otlp    — deferred; see §Phase 8
+//!
+//! ARCH(keep): protocol-specific rendering stays typed — matches on
+//! Option<SseExtras>/Option<WsExtras> from core's ScenarioStats; no
+//! string-keyed / HashMap metric tables. pick_latency_source +
+//! sse_latency_from_scenarios + ws_latency_from_scenarios stay as
+//! typed helpers, just live in zerobench-report.
+//!
+//! See docs/ARCH-REVIEW-2026-04-20.md §7, §B4 (rendering), §Phase 6.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Terminal and JSON reporters.
 //!
 //! Both entry points consume a [`Summary`] + [`Plan`] pair and render to

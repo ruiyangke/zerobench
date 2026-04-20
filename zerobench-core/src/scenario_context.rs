@@ -1,3 +1,12 @@
+//! ARCH STATUS: KEEP — Plan-adjacent
+//!
+//! Paired with template.rs + var.rs (expansion context). Stays in core
+//! because Template::expand_into takes `&mut ExpandCtx`, and both sides
+//! of that API live here.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Per-iteration execution context threaded through template expansion
 //! and response processing.
 //!

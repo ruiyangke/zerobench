@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::rng
+//!
+//! Runtime infrastructure (seeding + per-worker RNG factory). No rewrite.
+//! Used by calibrate + backends; stays reachable to both.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Per-worker random number generator.
 //!
 //! The hot path calls this ~once per template expansion. We use

@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::fingerprint
+//!
+//! Pairs with archive.rs (both compute run identity). Moves wholesale;
+//! no rewrite. Plan::identity_projection stays byte-stable (backcompat
+//! for archive bucketing). See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Two-level fingerprinting + run_id formatter for the v0.1.0 archive.
 //!
 //! Implements `docs/design-v0.1.0.md` §7.1:

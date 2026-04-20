@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::stop
+//!
+//! Runtime cross-cutting primitive; moves alongside LiveSnapshot + archive
+//! + calibrate. No rewrite.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! A cheap, cloneable stop-flag.
 //!
 //! [`StopSignal`] is a shared boolean used by the dispatcher to tell every

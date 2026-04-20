@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::archive
+//!
+//! Archive I/O is runtime infrastructure (alongside LiveSnapshot, calibrate,
+//! machine, fingerprint). Moves wholesale; no rewrite. See
+//! docs/ARCH-REVIEW-2026-04-20.md §7, docs/ARCH-TAGS.md.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Run archive — `$ZEROBENCH_HOME/runs/<url_fp>/<run_id>/` layout.
 //!
 //! Implements `docs/design-v0.1.0.md` §7.1 and `docs/PHILOSOPHY.md`

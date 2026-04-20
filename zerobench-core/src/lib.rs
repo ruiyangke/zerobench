@@ -1,3 +1,16 @@
+//! ARCH STATUS: REWRITE
+//!
+//! Public surface shrinks drastically. Target: core re-exports ONLY the
+//! plan vocabulary (Plan, Scenario, Step enum, *Plan structs), stats types
+//! (Sample, TaskStats, ScenarioStats with typed SseExtras/WsExtras),
+//! Template + Var, Target + TransportOpts, and a handful of type helpers.
+//! Everything else moves: archive + calibrate + fingerprint + json_scan +
+//! live_snapshot + machine + rng + stop + tls → zerobench-runtime;
+//! compare + report → zerobench-report.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench-core — plan model, transport abstraction, recorder.
 //!
 //! See `docs/design.md` in the repo root for the architectural overview.

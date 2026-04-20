@@ -1,3 +1,14 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::live_snapshot
+//!
+//! ARCH(keep): CROWN JEWEL — the 16-shard sharded-mutex design is the
+//! 1M+ req/s enabler. Move byte-for-byte; do NOT rewrite the sharding.
+//! Target: wrap LiveSnapshot as one `Recorder` variant so the backend
+//! hot path becomes a single `recorder.record(sid, sample)` call
+//! (§4.3 — kills the triple-record antipattern).
+//! See docs/ARCH-REVIEW-2026-04-20.md §1, §7, §4.3.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Per-second live snapshot for JSONL streaming output.
 //!
 //! Workers call [`LiveSnapshot::record`] (or [`LiveSnapshot::record_error`])

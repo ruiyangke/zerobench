@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-runtime::tls
+//!
+//! TLS config is runtime infrastructure (needed by every network-speaking
+//! backend). Not a core type. Moves wholesale; no rewrite.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Shared TLS client configuration for every transport crate.
 //!
 //! Every transport that can speak TLS (HTTP/1, HTTP/2, WebSocket, SSE)
