@@ -693,6 +693,47 @@ fn run_hold_scenario(
             {
                 sub.state = SubState::Dead;
                 alive -= 1;
+                // WHATWG EventSource §9.2: a live EventSource whose
+                // connection drops should reconnect (optionally with
+                // Last-Event-ID). When the user asks SseHold to
+                // follow that protocol — `hold_plan.reconnect = true`
+                // — we tear the old subscriber down and spin up a
+                // replacement at the same token index. Reconnect
+                // failures are bucketed as connect errors in the
+                // per-subscriber rollup, same as the initial connect
+                // on entry. Reconnects preserve the subscriber's
+                // accumulated `stats` so event counts and byte sums
+                // aggregate naturally across the session boundary.
+                if hold_plan.reconnect && Instant::now() < wall_deadline {
+                    let prior_stats = sub.stats.clone();
+                    let prior_last_event = sub.last_event_at;
+                    let old = subs[idx].take();
+                    if let Some(mut old_sub) = old {
+                        let _ = poll.registry().deregister(
+                            old_sub.stream.tcp_stream_mut(),
+                        );
+                    }
+                    match create_subscriber(
+                        addr,
+                        target,
+                        tls_config.as_ref(),
+                        Token(idx),
+                        poll.registry(),
+                    ) {
+                        Ok(mut fresh) => {
+                            fresh.stats = prior_stats;
+                            fresh.last_event_at = prior_last_event;
+                            subs[idx] = Some(fresh);
+                            alive += 1;
+                        }
+                        Err(_) => {
+                            if let Some(slot) = subs[idx].as_mut() {
+                                slot.stats.errors_connect =
+                                    slot.stats.errors_connect.saturating_add(1);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

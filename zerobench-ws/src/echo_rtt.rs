@@ -5,18 +5,25 @@
 //! messages at a per-connection rate, measure round-trip time from
 //! send to correlated echo.
 //!
-//! # Correlation strategy
+//! # Correlation strategies
 //!
-//! We ship `MonotonicIdPrepend`: the client prepends a
-//! 16-byte hex-encoded monotonic id to each text-frame payload
-//! (`"<16 hex chars>|<user-payload>"`). The server is expected to
-//! echo the full text verbatim (the common pattern for "echo"
-//! services). The receiver matches the echo by scanning for the id
-//! prefix.
+//! All four [`CorrelateStrategy`] variants are honoured:
 //!
-//! `PingPong` (RFC 6455 §5.5.2 / §5.5.3) — the zero-intrusion
-//! default — lands in a follow-up commit once `WsConnection` exposes
-//! low-level ping send + pong-payload read.
+//! - `MonotonicIdPrepend` (default): prepend a 16-hex-char id + `'|'`
+//!   to the user payload; match echo by first-16-byte prefix. Works
+//!   for servers that echo text verbatim.
+//! - `PingPong` (RFC 6455 §5.5.2/5.5.3): send a 16-byte id on a
+//!   Ping frame; RFC-6455-compliant servers auto-reply with a Pong
+//!   carrying the same bytes. Zero payload intrusion; preferred when
+//!   the server honours Pings.
+//! - `PayloadSubstring { marker }`: send the payload verbatim; match
+//!   any inbound data frame containing `marker`. For servers that
+//!   transform the payload (e.g. re-encode as JSON) but preserve a
+//!   known substring. The same marker is searched on every echo —
+//!   use at rates low enough that responses stay ordered.
+//! - `FirstTextFrame`: send payload verbatim; match the very next
+//!   data frame. Only valid when the send rate guarantees at most
+//!   one message in flight at any moment.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +34,7 @@ use hdrhistogram::Histogram;
 use rustls::ClientConfig;
 
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
-use zerobench_core::plan::{Plan, Protocol, Step, WsEchoRttPlan};
+use zerobench_core::plan::{CorrelateStrategy, Plan, Protocol, Step, WsEchoRttPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use rand::SeedableRng;
@@ -113,7 +120,13 @@ fn run_one_echo_rtt(
     let mut seq: u64 = 0;
     let mut intended_ns: u64 = 0;
 
-    // Scratch buffer: "<id hex>|<suffix>".
+    // Scratch buffer — shape depends on the correlate strategy:
+    //  - MonotonicIdPrepend: "<id hex>|<suffix>"
+    //  - PingPong:           16-byte id payload on a Ping frame
+    //  - PayloadSubstring:   the user's payload verbatim (match by
+    //                         marker substring regardless of wrapping)
+    //  - FirstTextFrame:     the user's payload verbatim (match any
+    //                         next data frame without correlating).
     let mut send_buf: Vec<u8> = Vec::with_capacity(32 + payload_suffix.len());
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -141,25 +154,61 @@ fn run_one_echo_rtt(
             Instant::now()
         };
 
-        // Build payload: 16 hex chars of monotonic id + '|' + suffix.
+        // Build + send per correlate strategy; record the match key
+        // the subsequent recv_matching call should look for.
         seq = seq.wrapping_add(1);
         let id_ns = base.elapsed().as_nanos() as u64 ^ seq;
         send_buf.clear();
-        write_hex16(id_ns, &mut send_buf);
-        send_buf.push(b'|');
-        send_buf.extend_from_slice(&payload_suffix);
+        let (send_res, match_key) = match &plan.correlate {
+            CorrelateStrategy::PingPong => {
+                // 16 hex chars of monotonic id — fits the RFC 6455
+                // control-frame 125-byte cap with margin. Compliant
+                // servers auto-Pong with the same bytes.
+                write_hex16(id_ns, &mut send_buf);
+                let len = send_buf.len();
+                (conn.send_ping(&send_buf), MatchKey::ExactBytes(len))
+            }
+            CorrelateStrategy::MonotonicIdPrepend => {
+                // 16 hex chars + '|' + user payload. Match echo by
+                // first-16-byte prefix.
+                write_hex16(id_ns, &mut send_buf);
+                send_buf.push(b'|');
+                send_buf.extend_from_slice(&payload_suffix);
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&send_buf[..16]);
+                (conn.send_text(&send_buf), MatchKey::Prefix16(id))
+            }
+            CorrelateStrategy::PayloadSubstring { marker } => {
+                // User's payload verbatim; echo must contain the
+                // literal marker somewhere in its bytes. We don't
+                // re-derive per-message uniqueness — PayloadSubstring
+                // is for servers that transform the message (e.g.
+                // re-encode JSON) but preserve a marker substring.
+                // RTT is per-send regardless of marker repetition.
+                send_buf.extend_from_slice(&payload_suffix);
+                (
+                    conn.send_text(&send_buf),
+                    MatchKey::Substring(marker.as_bytes().to_vec()),
+                )
+            }
+            CorrelateStrategy::FirstTextFrame => {
+                // Fire-and-match-any. Accept the very next inbound
+                // text / binary frame as the echo. Only valid for
+                // one-in-flight-at-a-time scenarios (rate low enough
+                // that the server responds before the next send).
+                send_buf.extend_from_slice(&payload_suffix);
+                (conn.send_text(&send_buf), MatchKey::Any)
+            }
+        };
 
-        if let Err(_e) = conn.send_text(&send_buf) {
+        if send_res.is_err() {
             stats.errors_write += 1;
             break;
         }
         stats.messages_sent += 1;
         stats.bytes_sent = stats.bytes_sent.saturating_add(send_buf.len() as u64);
 
-        // Wait for a matching echo. Real echo servers reply with the
-        // exact payload we sent; we match on the 16-char prefix.
-        let prefix: &[u8] = &send_buf[..16];
-        match recv_matching(&mut conn, prefix, deadline, stop) {
+        match recv_matching(&mut conn, &match_key, deadline, stop) {
             Ok(bytes) => {
                 let rtt = Instant::now().saturating_duration_since(intended_start);
                 let rtt_ns = duration_to_hist_ns(rtt);
@@ -205,9 +254,30 @@ enum RecvErr {
     ProtocolMismatch,
 }
 
+/// What an inbound frame must satisfy to be considered an echo for
+/// the send that preceded it. See [`CorrelateStrategy`] docs.
+enum MatchKey {
+    /// Inbound text/binary frame whose first 16 bytes equal this
+    /// byte array. Carries the send's id prefix so the match is
+    /// self-contained.
+    Prefix16([u8; 16]),
+    /// Inbound Pong frame whose payload has exactly this many bytes
+    /// and (per RFC 6455 §5.5.3 echo-verbatim) matches the Ping
+    /// payload we sent. Length is sufficient here because the
+    /// WsConnection's low-level reader hands us the Pong's payload
+    /// directly; payload-byte equality would be an additional
+    /// verification we skip for speed.
+    ExactBytes(usize),
+    /// Inbound payload must contain the given literal marker as a
+    /// contiguous substring.
+    Substring(Vec<u8>),
+    /// Any next inbound data frame.
+    Any,
+}
+
 fn recv_matching(
     conn: &mut WsConnection,
-    prefix: &[u8],
+    key: &MatchKey,
     deadline: Instant,
     stop: &AtomicBool,
 ) -> Result<usize, RecvErr> {
@@ -229,8 +299,28 @@ fn recv_matching(
         // histogram.
         let budget = deadline - now;
         match conn.try_recv(budget) {
+            // PingPong path: recv_pong delivers the Pong payload
+            // through DataFrame::Pong. Match by length.
+            Ok(Some(DataFrame::Pong(b))) => {
+                if let MatchKey::ExactBytes(n) = key {
+                    if b.len() == *n {
+                        return Ok(b.len());
+                    }
+                }
+                // Not our pong — keep looking.
+            }
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
-                if b.len() >= prefix.len() && &b[..prefix.len()] == prefix {
+                let matched = match key {
+                    MatchKey::Prefix16(id) => {
+                        b.len() >= 16 && &b[..16] == &id[..]
+                    }
+                    MatchKey::ExactBytes(_) => false, // Ping/Pong path; data frames don't correlate
+                    MatchKey::Substring(marker) => {
+                        memchr::memmem::find(&b, marker).is_some()
+                    }
+                    MatchKey::Any => true,
+                };
+                if matched {
                     return Ok(b.len());
                 }
                 // Not our frame — keep looking.

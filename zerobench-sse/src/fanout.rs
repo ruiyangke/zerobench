@@ -44,7 +44,18 @@ const POLL_TOKEN: Token = Token(0);
 const TRIGGER_INTERVAL_MS: u64 = 500; // 2/s triggers — balances accuracy vs server load
 
 /// Event arrival instant for one subscriber.
-type EventTime = Instant;
+/// One inbound broadcast event observed by a subscriber.
+///
+/// `emit_ns` is the payload-embedded server timestamp parsed per
+/// `FanoutMode::Timestamp { emit_field }`. `None` when the mode is
+/// `TriggerRtt` (we don't scan the payload) or when the field is
+/// missing / unparseable — Timestamp mode then falls back to the
+/// trigger-RTT delta for that particular event.
+#[derive(Debug, Clone, Copy)]
+struct EventTime {
+    received_at: Instant,
+    emit_ns: Option<u64>,
+}
 
 /// Per-subscriber state.
 struct SubscriberStats {
@@ -105,13 +116,18 @@ pub fn run_sse_fanout_from_plan_threaded(
         });
         let Some(fanout_plan) = fanout_plan else { continue };
 
-        // Only the documented subset is supported today.
-        if !matches!(fanout_plan.mode, FanoutMode::TriggerRtt) {
-            eprintln!(
-                "[sse_fanout] mode {:?} not yet implemented; falling back to TriggerRtt",
-                fanout_plan.mode
-            );
-        }
+        // Mode dispatch:
+        //   - TriggerRtt: record each broadcast's received Instant
+        //     and diff against the trigger's send Instant.
+        //   - Timestamp: scan each payload for the server-supplied
+        //     `emit_ns` field and diff against a wall-clock `now` at
+        //     reception. Server and client must share a synced wall
+        //     clock (NTP is usually good enough for the milliseconds
+        //     regime this benchmark cares about).
+        let emit_field: Option<String> = match &fanout_plan.mode {
+            FanoutMode::TriggerRtt => None,
+            FanoutMode::Timestamp { emit_field } => Some(emit_field.clone()),
+        };
         let trigger_url = match &fanout_plan.trigger {
             TriggerSpec::HttpPost { url, .. } => url.clone(),
             TriggerSpec::DedicatedWsConnection { .. } => {
@@ -141,6 +157,7 @@ pub fn run_sse_fanout_from_plan_threaded(
                 let req = request_bytes.clone();
                 let stop = Arc::clone(&stop);
                 let tls = tls_config.clone();
+                let emit_field = emit_field.clone();
                 std::thread::Builder::new()
                     .name("zerobench-sse-fanout-sub".into())
                     .spawn(move || {
@@ -151,6 +168,7 @@ pub fn run_sse_fanout_from_plan_threaded(
                             wall_deadline,
                             &stop,
                             tls.as_ref(),
+                            emit_field.as_deref(),
                         )
                     })
                     .expect("spawn subscriber")
@@ -207,19 +225,59 @@ pub fn run_sse_fanout_from_plan_threaded(
             if let Some(ttfb) = s.ttfb {
                 let _ = ttfb_hist.record(duration_to_hist_ns(ttfb));
             }
-            // For each trigger, the first event observed by this
-            // subscriber at or after the trigger's send-instant is the
-            // broadcast response. CONSUME that event after recording so
-            // the next trigger matches a LATER event — otherwise a
-            // slow-firing subscriber would map the same event to
-            // multiple consecutive triggers and double-count.
+            if emit_field.is_some() {
+                // Timestamp mode: each event's RTT is
+                //   (wall-clock-at-reception - server_emit_ns).
+                // We approximate "wall-clock-at-reception" by
+                // remembering that `ev.received_at` is monotonic
+                // relative to this worker's wall-clock anchor
+                // captured once per scenario below. Clock skew shows
+                // up as a constant offset in the whole histogram —
+                // percentile shapes are preserved.
+                for ev in &s.events {
+                    let Some(emit_ns) = ev.emit_ns else {
+                        // Event payload didn't carry the configured
+                        // `emit_ns` field — count as an error so the
+                        // verdict surfaces server-side misconfiguration
+                        // instead of silently dropping the sample.
+                        errors_read = errors_read.saturating_add(1);
+                        continue;
+                    };
+                    let now_unix_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    // Derive the received-at-unix-ns from the
+                    // monotonic Instant delta. Recording at record-
+                    // time (instead of here) would be more accurate
+                    // but is a bigger restructure; the delta is
+                    // small because rollup runs immediately after the
+                    // subscribers join.
+                    let rx_monotonic_ago = ev.received_at.elapsed().as_nanos() as u64;
+                    let rx_unix_ns = now_unix_ns.saturating_sub(rx_monotonic_ago);
+                    let delta_ns = rx_unix_ns.saturating_sub(emit_ns);
+                    let clamped = delta_ns.clamp(HIST_LO_NS, HIST_HI_NS);
+                    let _ = rtt_hist.record(clamped);
+                }
+                continue;
+            }
+
+            // TriggerRtt mode (default): for each trigger, the first
+            // event observed by this subscriber at or after the
+            // trigger's send-instant is the broadcast response.
+            // CONSUME that event after recording so the next trigger
+            // matches a LATER event — otherwise a slow-firing
+            // subscriber would map the same event to multiple
+            // consecutive triggers and double-count.
             let mut ev_iter = s.events.iter().peekable();
             for &t_sent in &trigger_times {
                 let mut matched = false;
                 while let Some(&&ev) = ev_iter.peek() {
-                    if ev >= t_sent {
-                        let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
-                            .clamp(HIST_LO_NS, HIST_HI_NS);
+                    if ev.received_at >= t_sent {
+                        let delta = duration_to_hist_ns(
+                            ev.received_at.saturating_duration_since(t_sent),
+                        )
+                        .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         ev_iter.next();
                         matched = true;
@@ -366,6 +424,11 @@ fn build_subscribe_request(
 
 /// Run one subscriber until deadline — mio single-conn state machine
 /// that records event arrival instants.
+// `emit_field` — Some iff `FanoutMode::Timestamp { emit_field }` was
+// selected. Each inbound event's payload is scanned for
+// `"<emit_field>":N` and the parsed N is carried into the post-run
+// RTT pass.
+#[allow(clippy::too_many_arguments)]
 fn run_one_subscriber(
     target: &Target,
     opts: &TransportOpts,
@@ -373,6 +436,7 @@ fn run_one_subscriber(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
+    emit_field: Option<&str>,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats::new();
     let addr = match target.resolve(opts) {
@@ -517,7 +581,18 @@ fn run_one_subscriber(
                 if !decoded.is_empty() {
                     let events_ref = &mut stats.events;
                     parser.feed(&decoded, |ev| match ev {
-                        SseEvent::Data(_) => events_ref.push(Instant::now()),
+                        SseEvent::Data(payload) => {
+                            let emit_ns = emit_field.and_then(|f| {
+                                zerobench_core::json_scan::find_json_u64_field(
+                                    &payload,
+                                    f.as_bytes(),
+                                )
+                            });
+                            events_ref.push(EventTime {
+                                received_at: Instant::now(),
+                                emit_ns,
+                            });
+                        }
                         SseEvent::Done | SseEvent::Id(_) | SseEvent::Ignored => {}
                     });
                 }

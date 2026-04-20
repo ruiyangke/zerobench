@@ -3,7 +3,11 @@
 //! Contains request building and response header parsing that is
 //! runtime-agnostic — only synchronous byte manipulation, no I/O.
 
-use zerobench_core::plan::{BodySource, RequestPlan};
+use std::time::Duration;
+
+use bytes::Bytes;
+
+use zerobench_core::plan::{Assertion, BodySource, Extract, RequestPlan};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::template::ExpandCtx;
 use zerobench_core::transport::{Target, TransportError};
@@ -220,6 +224,101 @@ pub(crate) fn find_content_length_raw(headers: &[httparse::Header<'_>]) -> Conte
         }
     }
     ContentLength::Missing
+}
+
+// ---------------------------------------------------------------------------
+// Post-response assertions / extractions (shared across HTTP backends)
+// ---------------------------------------------------------------------------
+
+/// Apply response assertions from the `RequestPlan`. Returns the
+/// number of failed assertions. A zero result means every assertion
+/// passed; non-zero is added to the scenario's `errors.assertion_failed`
+/// counter by the caller.
+///
+/// Shared between `mio_h1`, `cold_connect`, and `mio_h2` so a DSL
+/// `.expect_status(200)` is enforced regardless of which backend the
+/// CLI routes to.
+pub fn check_assertions(
+    plan: &RequestPlan,
+    status: u16,
+    total_latency: Duration,
+) -> u32 {
+    let mut failures = 0u32;
+    for check in &plan.checks {
+        let pass = match check {
+            Assertion::StatusEq(code) => status == *code,
+            Assertion::StatusIn(codes) => codes.iter().any(|c| *c == status),
+            Assertion::LatencyUnder(d) => total_latency < *d,
+        };
+        if !pass {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// Apply response extractions into the `ScenarioContext`.
+///
+/// `extracted_headers` is `(lowercased-name, value)` tuples. The
+/// caller is responsible for lowercasing names when it captures them
+/// from the parsed response — this function does byte-exact matches.
+///
+/// Shared across HTTP backends so `.extract_header(...)` /
+/// `.extract_status(...)` from the DSL works against every backend
+/// that finalises a response.
+pub fn apply_extractions(
+    plan: &RequestPlan,
+    status: u16,
+    extracted_headers: &[(Vec<u8>, Vec<u8>)],
+    ctx: &mut ScenarioContext,
+) {
+    for extract in &plan.extract {
+        match extract {
+            Extract::Header { name, into } => {
+                let target_name = name.as_str().as_bytes();
+                let found = extracted_headers
+                    .iter()
+                    .find(|(k, _)| k.as_slice() == target_name);
+                if let Some((_, value)) = found {
+                    ctx.set_var(*into, Bytes::copy_from_slice(value));
+                } else {
+                    ctx.clear_var(*into);
+                }
+            }
+            Extract::StatusCode { into } => {
+                // ASCII decimal — zero-alloc (5-byte stack buffer).
+                let mut buf = [0u8; 5];
+                let mut n = status as u32;
+                if n == 0 {
+                    ctx.set_var(*into, Bytes::from_static(b"0"));
+                    continue;
+                }
+                let mut i = buf.len();
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                }
+                ctx.set_var(*into, Bytes::copy_from_slice(&buf[i..]));
+            }
+        }
+    }
+}
+
+/// Capture headers from an `httparse::Response` into a form suitable
+/// for [`apply_extractions`]. Names are lowercased so matches stay
+/// case-insensitive.
+pub fn capture_headers(resp: &httparse::Response<'_, '_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(resp.headers.len());
+    for h in resp.headers.iter() {
+        if h.name.is_empty() {
+            break;
+        }
+        let name_lower: Vec<u8> =
+            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
+        out.push((name_lower, h.value.to_vec()));
+    }
+    out
 }
 
 /// Check whether the server sent `Connection: close`.

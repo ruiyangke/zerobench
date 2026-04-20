@@ -29,7 +29,11 @@ scenario("user-session", |s| {
             .expect_status(200)
     );
 
-    s.step(pause("20ms"));
+    // pause()/pause_random() are not currently executed by any
+    // backend — they were removed from the DSL rather than kept as
+    // silent no-ops. If you need inter-request think time, use
+    // separate scenarios with explicit rate("10/s") pacing, or wait
+    // for multi-step + per-connection ready-at support.
 
     s.step(
         GET("https://api.example.com/api/feed")

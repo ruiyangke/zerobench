@@ -37,7 +37,9 @@ use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::LiveSnapshot;
 
 use crate::mio_tls::{MioStream, MioTlsStream};
-use crate::raw_h1_common::{build_raw_request, ConnectionMode};
+use crate::raw_h1_common::{
+    apply_extractions, build_raw_request, capture_headers, check_assertions, ConnectionMode,
+};
 
 const POLL_TOKEN: Token = Token(0);
 
@@ -282,6 +284,31 @@ fn run_worker(
                         live.record_error(ErrorKind::Status5xx);
                     }
                 }
+
+                // Run user-declared assertions + extractions. Matches
+                // the behaviour of `mio_h1` so a script's
+                // `.expect_status(200)` / `.extract_header(...)`
+                // enforces / populates identically regardless of the
+                // HTTP backend the CLI routed to. Extractions write
+                // into `ctx.vars`; cold-connect clears the context
+                // after each op so extractions are effectively op-
+                // scoped (no cross-op var carry, unlike keep-alive
+                // pool reuse in mio_h1).
+                let assertion_failures =
+                    check_assertions(req_plan, outcome.status, total);
+                for _ in 0..assertion_failures {
+                    task.record_error(scenario_id, ErrorKind::AssertionFailed);
+                    if let Some(live) = live {
+                        live.record_error(ErrorKind::AssertionFailed);
+                    }
+                }
+                apply_extractions(
+                    req_plan,
+                    outcome.status,
+                    &outcome.extracted_headers,
+                    &mut ctx,
+                );
+                ctx.clear_all();
             }
             Err(e) => {
                 let kind = classify_err(&e);
@@ -304,6 +331,10 @@ struct OpOutcome {
     status: u16,
     request_bytes: u64,
     response_bytes: u64,
+    /// Lowercased-name → value tuples captured from the response
+    /// headers. Fed to `apply_extractions` so the scenario's
+    /// `.extract_header(...)` slots get populated.
+    extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Categorised errors from a single cold-connect op.
@@ -527,6 +558,7 @@ fn do_one_op(
     let mut status: u16 = 0;
     let mut content_length: usize = 0;
     let mut have_content_length = false;
+    let mut captured_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     let read_deadline = Instant::now() + opts.request_timeout;
     loop {
@@ -570,6 +602,9 @@ fn do_one_op(
                                         }
                                     }
                                 }
+                                // Capture for later .extract_header(...)
+                                // / .extract_status(...) processing.
+                                captured_headers = capture_headers(&resp);
                             }
                             _ => {
                                 return Err(ColdErr::BadResponse(
@@ -617,6 +652,7 @@ fn do_one_op(
         status,
         request_bytes,
         response_bytes,
+        extracted_headers: captured_headers,
     })
 }
 

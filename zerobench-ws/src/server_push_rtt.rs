@@ -116,6 +116,11 @@ fn run_one_push(
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(b.len() as u64);
             }
+            Ok(Some(DataFrame::Pong(_))) => {
+                // Server push scenarios don't initiate pings, so any
+                // inbound Pong is spurious — ignore without bumping
+                // messages_recv (Pong isn't a push event).
+            }
             Ok(None) => {
                 // Timeout — loop back to check deadline/stop.
             }

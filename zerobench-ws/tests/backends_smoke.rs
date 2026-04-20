@@ -517,3 +517,141 @@ fn ws_fanout_receives_broadcasts_after_triggers() {
         ws.messages_recv
     );
 }
+
+// ---------------------------------------------------------------------------
+// WsEchoRtt correlate-strategy coverage
+//
+// Each test spins up a stub that matches the strategy's on-wire
+// expectations: echo text verbatim for Prefix16, auto-Pong for
+// PingPong, etc. — and asserts that RTTs are actually recorded. A
+// failure means the strategy is registered on the Rhai surface but
+// not honoured by the backend (which was the pre-fix state for
+// everything except MonotonicIdPrepend).
+// ---------------------------------------------------------------------------
+
+use zerobench_core::plan::{CorrelateStrategy, WsEchoRttPlan};
+
+fn spawn_ws_echo_text_verbatim() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            std::thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .ok();
+                if do_ws_handshake(&mut stream).is_err() {
+                    return;
+                }
+                loop {
+                    match read_masked_frame(&mut stream) {
+                        Ok(Some((0x1, payload))) | Ok(Some((0x2, payload))) => {
+                            let _ = write_server_frame(&mut stream, 0x1, &payload);
+                        }
+                        Ok(Some((0x9, payload))) => {
+                            // RFC 6455 auto-Pong.
+                            let _ = write_server_frame(&mut stream, 0xA, &payload);
+                        }
+                        Ok(Some((0x8, _))) | Ok(None) | Err(_) => return,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    addr
+}
+
+fn echo_plan(addr: SocketAddr, correlate: CorrelateStrategy, payload: &str) -> Plan {
+    let mut vars = VarRegistry::new();
+    let url = Template::compile(&format!("ws://{addr}/"), &mut vars).unwrap();
+    let payload_tpl = Template::compile(payload, &mut vars).unwrap();
+    let plan_step = Step::WsEchoRtt(WsEchoRttPlan {
+        url,
+        headers: SmallVec::new(),
+        connections: 1,
+        msg_rate_per_conn: 100.0,
+        correlate,
+        payload: payload_tpl,
+    });
+    let mut plan = make_plan("ws-echo-correlate-smoke", plan_step);
+    plan.vars = vars;
+    plan
+}
+
+#[test]
+fn ws_echo_rtt_correlate_pingpong_records_rtt() {
+    let addr = spawn_ws_echo_text_verbatim();
+    let plan = echo_plan(addr, CorrelateStrategy::PingPong, "ignored-ping-payload");
+    let stats = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+        &ws_target(addr),
+        &TransportOpts::default(),
+        &plan,
+        Duration::from_millis(300),
+        None,
+        None,
+        None,
+    );
+    let ws = stats[0].per_scenario[0].ws.as_ref().expect("ws extras");
+    assert!(
+        ws.messages_recv >= 5,
+        "pingpong strategy should match ≥5 pongs in 300ms; got {}",
+        ws.messages_recv
+    );
+    assert!(ws.rtt.len() == ws.messages_recv);
+}
+
+#[test]
+fn ws_echo_rtt_correlate_substring_records_rtt() {
+    let addr = spawn_ws_echo_text_verbatim();
+    // Payload carries a unique marker; verbatim echo trivially
+    // contains it, so every reply correlates.
+    let plan = echo_plan(
+        addr,
+        CorrelateStrategy::PayloadSubstring {
+            marker: "zb-substring-marker".into(),
+        },
+        r#"{"marker":"zb-substring-marker","payload":"x"}"#,
+    );
+    let stats = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+        &ws_target(addr),
+        &TransportOpts::default(),
+        &plan,
+        Duration::from_millis(300),
+        None,
+        None,
+        None,
+    );
+    let ws = stats[0].per_scenario[0].ws.as_ref().expect("ws extras");
+    assert!(
+        ws.messages_recv >= 3,
+        "substring strategy should match ≥3 echoes in 300ms; got {}",
+        ws.messages_recv
+    );
+}
+
+#[test]
+fn ws_echo_rtt_correlate_first_text_frame_records_rtt() {
+    let addr = spawn_ws_echo_text_verbatim();
+    let plan = echo_plan(
+        addr,
+        CorrelateStrategy::FirstTextFrame,
+        "whatever-the-server-echoes",
+    );
+    let stats = zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+        &ws_target(addr),
+        &TransportOpts::default(),
+        &plan,
+        Duration::from_millis(300),
+        None,
+        None,
+        None,
+    );
+    let ws = stats[0].per_scenario[0].ws.as_ref().expect("ws extras");
+    assert!(
+        ws.messages_recv >= 3,
+        "first_text_frame should match ≥3 echoes in 300ms; got {}",
+        ws.messages_recv
+    );
+}

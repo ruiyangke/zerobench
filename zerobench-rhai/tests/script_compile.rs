@@ -55,7 +55,10 @@ fn chained_example_compiles_to_expected_plan() {
     assert_eq!(loaded.plan.scenarios.len(), 1);
     let scn = &loaded.plan.scenarios[0];
     assert_eq!(scn.name, "user-session");
-    assert_eq!(scn.steps.len(), 4);
+    // 3 steps since the example dropped its pause() step (the
+    // corresponding Rhai function was removed as part of the
+    // "no silent no-ops" DSL cleanup).
+    assert_eq!(scn.steps.len(), 3);
 
     // Step 0: POST /login
     match &scn.steps[0] {
@@ -74,15 +77,10 @@ fn chained_example_compiles_to_expected_plan() {
         }
         other => panic!("step 1: expected Request, got {other:?}"),
     }
-    // Step 2: pause
+    // Step 2: GET /api/feed
     match &scn.steps[2] {
-        Step::Pause(d) => assert_eq!(*d, std::time::Duration::from_millis(20)),
-        other => panic!("step 2: expected Pause, got {other:?}"),
-    }
-    // Step 3: GET /api/feed
-    match &scn.steps[3] {
         Step::Request(r) => assert_eq!(r.method, Method::GET),
-        other => panic!("step 3: expected Request, got {other:?}"),
+        other => panic!("step 2: expected Request, got {other:?}"),
     }
 
     // `saturate(20)` + no global rate → Saturate(20) per scenario.
@@ -280,7 +278,15 @@ fn var_slot_reused_by_template_and_extractor() {
 }
 
 #[test]
-fn pause_random_step_compiles() {
+fn pause_random_is_unregistered_and_fails_script_eval() {
+    // pause / pause_random are deliberately NOT registered on the
+    // Rhai engine today — no backend executes them, so exposing
+    // them produced silent no-ops that misled users. Scripts using
+    // them now fail at script-eval time with "unknown function",
+    // which is the loudest possible signal that the feature is
+    // not supported. `Step::PauseRandom` remains in the core Plan
+    // enum so a future implementation can land without a schema
+    // bump.
     let src = r#"
         scenario("x", |s| {
             s.step(pause_random("10ms", "20ms"));
@@ -288,14 +294,10 @@ fn pause_random_step_compiles() {
         });
         duration("5s");
     "#;
-    let loaded = load_script_str(src).unwrap();
-    match &loaded.plan.scenarios[0].steps[0] {
-        Step::PauseRandom { min, max } => {
-            assert_eq!(*min, std::time::Duration::from_millis(10));
-            assert_eq!(*max, std::time::Duration::from_millis(20));
-        }
-        other => panic!("expected PauseRandom, got {other:?}"),
-    }
+    assert!(
+        load_script_str(src).is_err(),
+        "pause_random() must fail at script-eval time"
+    );
 }
 
 #[test]

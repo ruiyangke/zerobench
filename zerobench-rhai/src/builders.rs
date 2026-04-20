@@ -2152,18 +2152,40 @@ fn register_scenario_builder(engine: &mut Engine) {
     });
 }
 
-fn register_pause_helpers(engine: &mut Engine) {
-    // pause("50ms")
-    engine.register_fn("pause", move |spec: ImmutableString| {
-        let d = parse::parse_duration(&spec)
-            .ok_or_else(|| to_rhai_err(format!("invalid pause duration {spec:?}")))?;
-        Ok::<StepSource, Box<EvalAltResult>>(StepSource::Pause(d))
-    });
+fn register_pause_helpers(_engine: &mut Engine) {
+    // pause() / pause_random() are intentionally NOT registered on
+    // the Rhai engine.
+    //
+    // Rationale: inter-step pauses require per-connection "ready-at"
+    // tracking in the mio event loop (a pause blocks only the
+    // connection that saw it, not the worker thread's other N-1
+    // connections). Wiring that through the existing state machine is
+    // a substantial refactor we haven't shipped yet. Rather than keep
+    // the DSL registrations and have every backend silently drop
+    // `Step::Pause` on the floor — which produced benchmarks where
+    // users THOUGHT they were measuring think-time effects but
+    // weren't — scripts now fail at script-eval time with
+    // `unknown function 'pause'`, which is the loudest possible
+    // signal.
+    //
+    // `Step::Pause` / `Step::PauseRandom` remain in the core Plan
+    // enum so a future implementation can wire them without another
+    // plan-schema bump.
+    let _ = register_pause_helpers_unreachable;
+}
 
-    // pause_random("10ms", "20ms")
-    engine.register_fn(
-        "pause_random",
-        move |lo: ImmutableString, hi: ImmutableString| {
+#[allow(dead_code)]
+fn register_pause_helpers_unreachable(_engine: &mut Engine) {
+    // Dead helper kept for reference — the shape of the registrations
+    // we'd need to restore to re-enable pause/pause_random once the
+    // mio_h1 event loop supports per-connection ready-at tracking.
+    let _ = || {
+        let _ = (|spec: ImmutableString| {
+            let d = parse::parse_duration(&spec)
+                .ok_or_else(|| to_rhai_err(format!("invalid pause duration {spec:?}")))?;
+            Ok::<StepSource, Box<EvalAltResult>>(StepSource::Pause(d))
+        },);
+        let _ = (|lo: ImmutableString, hi: ImmutableString| {
             let min = parse::parse_duration(&lo)
                 .ok_or_else(|| to_rhai_err(format!("invalid pause min {lo:?}")))?;
             let max = parse::parse_duration(&hi)
@@ -2177,8 +2199,8 @@ fn register_pause_helpers(engine: &mut Engine) {
                 min,
                 max,
             })
-        },
-    );
+        },);
+    };
 }
 
 // ---------------------------------------------------------------------------

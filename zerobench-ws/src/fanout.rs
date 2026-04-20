@@ -29,8 +29,18 @@ use crate::conn::{DataFrame, WsConnection};
 
 const TRIGGER_INTERVAL_MS: u64 = 500;
 
+/// One broadcast frame observed by a subscriber. `emit_ns` is
+/// populated only under `FanoutMode::Timestamp` via the SSE crate's
+/// payload scanner (re-exported for use here — WS broadcast payloads
+/// typically carry JSON too).
+#[derive(Debug, Clone, Copy)]
+struct FrameTime {
+    received_at: Instant,
+    emit_ns: Option<u64>,
+}
+
 struct SubscriberStats {
-    frames: Vec<Instant>,
+    frames: Vec<FrameTime>,
     handshake: Option<Duration>,
     bytes_recv: u64,
     errors_connect: u64,
@@ -70,12 +80,15 @@ pub fn run_ws_fanout_from_plan_threaded(
         });
         let Some(fan) = fan else { continue };
 
-        if !matches!(fan.mode, FanoutMode::TriggerRtt) {
-            eprintln!(
-                "[ws_fanout] mode {:?} not yet implemented; falling back to TriggerRtt",
-                fan.mode
-            );
-        }
+        // Mode dispatch: TriggerRtt diffs against the trigger's
+        // send instant; Timestamp parses a server-embedded
+        // `emit_ns` field out of each broadcast payload and diffs
+        // against wall-clock at reception. See sse/fanout.rs for the
+        // extended rationale.
+        let emit_field: Option<String> = match &fan.mode {
+            FanoutMode::TriggerRtt => None,
+            FanoutMode::Timestamp { emit_field } => Some(emit_field.clone()),
+        };
         let trigger_url = match &fan.trigger {
             TriggerSpec::HttpPost { url, .. } => url.clone(),
             TriggerSpec::DedicatedWsConnection { .. } => {
@@ -103,10 +116,19 @@ pub fn run_ws_fanout_from_plan_threaded(
                 let stop = Arc::clone(&stop);
                 let tls = tls_config.clone();
                 let path = path.clone();
+                let emit_field = emit_field.clone();
                 std::thread::Builder::new()
                     .name("zerobench-ws-fanout-sub".into())
                     .spawn(move || {
-                        run_one_subscriber(&target, &opts, &path, wall_deadline, &stop, tls.as_ref())
+                        run_one_subscriber(
+                            &target,
+                            &opts,
+                            &path,
+                            wall_deadline,
+                            &stop,
+                            tls.as_ref(),
+                            emit_field.as_deref(),
+                        )
                     })
                     .expect("spawn ws fanout subscriber")
             })
@@ -156,6 +178,28 @@ pub fn run_ws_fanout_from_plan_threaded(
             if let Some(h) = s.handshake {
                 let _ = handshake_hist.record(duration_to_hist_ns(h));
             }
+            if emit_field.is_some() {
+                // Timestamp mode — read server-embedded emit_ns per
+                // frame. See sse/fanout.rs for the skew caveat.
+                for f in &s.frames {
+                    let Some(emit_ns) = f.emit_ns else {
+                        errors_read = errors_read.saturating_add(1);
+                        continue;
+                    };
+                    let now_unix_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let rx_ago = f.received_at.elapsed().as_nanos() as u64;
+                    let rx_unix_ns = now_unix_ns.saturating_sub(rx_ago);
+                    let delta = rx_unix_ns
+                        .saturating_sub(emit_ns)
+                        .clamp(HIST_LO_NS, HIST_HI_NS);
+                    let _ = rtt_hist.record(delta);
+                }
+                continue;
+            }
+
             // See the SseFanout version for the consume-after-match
             // rationale (prevents a single frame being credited to
             // multiple consecutive triggers).
@@ -163,9 +207,11 @@ pub fn run_ws_fanout_from_plan_threaded(
             for &t_sent in &trigger_times {
                 let mut matched = false;
                 while let Some(&&ev) = frame_iter.peek() {
-                    if ev >= t_sent {
-                        let delta = duration_to_hist_ns(ev.saturating_duration_since(t_sent))
-                            .clamp(HIST_LO_NS, HIST_HI_NS);
+                    if ev.received_at >= t_sent {
+                        let delta = duration_to_hist_ns(
+                            ev.received_at.saturating_duration_since(t_sent),
+                        )
+                        .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         frame_iter.next();
                         matched = true;
@@ -206,6 +252,11 @@ pub fn run_ws_fanout_from_plan_threaded(
     out
 }
 
+// `emit_field` — Some iff the caller selected FanoutMode::Timestamp.
+// Each broadcast frame's payload is scanned for the JSON field
+// `"<emit_field>":N`; the parsed N lands in the per-frame record for
+// the post-run RTT pass.
+#[allow(clippy::too_many_arguments)]
 fn run_one_subscriber(
     target: &Target,
     opts: &TransportOpts,
@@ -213,6 +264,7 @@ fn run_one_subscriber(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
+    emit_field: Option<&str>,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats {
         frames: Vec::new(),
@@ -246,8 +298,19 @@ fn run_one_subscriber(
         }
         match conn.try_recv(remaining) {
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
-                stats.frames.push(Instant::now());
+                let emit_ns = emit_field.and_then(|f| {
+                    zerobench_core::json_scan::find_json_u64_field(&b, f.as_bytes())
+                });
+                stats.frames.push(FrameTime {
+                    received_at: Instant::now(),
+                    emit_ns,
+                });
                 stats.bytes_recv = stats.bytes_recv.saturating_add(b.len() as u64);
+            }
+            Ok(Some(DataFrame::Pong(_))) => {
+                // Spurious pong from a keep-alive ping we didn't
+                // send — ignore. Fanout subscribers don't correlate
+                // control frames.
             }
             Ok(None) => {}
             Err(crate::conn::WsError::Closed { .. }) => {

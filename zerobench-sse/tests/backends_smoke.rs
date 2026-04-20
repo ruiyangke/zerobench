@@ -221,6 +221,67 @@ fn sse_fanout_receives_broadcasts_after_triggers() {
 }
 
 // ---------------------------------------------------------------------------
+// SseHold — reconnect=true path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sse_hold_reconnect_restarts_session_on_server_close() {
+    // Server closes after 2 events. With reconnect=true and a
+    // 1.5s hold, the SseHold subscriber should cycle through at
+    // least two sessions — total events > events_per_session.
+    let addr = spawn_sse_reconnect_stub(2, Duration::from_millis(20));
+
+    let mut vars = VarRegistry::new();
+    let url = Template::compile(&format!("http://{addr}/stream"), &mut vars).unwrap();
+    let hold = SseHoldPlan {
+        url,
+        headers: SmallVec::new(),
+        subscribers: 1,
+        hold_for: Duration::from_millis(1_500),
+        reconnect: true,
+    };
+    let plan = Plan {
+        scenarios: vec![Scenario {
+            name: "sse-hold-reconnect-smoke".into(),
+            rate: RateProfile::Saturate { max_concurrency: 1 },
+            steps: vec![Step::SseHold(hold)],
+        }],
+        vars,
+        duration: Duration::from_millis(1_500),
+        warmup: Duration::ZERO,
+        cooldown: Duration::ZERO,
+        runs: 1,
+        threads: 1,
+        mode: Mode::Measure,
+        name: "sse-hold-reconnect-smoke".into(),
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_timer = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_700));
+        stop_timer.store(true, Ordering::Relaxed);
+    });
+
+    let stats = zerobench_sse::run_sse_hold_from_plan_threaded(
+        &http_target(addr),
+        &TransportOpts::default(),
+        &plan,
+        Duration::from_millis(1_500),
+        None,
+        None,
+        Some(stop),
+    );
+    let ts = &stats[0];
+    let sse = ts.per_scenario[0].sse.as_ref().expect("sse extras");
+    assert!(
+        sse.chunks >= 4,
+        "reconnect=true should yield ≥4 events across sessions; got {}",
+        sse.chunks
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SseReconnectStorm
 // ---------------------------------------------------------------------------
 

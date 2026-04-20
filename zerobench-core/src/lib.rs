@@ -7,6 +7,7 @@ pub mod calibrate;
 pub mod compare;
 pub mod fingerprint;
 pub mod histogram;
+pub mod json_scan;
 pub mod live_snapshot;
 pub mod machine;
 pub mod plan;

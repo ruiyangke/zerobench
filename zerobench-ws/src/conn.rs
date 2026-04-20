@@ -115,8 +115,13 @@ pub struct WsConnection {
     close_sent: bool,
 }
 
-/// A data frame handed to the caller — messages only (no control
-/// frames). Fragmented messages are re-assembled before this appears.
+/// A frame handed to the caller. Text / Binary are message-level
+/// (fragmented messages are re-assembled before dispatch); Pong is
+/// surfaced directly because `CorrelateStrategy::PingPong` in
+/// `WsEchoRtt` needs to read the pong payload to correlate a Ping.
+///
+/// Ping is NOT surfaced: the connection auto-replies with Pong
+/// internally before returning to the caller (see `handle_frame`).
 #[derive(Debug, Clone)]
 pub enum DataFrame {
     /// A complete text message (caller's responsibility to validate
@@ -124,13 +129,17 @@ pub enum DataFrame {
     Text(bytes::Bytes),
     /// A complete binary message.
     Binary(bytes::Bytes),
+    /// An inbound Pong control frame's payload. Surfaced so the
+    /// echo-RTT ping-pong correlation strategy can measure RTT from
+    /// the Ping send to the matching Pong receipt.
+    Pong(bytes::Bytes),
 }
 
 impl DataFrame {
     /// Length of the message payload in bytes.
     pub fn len(&self) -> usize {
         match self {
-            DataFrame::Text(b) | DataFrame::Binary(b) => b.len(),
+            DataFrame::Text(b) | DataFrame::Binary(b) | DataFrame::Pong(b) => b.len(),
         }
     }
 
@@ -139,10 +148,10 @@ impl DataFrame {
         self.len() == 0
     }
 
-    /// Borrow the raw bytes regardless of Text/Binary variant.
+    /// Borrow the raw bytes regardless of variant.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            DataFrame::Text(b) | DataFrame::Binary(b) => b,
+            DataFrame::Text(b) | DataFrame::Binary(b) | DataFrame::Pong(b) => b,
         }
     }
 }
@@ -445,7 +454,12 @@ impl WsConnection {
                 Ok(None)
             }
             Opcode::Pong => {
-                Ok(None)
+                // Surface to the caller so ping-pong correlation
+                // strategies can read the pong payload. Callers that
+                // don't care (hold / server_push / fanout) match only
+                // Text / Binary in their recv loop; the Pong frame
+                // falls through their match arms harmlessly.
+                Ok(Some(DataFrame::Pong(payload)))
             }
             Opcode::Close => {
                 let (code, reason) = frame::parse_close_payload(&payload);

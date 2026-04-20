@@ -234,6 +234,15 @@ struct H2Stream {
     request_bytes: u64,
     /// Sum of DATA-frame payloads received on this stream.
     response_bytes: u64,
+    /// HTTP status code captured from the response future on arrival.
+    /// Zero until the future resolves (never dispatched with 0 since
+    /// we only finalise streams once body drain completes, which
+    /// requires headers to have already arrived).
+    status: u16,
+    /// Response headers captured on future arrival, in the same
+    /// `(lowercased-name, value)` format `apply_extractions` expects.
+    /// Empty until headers arrive.
+    extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// State for a single H2 connection (one per worker thread).
@@ -254,7 +263,16 @@ impl H2Conn {
     /// response streams.
     ///
     /// Returns `true` if the connection is still alive.
-    fn poll_progress(&mut self, cx: &mut Context<'_>, now: Instant, stats: &mut TaskStats, live: Option<&LiveSnapshot>) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn poll_progress(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+        stats: &mut TaskStats,
+        live: Option<&LiveSnapshot>,
+        request_plan: &zerobench_core::plan::RequestPlan,
+        ctx: &mut zerobench_core::scenario_context::ScenarioContext,
+    ) -> bool {
         // 1. Drive the connection — this processes incoming frames and
         //    unblocks any pending send operations.
         match Pin::new(&mut self.connection).poll(cx) {
@@ -279,7 +297,24 @@ impl H2Conn {
             if stream.body.is_none() {
                 match Pin::new(&mut stream.response_fut).poll(cx) {
                     Poll::Ready(Ok(response)) => {
-                        let _status = response.status().as_u16();
+                        stream.status = response.status().as_u16();
+                        // Capture headers in the lower-cased form
+                        // `apply_extractions` expects. H2 pseudo-
+                        // headers (:status / :scheme / :authority /
+                        // :path) arrive with the `:` prefix; we keep
+                        // them so scripts can extract them by name
+                        // if they want (e.g. `.extract_header(":status")`).
+                        let mut hdrs =
+                            Vec::with_capacity(response.headers().len());
+                        for (name, value) in response.headers() {
+                            let name_bytes = name.as_str().as_bytes();
+                            let lower: Vec<u8> = name_bytes
+                                .iter()
+                                .map(|b| b.to_ascii_lowercase())
+                                .collect();
+                            hdrs.push((lower, value.as_bytes().to_vec()));
+                        }
+                        stream.extracted_headers = hdrs;
                         stream.body = Some(response.into_body());
                         // Fall through to drain the body below.
                     }
@@ -343,6 +378,43 @@ impl H2Conn {
                     l.record(lat_ns, bs, br);
                     l.record_scenario(sid, lat_ns, bs, br);
                 }
+                // 4xx/5xx classification + user assertions +
+                // extractions. Identical semantics to the mio_h1 +
+                // cold_connect paths so `.expect_status(...)` /
+                // `.extract_header(...)` from the DSL behave the
+                // same under `--http-version h2`.
+                if (400..500).contains(&stream.status) {
+                    stats.record_error(sid, ErrorKind::Status4xx);
+                    if let Some(l) = live {
+                        l.record_error(ErrorKind::Status4xx);
+                        l.record_scenario_error(sid, ErrorKind::Status4xx);
+                    }
+                } else if (500..600).contains(&stream.status) {
+                    stats.record_error(sid, ErrorKind::Status5xx);
+                    if let Some(l) = live {
+                        l.record_error(ErrorKind::Status5xx);
+                        l.record_scenario_error(sid, ErrorKind::Status5xx);
+                    }
+                }
+                let assertion_failures = crate::raw_h1_common::check_assertions(
+                    request_plan,
+                    stream.status,
+                    co_free_latency,
+                );
+                for _ in 0..assertion_failures {
+                    stats.record_error(sid, ErrorKind::AssertionFailed);
+                    if let Some(l) = live {
+                        l.record_error(ErrorKind::AssertionFailed);
+                        l.record_scenario_error(sid, ErrorKind::AssertionFailed);
+                    }
+                }
+                crate::raw_h1_common::apply_extractions(
+                    request_plan,
+                    stream.status,
+                    &stream.extracted_headers,
+                    ctx,
+                );
+                ctx.clear_all();
                 self.idle_slots += 1;
                 // Don't increment i — swap_remove moved the last element here.
             } else if stream.body.is_some() {
@@ -391,6 +463,8 @@ impl H2Conn {
                     scenario_id,
                     request_bytes,
                     response_bytes: 0,
+                    status: 0,
+                    extracted_headers: Vec::new(),
                 });
                 self.idle_slots -= 1;
                 true
@@ -552,6 +626,18 @@ pub fn run_mio_h2_worker(
         idle_slots: max_streams,
     };
 
+    // mio_h2 supports only one HTTP scenario today (documented
+    // limitation). Grab its RequestPlan once so `poll_progress` can
+    // pass assertion + extraction lists when a response completes.
+    let request_plan_for_assertions = plan.scenarios[http_indices[0]]
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Request(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("mio-h2 HTTP scenario must contain at least one Request step");
+
     // Token scheduling (same as H1).
     let open_loop = target_rps.is_some();
     let token_interval = target_rps.map(|rps| Duration::from_secs_f64(1.0 / rps));
@@ -622,7 +708,14 @@ pub fn run_mio_h2_worker(
         // --- Drive H2 connection + check completed streams -------------
         let mut cx = Context::from_waker(&waker);
 
-        let alive = h2.poll_progress(&mut cx, batch_now, &mut stats, live);
+        let alive = h2.poll_progress(
+            &mut cx,
+            batch_now,
+            &mut stats,
+            live,
+            &request_plan_for_assertions,
+            &mut ctx,
+        );
         if !alive {
             // Connection died — record error and exit.
             err(&mut stats, live, 0, ErrorKind::Read);

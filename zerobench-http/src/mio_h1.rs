@@ -63,14 +63,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use rand::Rng;
 use rustls::ClientConfig;
 
 use zerobench_core::LiveSnapshot;
-use zerobench_core::plan::{Assertion, Extract, Plan, Protocol, RequestPlan, Step};
+use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
@@ -495,70 +494,11 @@ impl Conn {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Response post-processing (assertions + extraction)
-// ---------------------------------------------------------------------------
-
-/// Apply response assertions from the `RequestPlan`. Returns the number
-/// of failed assertions.
-fn check_assertions(plan: &RequestPlan, status: u16, total_latency: Duration) -> u32 {
-    let mut failures = 0u32;
-    for check in &plan.checks {
-        let pass = match check {
-            Assertion::StatusEq(code) => status == *code,
-            Assertion::StatusIn(codes) => codes.iter().any(|c| *c == status),
-            Assertion::LatencyUnder(d) => total_latency < *d,
-        };
-        if !pass {
-            failures += 1;
-        }
-    }
-    failures
-}
-
-/// Apply response extractions into the `ScenarioContext`.
-///
-/// `Extract::Header` matches against the captured `extracted_headers`
-/// (lowercased names). `Extract::StatusCode` writes the status as ASCII
-/// decimal.
-fn apply_extractions(
-    plan: &RequestPlan,
-    status: u16,
-    extracted_headers: &[(Vec<u8>, Vec<u8>)],
-    ctx: &mut ScenarioContext,
-) {
-    for extract in &plan.extract {
-        match extract {
-            Extract::Header { name, into } => {
-                let target_name = name.as_str().as_bytes();
-                let found = extracted_headers
-                    .iter()
-                    .find(|(k, _)| k.as_slice() == target_name);
-                if let Some((_, value)) = found {
-                    ctx.set_var(*into, Bytes::copy_from_slice(value));
-                } else {
-                    ctx.clear_var(*into);
-                }
-            }
-            Extract::StatusCode { into } => {
-                // ASCII decimal — zero-alloc (5-byte stack buffer).
-                let mut buf = [0u8; 5];
-                let mut n = status as u32;
-                if n == 0 {
-                    ctx.set_var(*into, Bytes::from_static(b"0"));
-                    continue;
-                }
-                let mut i = buf.len();
-                while n > 0 {
-                    i -= 1;
-                    buf[i] = b'0' + (n % 10) as u8;
-                    n /= 10;
-                }
-                ctx.set_var(*into, Bytes::copy_from_slice(&buf[i..]));
-            }
-        }
-    }
-}
+// Response post-processing — `check_assertions`, `apply_extractions`,
+// `capture_headers` live in `raw_h1_common` so cold_connect + mio_h2
+// reuse the same logic. Re-imported under the original names below
+// so the mio_h1 call sites don't churn.
+use crate::raw_h1_common::{apply_extractions, check_assertions};
 
 // ---------------------------------------------------------------------------
 // Single-thread worker
@@ -1143,6 +1083,8 @@ pub fn __test_build_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use zerobench_core::plan::{Assertion, Extract};
 
     /// Verify `Conn` state transitions on a synthetic buffer that contains
     /// a complete HTTP response in one chunk.
