@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
-use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
+use zerobench_runtime::live_snapshot::LiveTick;
 use zerobench_tui::state::{
     DashboardState, RunMode, Tab, TransportInfo, DELTA_LOOKBACK, MAX_TICKS,
     ROLLING_LATENCY_WINDOW,

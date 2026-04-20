@@ -55,7 +55,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-use crate::transport::TransportOpts;
+use zerobench_core::transport::TransportOpts;
 
 // ---------------------------------------------------------------------------
 // Public API

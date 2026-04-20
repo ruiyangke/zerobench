@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
+zerobench-runtime = { workspace = true }
 zerobench-http = { workspace = true, default-features = false, features = ["mio-h1"] }
 hdrhistogram = { workspace = true }
 mio = { workspace = true }

@@ -15,6 +15,7 @@ mio-h2 = ["mio-h1", "dep:h2", "dep:tokio"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
+zerobench-runtime = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 

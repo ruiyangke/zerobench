@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use ratatui::symbols::Marker;
-use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
+use zerobench_runtime::live_snapshot::LiveTick;
 
 /// Maximum number of log entries retained in the dashboard.
 const MAX_LOG_ENTRIES: usize = 100;
@@ -851,7 +851,7 @@ mod tests {
 
     #[test]
     fn per_scenario_accumulates_across_ticks() {
-        use zerobench_core::live_snapshot::ScenarioTick;
+        use zerobench_runtime::live_snapshot::ScenarioTick;
 
         fn make_scenario_tick(
             elapsed_s: u64,

@@ -13,8 +13,8 @@ use std::time::Duration;
 use hdrhistogram::Histogram;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
-use zerobench_core::live_snapshot::LiveTick;
 use zerobench_core::stats::ErrorCounters;
+use zerobench_runtime::live_snapshot::LiveTick;
 use zerobench_tui::state::{DashboardState, RunMode, Tab, TransportInfo};
 use zerobench_tui::ui::render;
 

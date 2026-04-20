@@ -49,8 +49,8 @@ use zerobench_core::plan::{
 };
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::LiveSnapshot;
 use zerobench_http::mio_tls::MioStream;
+use zerobench_runtime::LiveSnapshot;
 
 use crate::line_parser::{SseEvent, SseLineParser};
 
@@ -602,7 +602,7 @@ fn run_one_subscriber(
                     parser.feed(&decoded, |ev| match ev {
                         SseEvent::Data(payload) => {
                             let emit_ns = emit_field.and_then(|f| {
-                                zerobench_core::json_scan::find_json_u64_field(
+                                zerobench_runtime::json_scan::find_json_u64_field(
                                     &payload,
                                     f.as_bytes(),
                                 )

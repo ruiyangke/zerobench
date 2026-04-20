@@ -101,7 +101,7 @@ fn run_one_echo_rtt(
     deadline: Instant,
     stop: &AtomicBool,
     tls_config: Option<&Arc<ClientConfig>>,
-    live: Option<&zerobench_core::LiveSnapshot>,
+    live: Option<&zerobench_runtime::LiveSnapshot>,
     scenario_id: u16,
 ) -> ConnStats {
     let mut stats = ConnStats::new();
@@ -382,7 +382,7 @@ pub fn run_ws_echo_rtt_from_plan_threaded(
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
-    live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    live: Option<Arc<zerobench_runtime::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -470,7 +470,7 @@ fn run_echo_scenario(
     duration: Duration,
     stop: &Arc<AtomicBool>,
     tls_config: Option<Arc<ClientConfig>>,
-    live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    live: Option<Arc<zerobench_runtime::LiveSnapshot>>,
     scenario_id: u16,
 ) -> ScenarioRollup {
     // Deadline = `duration` (WsEchoRtt doesn't carry a hold_for — the

@@ -42,8 +42,8 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 
-use crate::plan::Plan;
-use crate::transport::Target;
+use zerobench_core::plan::Plan;
+use zerobench_core::transport::Target;
 
 // ---------------------------------------------------------------------------
 // Canonical JSON
@@ -299,7 +299,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn test_target(scheme_tls: bool, host: &str, port: u16, sni: Option<&str>) -> Target {
-        use crate::transport::AddrFamily;
+        use zerobench_core::transport::AddrFamily;
         Target {
             host: host.to_string(),
             port,
@@ -364,7 +364,7 @@ mod tests {
         // Varying duration / warmup / cooldown / runs / threads /
         // mode must NOT produce a new archive bucket — it's the
         // same workload measured under a different time budget.
-        use crate::plan::Mode;
+        use zerobench_core::plan::Mode;
         let p1 = Plan::new();
         let mut p2 = Plan::new();
         p2.duration = std::time::Duration::from_secs(900);
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn plan_hash_changes_when_workload_changes() {
-        use crate::plan::{RateProfile, Scenario};
+        use zerobench_core::plan::{RateProfile, Scenario};
         // A scenario addition is a workload change, so the hash
         // must differ — identity is driven by scenarios + vars.
         let p1 = Plan::new();

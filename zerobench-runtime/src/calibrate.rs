@@ -34,7 +34,7 @@
 //!
 //! ```ignore
 //! use std::time::Duration;
-//! use zerobench_core::calibrate::ClientSelfCheck;
+//! use zerobench_runtime::calibrate::ClientSelfCheck;
 //!
 //! let check = ClientSelfCheck::spawn()?;
 //! let result = check.check(50_000.0, Duration::from_secs(1))?;
@@ -57,7 +57,7 @@ use hdrhistogram::Histogram;
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use mio::{Events, Interest, Poll, Token};
 
-use crate::histogram::{new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
+use zerobench_core::histogram::{new_hist, HIST_HI_NS, HIST_LO_NS, HIST_SIG};
 
 // ---------------------------------------------------------------------------
 // LoopbackEcho — mio-multiplexed TCP echo server on 127.0.0.1:<ephemeral>.

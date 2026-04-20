@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::DefaultTerminal;
-use zerobench_core::{LiveSnapshot, StopSignal};
+use zerobench_runtime::{LiveSnapshot, StopSignal};
 
 pub use state::{DashboardState, LogEntry, RunMode, Tab, TransportInfo};
 pub use ui::render;

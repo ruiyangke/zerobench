@@ -1,4 +1,4 @@
-//! Integration tests for [`zerobench_core::report`].
+//! Integration tests for [`zerobench_report::report`].
 //!
 //! The tests stuff a known set of latencies / error counts / request
 //! counts into a [`TaskStats`], merge into a [`Summary`], render via
@@ -18,7 +18,7 @@ use zerobench_core::plan::{
 use zerobench_core::stats::{ErrorKind, Summary, TaskStats};
 use zerobench_core::template::Template;
 use zerobench_core::var::VarRegistry;
-use zerobench_core::{print_json, print_terminal, ColorChoice};
+use zerobench_report::{print_json, print_terminal, ColorChoice};
 
 // ---------------------------------------------------------------------------
 // Fixtures

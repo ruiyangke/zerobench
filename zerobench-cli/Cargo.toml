@@ -28,6 +28,8 @@ script = ["dep:zerobench-rhai", "h1"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
+zerobench-runtime = { workspace = true }
+zerobench-report = { workspace = true }
 zerobench-http = { workspace = true, default-features = false }
 zerobench-ws = { workspace = true, optional = true }
 zerobench-sse = { workspace = true, optional = true }

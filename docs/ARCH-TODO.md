@@ -56,7 +56,7 @@ Companions: `ARCH-REVIEW-2026-04-20.md` (the rewrite plan), `ARCH-TAGS.md` (mark
 | `plan.rs` | KEEP — closed-enum Step + all *Plan structs stay here |
 | `report.rs` | MOVE → zerobench-report (split into terminal/json/prometheus) |
 | `request_file.rs` | KEEP — Plan-adjacent |
-| `rng.rs` | MOVE → zerobench-runtime::rng |
+| `rng.rs` | KEEP — stays in core; `template` + `scenario_context` depend on `BenchRng` |
 | `scenario_context.rs` | KEEP — Plan-adjacent |
 | `stats.rs` | KEEP — TaskStats + typed SseExtras/WsExtras |
 | `stop.rs` | MOVE → zerobench-runtime::stop |

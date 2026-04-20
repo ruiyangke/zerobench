@@ -18,7 +18,7 @@
 //!
 //! The full statistical comparison engine (bootstrap CI for N≥3,
 //! Anderson-Darling for N=1, Holm-Bonferroni multi-metric correction)
-//! is in `zerobench_core::compare`. This verb's simple-delta form is
+//! is in `zerobench_report::compare`. This verb's simple-delta form is
 //! sufficient as a regression gate when thresholds are set.
 
 use std::fs;
@@ -26,11 +26,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
-use zerobench_core::archive::load_histogram_from_histlog;
-use zerobench_core::compare::{
-    ad_test, compare_all, holm_bonferroni, ks_test, CompareOptions, Metric, StrategyUsed,
+use zerobench_core::{LatencyExport, SummaryExport};
+use zerobench_report::compare::{
+    ad_test, compare_all, holm_bonferroni, ks_test, CompareOptions, Metric, Significance,
+    StrategyUsed,
 };
-use zerobench_core::{LatencyExport, Significance, SummaryExport};
+use zerobench_runtime::archive::load_histogram_from_histlog;
 
 // ---------------------------------------------------------------------------
 // CLI args

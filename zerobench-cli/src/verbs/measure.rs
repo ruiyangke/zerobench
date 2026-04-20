@@ -46,22 +46,23 @@ use std::time::{Duration, SystemTime};
 use clap::{ArgAction, Args};
 use smallvec::SmallVec;
 
-use zerobench_core::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
-use zerobench_core::calibrate::{ClientSelfCheck, Verdict};
-use zerobench_core::fingerprint::{
-    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
-};
-use zerobench_core::machine::MachineFingerprint;
 use zerobench_core::plan::{
     CorrelateStrategy, Mode, Plan, Protocol, RateProfile, RequestPlan, Scenario, SseHoldPlan,
     Step, WsEchoRttPlan,
 };
+use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
-use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
-use zerobench_core::report::pick_primary_histogram;
-use zerobench_core::{ColorChoice, Summary, SummaryExport, TaskStats};
+use zerobench_core::{Summary, SummaryExport, TaskStats};
+use zerobench_report::report::pick_primary_histogram;
+use zerobench_report::ColorChoice;
+use zerobench_runtime::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
+use zerobench_runtime::calibrate::{ClientSelfCheck, Verdict};
+use zerobench_runtime::fingerprint::{
+    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
+};
+use zerobench_runtime::machine::MachineFingerprint;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -1006,7 +1007,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         use std::io::{IsTerminal, Write};
         let is_tty = std::io::stdout().is_terminal();
         let mut out = std::io::stdout().lock();
-        let _ = zerobench_core::print_terminal(
+        let _ = zerobench_report::print_terminal(
             &summary,
             &plan,
             ColorChoice::Auto,

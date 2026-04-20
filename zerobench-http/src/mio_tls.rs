@@ -46,8 +46,8 @@ use std::sync::Arc;
 use mio::net::TcpStream;
 use rustls::ClientConfig;
 
-use zerobench_core::tls::tls_client_config;
 use zerobench_core::transport::TransportOpts;
+use zerobench_runtime::tls::tls_client_config;
 
 // ---------------------------------------------------------------------------
 // MioTlsStream — TLS over mio TcpStream
@@ -407,7 +407,7 @@ impl Write for MioStream {
 
 /// Build a `rustls::ClientConfig` suitable for the mio backends.
 ///
-/// Delegates to `zerobench_core::tls::tls_client_config`, which handles
+/// Delegates to `zerobench_runtime::tls::tls_client_config`, which handles
 /// strict webpki-roots verification vs `--insecure` accept-all mode.
 /// The `alpn` list is passed through to the config — callers should set
 /// `[b"http/1.1"]` for H1 or `[b"h2"]` for H2.

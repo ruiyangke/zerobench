@@ -10,7 +10,7 @@
 //! out of a payload without pulling in `serde_json`.
 //!
 //! Used by the fanout backends to implement
-//! [`FanoutMode::Timestamp`](crate::plan::FanoutMode::Timestamp): the
+//! [`FanoutMode::Timestamp`](zerobench_core::plan::FanoutMode::Timestamp): the
 //! server embeds `"emit_ns":<integer>` in each broadcast payload, and
 //! the subscriber scans for it at reception time so the post-run RTT
 //! pass has server-local timing to correlate against.

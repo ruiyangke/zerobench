@@ -79,11 +79,11 @@ use mio::{Events, Interest, Poll, Token};
 use rand::Rng;
 use rustls::ClientConfig;
 
-use zerobench_core::LiveSnapshot;
 use zerobench_core::plan::{Plan, Protocol, RequestPlan, Step};
 use zerobench_core::scenario_context::ScenarioContext;
 use zerobench_core::stats::{ErrorKind, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
+use zerobench_runtime::LiveSnapshot;
 
 use super::mio_tls::{MioStream, MioTlsStream};
 use super::raw_h1_common::{

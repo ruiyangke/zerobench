@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "zerobench-core",
+    "zerobench-runtime",
+    "zerobench-report",
     "zerobench-http",
     "zerobench-ws",
     "zerobench-sse",
@@ -21,6 +23,8 @@ authors = ["Ruiyang Ke"]
 [workspace.dependencies]
 # Local crates
 zerobench-core = { path = "zerobench-core", version = "0.0.1", default-features = false }
+zerobench-runtime = { path = "zerobench-runtime", version = "0.0.1" }
+zerobench-report = { path = "zerobench-report", version = "0.0.1" }
 zerobench-http = { path = "zerobench-http", version = "0.0.1", default-features = false }
 zerobench-ws   = { path = "zerobench-ws",   version = "0.0.1" }
 zerobench-sse  = { path = "zerobench-sse",  version = "0.0.1" }

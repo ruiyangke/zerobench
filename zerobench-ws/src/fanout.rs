@@ -69,7 +69,7 @@ pub fn run_ws_fanout_from_plan_threaded(
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
     // See SseFanout for rationale on deferring live recording.
-    _live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    _live: Option<Arc<zerobench_runtime::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -313,7 +313,7 @@ fn run_one_subscriber(
         match conn.try_recv(remaining) {
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 let emit_ns = emit_field.and_then(|f| {
-                    zerobench_core::json_scan::find_json_u64_field(&b, f.as_bytes())
+                    zerobench_runtime::json_scan::find_json_u64_field(&b, f.as_bytes())
                 });
                 stats.frames.push(FrameTime {
                     received_at: Instant::now(),

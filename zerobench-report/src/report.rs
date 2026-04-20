@@ -51,9 +51,9 @@ use std::time::Duration;
 
 use yansi::{Condition, Paint};
 
-use crate::live_snapshot::LiveTick;
-use crate::plan::{Plan, Protocol};
-use crate::stats::Summary;
+use zerobench_core::plan::{Plan, Protocol};
+use zerobench_core::stats::Summary;
+use zerobench_runtime::live_snapshot::LiveTick;
 
 // ---------------------------------------------------------------------------
 // Public enums
@@ -751,8 +751,8 @@ fn sse_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64
     // broadcast_rtt slot for SseFanout scenarios; fall back to
     // chunk_gap for SseHold / SseReconnectStorm. An SSE scenario
     // populates exactly one of the two.
-    let mut broadcast = crate::histogram::new_hist();
-    let mut chunk_gap = crate::histogram::new_hist();
+    let mut broadcast = zerobench_core::histogram::new_hist();
+    let mut chunk_gap = zerobench_core::histogram::new_hist();
     for sc in &summary.per_scenario {
         if let Some(sse) = sc.sse.as_ref() {
             let _ = broadcast.add(&sse.broadcast_rtt);
@@ -782,8 +782,8 @@ fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64,
     // As with SSE: WsFanout writes broadcast_rtt and leaves rtt
     // empty; WsEchoRtt / WsServerPushRtt populate rtt. Prefer
     // broadcast_rtt when non-empty.
-    let mut broadcast = crate::histogram::new_hist();
-    let mut rtt = crate::histogram::new_hist();
+    let mut broadcast = zerobench_core::histogram::new_hist();
+    let mut rtt = zerobench_core::histogram::new_hist();
     for sc in &summary.per_scenario {
         if let Some(ws) = sc.ws.as_ref() {
             let _ = broadcast.add(&ws.broadcast_rtt);
@@ -896,7 +896,7 @@ fn format_f64(x: f64) -> String {
 /// per-scenario entries in scenario order; single-scenario (or all
 /// identical) plans produce the scalar shape for diff-tool simplicity.
 fn target_rate_json(plan: &Plan) -> serde_json::Value {
-    use crate::plan::RateProfile;
+    use zerobench_core::plan::RateProfile;
     use serde_json::json;
 
     fn one(p: &RateProfile) -> serde_json::Value {
@@ -945,7 +945,7 @@ fn target_rate_json(plan: &Plan) -> serde_json::Value {
 /// Describe the target rate line. Task 10 swaps this for a real
 /// `RateProfile::Constant(r)` rendering once the profile enum lands.
 fn describe_target_rate(plan: &Plan) -> String {
-    use crate::plan::RateProfile;
+    use zerobench_core::plan::RateProfile;
     let threads = plan.threads;
     let thread_suffix = if threads > 1 {
         format!(" ({threads} threads)")
@@ -979,11 +979,11 @@ fn describe_target_rate(plan: &Plan) -> String {
 /// One-line human summary of the assertions in the plan (for the
 /// "assertions" report line). 
 fn describe_assertions(plan: &Plan) -> String {
-    use crate::plan::Assertion;
+    use zerobench_core::plan::Assertion;
     let mut parts = Vec::new();
     for sc in &plan.scenarios {
         for step in &sc.steps {
-            if let crate::plan::Step::Request(r) = step {
+            if let zerobench_core::plan::Step::Request(r) = step {
                 for a in &r.checks {
                     parts.push(match a {
                         Assertion::StatusEq(c) => format!("status=={c}"),
@@ -1010,7 +1010,7 @@ fn total_assertion_count(plan: &Plan) -> usize {
     let mut total = 0;
     for sc in &plan.scenarios {
         for step in &sc.steps {
-            if let crate::plan::Step::Request(r) = step {
+            if let zerobench_core::plan::Step::Request(r) = step {
                 total += r.checks.len();
             }
         }
@@ -1084,7 +1084,7 @@ pub fn format_count(n: u64) -> String {
 /// values render cleanly.
 ///
 /// ```
-/// # use zerobench_core::report::format_bytes;
+/// # use zerobench_report::report::format_bytes;
 /// assert_eq!(format_bytes(0), "0 B");
 /// assert_eq!(format_bytes(512), "512 B");
 /// assert_eq!(format_bytes(1_000), "1.0 kB");
@@ -1245,10 +1245,10 @@ mod tests {
 
     #[test]
     fn print_terminal_omits_transfer_line_when_bytes_zero() {
-        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
-        use crate::stats::{Summary, TaskStats};
-        use crate::template::Template;
-        use crate::var::VarRegistry;
+        use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
+        use zerobench_core::stats::{Summary, TaskStats};
+        use zerobench_core::template::Template;
+        use zerobench_core::var::VarRegistry;
 
         let mut vars = VarRegistry::new();
         let url = Template::compile("/", &mut vars).unwrap();
@@ -1289,10 +1289,10 @@ mod tests {
 
     #[test]
     fn print_terminal_includes_transfer_line_when_bytes_present() {
-        use crate::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
-        use crate::stats::{Summary, TaskStats};
-        use crate::template::Template;
-        use crate::var::VarRegistry;
+        use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
+        use zerobench_core::stats::{Summary, TaskStats};
+        use zerobench_core::template::Template;
+        use zerobench_core::var::VarRegistry;
 
         let mut vars = VarRegistry::new();
         let url = Template::compile("/", &mut vars).unwrap();
@@ -1351,11 +1351,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn plan_with_protocols(entries: &[(&str, Protocol)]) -> Plan {
-        use crate::plan::{
+        use zerobench_core::plan::{
             Mode, Plan, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step, WsEchoRttPlan,
         };
-        use crate::template::Template;
-        use crate::var::VarRegistry;
+        use zerobench_core::template::Template;
+        use zerobench_core::var::VarRegistry;
         use smallvec::SmallVec;
 
         let mut vars = VarRegistry::new();
@@ -1377,7 +1377,7 @@ mod tests {
                         headers: SmallVec::new(),
                         connections: 1,
                         msg_rate_per_conn: 1.0,
-                        correlate: crate::plan::CorrelateStrategy::PingPong,
+                        correlate: zerobench_core::plan::CorrelateStrategy::PingPong,
                         payload: url.clone(),
                     }),
                 };
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn print_terminal_uses_operations_label_when_mixed() {
-        use crate::stats::{Summary, TaskStats};
+        use zerobench_core::stats::{Summary, TaskStats};
         let plan =
             plan_with_protocols(&[("h", Protocol::Http), ("s", Protocol::Sse)]);
         let mut stats = TaskStats::new(plan.scenarios.len());
@@ -1461,7 +1461,7 @@ mod tests {
 
     #[test]
     fn print_terminal_ws_row_shows_conns_and_msgs() {
-        use crate::stats::{Summary, TaskStats};
+        use zerobench_core::stats::{Summary, TaskStats};
         let plan = plan_with_protocols(&[
             ("h", Protocol::Http),
             ("w", Protocol::Ws),

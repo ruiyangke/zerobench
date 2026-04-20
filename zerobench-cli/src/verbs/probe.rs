@@ -30,7 +30,8 @@ use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step}
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
-use zerobench_core::{ColorChoice, Summary, TaskStats};
+use zerobench_core::{Summary, TaskStats};
+use zerobench_report::ColorChoice;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -173,7 +174,7 @@ pub fn run(args: ProbeArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         use std::io::{IsTerminal, Write};
         let is_tty = std::io::stdout().is_terminal();
         let mut out = std::io::stdout().lock();
-        let _ = zerobench_core::print_terminal(
+        let _ = zerobench_report::print_terminal(
             &summary,
             &plan,
             ColorChoice::Auto,

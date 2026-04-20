@@ -39,7 +39,7 @@
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
-use crate::stats::{PerRunMetrics, SummaryExport};
+use zerobench_core::stats::{PerRunMetrics, SummaryExport};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -940,7 +940,7 @@ impl Xoshiro {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::{ErrorCountersExport, LatencyExport};
+    use zerobench_core::stats::{ErrorCountersExport, LatencyExport};
 
     fn per_run(rate: f64, p99: u64) -> PerRunMetrics {
         PerRunMetrics {

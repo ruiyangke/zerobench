@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use zerobench_core::{
     plan::{Plan, RateProfile, RequestPlan, Scenario, Step},
-    print_jsonl_tick, print_prometheus, ErrorKind, LiveSnapshot, Summary, TaskStats,
-    Template, VarRegistry,
+    ErrorKind, Summary, TaskStats, Template, VarRegistry,
 };
+use zerobench_report::{print_jsonl_tick, print_prometheus};
+use zerobench_runtime::LiveSnapshot;
 
 // ---------------------------------------------------------------------------
 // LiveSnapshot round-trip

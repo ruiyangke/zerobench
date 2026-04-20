@@ -188,7 +188,7 @@ fn create_subscriber(
 fn drive_subscriber(
     sub: &mut Subscriber,
     request: &[u8],
-    live: Option<&zerobench_core::LiveSnapshot>,
+    live: Option<&zerobench_runtime::LiveSnapshot>,
     scenario_id: u16,
 ) -> DriveOutcome {
     loop {
@@ -338,7 +338,7 @@ fn drive_subscriber(
 fn feed_body(
     sub: &mut Subscriber,
     input: &[u8],
-    live: Option<&zerobench_core::LiveSnapshot>,
+    live: Option<&zerobench_runtime::LiveSnapshot>,
     scenario_id: u16,
 ) {
     let mut decoded: Vec<u8> = Vec::with_capacity(input.len());
@@ -511,7 +511,7 @@ pub fn run_sse_hold_from_plan_threaded(
     plan: &Plan,
     duration: Duration,
     tls_config: Option<Arc<ClientConfig>>,
-    live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    live: Option<Arc<zerobench_runtime::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {
@@ -594,7 +594,7 @@ fn run_hold_scenario(
     duration: Duration,
     stop: &Arc<AtomicBool>,
     tls_config: Option<Arc<ClientConfig>>,
-    live: Option<&zerobench_core::LiveSnapshot>,
+    live: Option<&zerobench_runtime::LiveSnapshot>,
     scenario_id: u16,
 ) -> ScenarioRollup {
     let wall_deadline = Instant::now()

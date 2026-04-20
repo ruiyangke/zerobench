@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Args;
-use zerobench_core::calibrate::{ClientSelfCheck, Verdict};
+use zerobench_runtime::calibrate::{ClientSelfCheck, Verdict};
 
 // ---------------------------------------------------------------------------
 // CLI args

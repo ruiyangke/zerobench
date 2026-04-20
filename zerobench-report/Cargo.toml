@@ -1,6 +1,6 @@
 [package]
-name = "zerobench-tui"
-description = "Live terminal dashboard for zerobench"
+name = "zerobench-report"
+description = "Presentation and statistical comparison layer for zerobench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,16 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-zerobench-core = { workspace = true, default-features = false }
+zerobench-core = { workspace = true }
 zerobench-runtime = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
+
 hdrhistogram = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+yansi = { workspace = true }
+
+[dev-dependencies]
+smallvec = { workspace = true }
 
 [lints]
 workspace = true

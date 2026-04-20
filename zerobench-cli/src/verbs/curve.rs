@@ -26,18 +26,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::Args;
 use smallvec::SmallVec;
-use zerobench_core::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
-use zerobench_core::calibrate::ClientSelfCheck;
-use zerobench_core::fingerprint::{
-    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
-};
-use zerobench_core::machine::MachineFingerprint;
 use zerobench_core::plan::{Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
 use zerobench_core::stats::{ErrorCountersExport, LatencyExport, PerRunMetrics};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
 use zerobench_core::{Summary, SummaryExport};
+use zerobench_runtime::archive::{Archive, ArchiveWriter, EnvRecord, Index, SchemaVersions};
+use zerobench_runtime::calibrate::ClientSelfCheck;
+use zerobench_runtime::fingerprint::{
+    plan_hash, run_id, target_fingerprint, url_fingerprint, IpFamilyTag,
+};
+use zerobench_runtime::machine::MachineFingerprint;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -221,7 +221,7 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             cal.sustained_pct * 100.0,
             cal.verdict,
         );
-        if matches!(cal.verdict, zerobench_core::Verdict::Refuse) && !args.force_overload {
+        if matches!(cal.verdict, zerobench_runtime::Verdict::Refuse) && !args.force_overload {
             return Err(format!(
                 "client cannot sustain top-of-ramp {} req/s (achieved {:.0}). \
                  Lower --to or pass --force-overload.",

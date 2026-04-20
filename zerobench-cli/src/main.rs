@@ -25,9 +25,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
-use zerobench_core::{
-    print_json, print_terminal, ColorChoice, Summary,
-};
+use zerobench_core::Summary;
+use zerobench_report::{print_json, print_terminal, ColorChoice};
 
 mod cli_args;
 mod diff;
@@ -332,7 +331,7 @@ fn run_mio_sync(
 
     // Set up LiveSnapshot + StopSignal for TUI (or pass None for headless).
     let live = if tui_enabled {
-        Some(zerobench_core::LiveSnapshot::new(plan.scenarios.len()))
+        Some(zerobench_runtime::LiveSnapshot::new(plan.scenarios.len()))
     } else {
         None
     };
@@ -341,7 +340,7 @@ fn run_mio_sync(
     // (user presses q) and the timer can trip. The mio workers use the
     // same underlying AtomicBool — no separate timer inside the backend.
     let (stop, stop_flag) = if tui_enabled {
-        let s = zerobench_core::StopSignal::after_wall(plan.duration);
+        let s = zerobench_runtime::StopSignal::after_wall(plan.duration);
         let flag = std::sync::Arc::clone(s.flag());
         (Some(s), Some(flag))
     } else {
@@ -488,7 +487,7 @@ fn render_report(
 /// Dispatch a single `Summary` → `Write` render for the given format.
 ///
 /// Generic over `W: Write` because `print_terminal` / `print_json` /
-/// `print_prometheus` in `zerobench-core` take `impl Write` bounds
+/// `print_prometheus` in `zerobench-report` take `impl Write` bounds
 /// (`Sized`) — a `&mut dyn Write` trait object wouldn't satisfy them.
 fn write_report<W: Write>(
     summary: &Summary,
@@ -506,7 +505,7 @@ fn write_report<W: Write>(
             print_json(summary, plan, out)?;
         }
         CliFormat::Prom => {
-            zerobench_core::print_prometheus(summary, plan, out)?;
+            zerobench_report::print_prometheus(summary, plan, out)?;
         }
     }
     Ok(())
@@ -598,7 +597,7 @@ fn dispatch_multi_protocol_plan(
         // does not wire TUI today, so pass None — adding it here
         // requires threading a LiveSnapshot through the function's
         // signature, which is a bigger surface change than this fix.
-        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
+        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         let _ = connections; // SseHold takes subscriber count from its own plan field.
         Some(std::thread::spawn(move || {
             zerobench_sse::run_sse_hold_from_plan_threaded(
@@ -630,7 +629,7 @@ fn dispatch_multi_protocol_plan(
         };
         let dur = plan.duration;
         // Multi-protocol dispatcher does not wire TUI; pass None.
-        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
+        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
@@ -879,7 +878,7 @@ fn run_script_sync(
         // today, so live stays None. `run_mio_sync` (the default
         // dispatch) is the TUI-aware path and threads `live` through
         // its own backend calls.
-        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
+        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_sse::run_sse_hold_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
@@ -919,7 +918,7 @@ fn run_script_sync(
         // `run_script_sync` is the Rhai path; TUI is wired only for
         // `run_mio_sync`. Pass None to stay consistent with the
         // Rhai SSE path above.
-        let live_c: Option<std::sync::Arc<zerobench_core::LiveSnapshot>> = None;
+        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
             zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,

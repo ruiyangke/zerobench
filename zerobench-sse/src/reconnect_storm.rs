@@ -84,7 +84,7 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
     // for a sharper integration that surfaces reconnect_succeeded /
     // reconnect_resumed as dedicated counters. For now: accepted for
     // API symmetry with sibling backends.
-    _live: Option<Arc<zerobench_core::LiveSnapshot>>,
+    _live: Option<Arc<zerobench_runtime::LiveSnapshot>>,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Vec<TaskStats> {
     let stop = stop_flag.unwrap_or_else(|| {

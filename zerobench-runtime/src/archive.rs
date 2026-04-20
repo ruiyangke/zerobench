@@ -57,8 +57,8 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineFingerprint;
-use crate::plan::Plan;
-use crate::stats::SummaryExport;
+use zerobench_core::plan::Plan;
+use zerobench_core::stats::SummaryExport;
 
 // ---------------------------------------------------------------------------
 // Archive root

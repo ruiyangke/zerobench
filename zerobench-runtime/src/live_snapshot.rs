@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
 
-use crate::stats::{ErrorCounters, ErrorKind};
+use zerobench_core::stats::{ErrorCounters, ErrorKind};
 
 // ---------------------------------------------------------------------------
 // Sharding — number of latency-histogram mutexes.

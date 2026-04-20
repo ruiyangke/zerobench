@@ -34,7 +34,8 @@ use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{HeartbeatFrame, Plan, Protocol, Step, WsHoldPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
-use zerobench_core::{BenchRng, LiveSnapshot};
+use zerobench_core::BenchRng;
+use zerobench_runtime::LiveSnapshot;
 
 use crate::conn::WsConnection;
 
