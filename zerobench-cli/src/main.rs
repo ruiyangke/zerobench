@@ -1,3 +1,5 @@
+//! zerobench — CLI entry point.
+//!
 //! ARCH STATUS: REWRITE
 //!
 //! 957 LoC, contains THREE separate "dispatcher" functions — each is a
@@ -9,10 +11,6 @@
 //! `zerobench_backends::run_scenario(step, ctx)`. main.rs shrinks to
 //! argument routing + TUI-thread setup. Target: <200 LoC.
 //! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §6 Phase 4, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
-//! zerobench — CLI entry point.
 //!
 //! Synchronous, mio/epoll-based. Zero async runtime.
 
@@ -51,7 +49,6 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             },
-            #[cfg(feature = "script")]
             Subcommand::Run(ra) => match run_script_sync(ra) {
                 Ok(code) => code,
                 Err(e) => {
@@ -324,7 +321,7 @@ fn run_mio_sync(
     // Build TLS config when targeting https://.
     let tls_config = if target.tls {
         let alpn: &[&[u8]] = if use_h2 { &[b"h2"] } else { &[b"http/1.1"] };
-        Some(zerobench_http::mio_tls::build_tls_config(&opts, alpn))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, alpn))
     } else {
         None
     };
@@ -377,28 +374,20 @@ fn run_mio_sync(
     let tui_handle: Option<std::thread::JoinHandle<std::io::Result<()>>> = None;
 
     let stats = if use_h2 {
-        #[cfg(feature = "h2")]
-        {
-            zerobench_http::mio_h2::run_mio_h2_threaded(
-                &target,
-                &opts,
-                &plan,
-                num_threads,
-                args.connections,
-                plan.duration,
-                args.rate,
-                tls_config,
-                live,
-                stop_flag,
-            )
-        }
-        #[cfg(not(feature = "h2"))]
-        {
-            return Err("--http-version h2 with --mio requires the h2 feature. \
-                         Rebuild with --features h2.".into());
-        }
+        zerobench_backends::http::mio_h2::run_mio_h2_threaded(
+            &target,
+            &opts,
+            &plan,
+            num_threads,
+            args.connections,
+            plan.duration,
+            args.rate,
+            tls_config,
+            live,
+            stop_flag,
+        )
     } else {
-        zerobench_http::mio_h1::run_mio_threaded(
+        zerobench_backends::http::mio_h1::run_mio_threaded(
             &target,
             &opts,
             &plan,
@@ -535,12 +524,10 @@ fn write_report<W: Write>(
 /// `TaskStats` are merged into a single unified `Summary` with
 /// protocol-specific extras (SSE/WS histograms, byte counters)
 /// preserved per scenario.
-#[cfg(feature = "script")]
 /// Dispatch a plan across the HTTP / SSE / WS backends in parallel and
 /// merge their per-worker stats into one summary. Shared by the serial
 /// (one scenario per call) and `--parallel` (all scenarios in one call)
 /// execution modes of `run_script_sync`.
-#[cfg(feature = "script")]
 fn dispatch_multi_protocol_plan(
     plan: &zerobench_core::plan::Plan,
     target: &zerobench_core::transport::Target,
@@ -561,7 +548,7 @@ fn dispatch_multi_protocol_plan(
     let has_ws = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Ws);
 
     let tls_config_http = if target.tls && has_http {
-        Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
     } else {
         None
     };
@@ -573,7 +560,7 @@ fn dispatch_multi_protocol_plan(
         let tls = tls_config_http.clone();
         let dur = plan.duration;
         Some(std::thread::spawn(move || {
-            zerobench_http::mio_h1::run_mio_threaded(
+            zerobench_backends::http::mio_h1::run_mio_threaded(
                 &target_c, &opts_c, &plan_c, num_threads, connections, dur, target_rps,
                 tls, None, None,
             )
@@ -582,13 +569,12 @@ fn dispatch_multi_protocol_plan(
         None
     };
 
-    #[cfg(feature = "sse")]
     let sse_handle = if has_sse {
         let plan_c = plan.clone();
         let target_c = target.clone();
         let opts_c = opts.clone();
         let tls = if target.tls {
-            Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+            Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
         } else {
             None
         };
@@ -600,30 +586,20 @@ fn dispatch_multi_protocol_plan(
         let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         let _ = connections; // SseHold takes subscriber count from its own plan field.
         Some(std::thread::spawn(move || {
-            zerobench_sse::run_sse_hold_from_plan_threaded(
+            zerobench_backends::sse::run_sse_hold_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
         None
     };
-    #[cfg(not(feature = "sse"))]
-    let sse_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
-        if has_sse {
-            return Err(
-                "plan contains SSE scenarios but this build lacks the `sse` feature".into(),
-            );
-        }
-        None
-    };
 
-    #[cfg(feature = "ws")]
     let ws_handle = if has_ws {
         let plan_c = plan.clone();
         let opts_c = opts.clone();
         let target_c = target.clone();
         let tls = if target.tls {
-            Some(zerobench_http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+            Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
         } else {
             None
         };
@@ -631,23 +607,13 @@ fn dispatch_multi_protocol_plan(
         // Multi-protocol dispatcher does not wire TUI; pass None.
         let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+            zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
         None
     };
-    #[cfg(not(feature = "ws"))]
-    let ws_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
-        if has_ws {
-            return Err(
-                "plan contains WS scenarios but this build lacks the `ws` feature".into(),
-            );
-        }
-        None
-    };
-
     let mut all_stats: Vec<TaskStats> = Vec::new();
     if let Some(h) = http_handle {
         all_stats.extend(h.join().map_err(|_| "HTTP backend thread panicked")?);
@@ -662,7 +628,6 @@ fn dispatch_multi_protocol_plan(
     Ok(Summary::merge(all_stats, plan.duration))
 }
 
-#[cfg(feature = "script")]
 fn run_script_sync(
     args: cli_args::RunArgs,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -825,7 +790,7 @@ fn run_script_sync(
     // read-only views and `Plan` is cheap to clone (reference-counted
     // buffers + a few smallvecs).
     let tls_config_http = if target.tls && has_http {
-        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
     } else {
         None
     };
@@ -839,7 +804,7 @@ fn run_script_sync(
         let conns = args.connections;
         let dur = plan.duration;
         Some(std::thread::spawn(move || {
-            zerobench_http::mio_h1::run_mio_threaded(
+            zerobench_backends::http::mio_h1::run_mio_threaded(
                 &target_c,
                 &opts_c,
                 &plan_c,
@@ -859,13 +824,12 @@ fn run_script_sync(
     // SSE backend — one worker per `-c` connection, each running a
     // stream at a time. SSE scenarios always use HTTP/1.1; TLS follows
     // the shared target.
-    #[cfg(feature = "sse")]
     let sse_handle = if has_sse {
         let plan_c = plan.clone();
         let target_c = target.clone();
         let opts_c = opts.clone();
         let tls = if target.tls {
-            Some(zerobench_http::mio_tls::build_tls_config(
+            Some(zerobench_backends::http::mio_tls::build_tls_config(
                 &opts,
                 &[b"http/1.1"],
             ))
@@ -880,33 +844,23 @@ fn run_script_sync(
         // its own backend calls.
         let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_sse::run_sse_hold_from_plan_threaded(
+            zerobench_backends::sse::run_sse_hold_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
         None
     };
-    #[cfg(not(feature = "sse"))]
-    let sse_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
-        if has_sse {
-            return Err(
-                "plan contains SSE scenarios but this build lacks the `sse` feature".into(),
-            );
-        }
-        None
-    };
 
     // WS backend — one worker per `-c` connection, each opening a new
     // connection per round-trip. Kept consistent with the SSE model so
     // `-c` has the same meaning for both.
-    #[cfg(feature = "ws")]
     let ws_handle = if has_ws {
         let plan_c = plan.clone();
         let opts_c = opts.clone();
         let target_c = target.clone();
         let tls = if target.tls {
-            Some(zerobench_http::mio_tls::build_tls_config(
+            Some(zerobench_backends::http::mio_tls::build_tls_config(
                 &opts,
                 &[b"http/1.1"],
             ))
@@ -920,20 +874,11 @@ fn run_script_sync(
         // Rhai SSE path above.
         let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
         Some(std::thread::spawn(move || {
-            zerobench_ws::run_ws_echo_rtt_from_plan_threaded(
+            zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
                 &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
             )
         }))
     } else {
-        None
-    };
-    #[cfg(not(feature = "ws"))]
-    let ws_handle: Option<std::thread::JoinHandle<Vec<TaskStats>>> = {
-        if has_ws {
-            return Err(
-                "plan contains WS scenarios but this build lacks the `ws` feature".into(),
-            );
-        }
         None
     };
 

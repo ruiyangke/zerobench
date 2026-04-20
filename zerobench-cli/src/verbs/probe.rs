@@ -141,7 +141,7 @@ pub fn run(args: ProbeArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     // TLS config for https://.
     let tls_config = if target.tls {
-        Some(zerobench_http::mio_tls::build_tls_config(
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
             &opts,
             &[b"http/1.1"],
         ))
@@ -156,7 +156,7 @@ pub fn run(args: ProbeArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     );
 
     let stop: Option<Arc<AtomicBool>> = None;
-    let stats: Vec<TaskStats> = zerobench_http::mio_h1::run_mio_threaded(
+    let stats: Vec<TaskStats> = zerobench_backends::http::mio_h1::run_mio_threaded(
         &target,
         &opts,
         &plan,

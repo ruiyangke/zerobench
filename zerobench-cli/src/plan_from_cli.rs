@@ -213,8 +213,8 @@ fn build_from_url(
     };
 
     // NOTE (S1.6): `plan.warmup` is plumbed from the CLI but the mio
-    // dispatch layer in zerobench-http doesn't honour it yet — it
-    // starts measuring on first request. TODO: wire through.
+    // dispatch layer in zerobench-backends::http doesn't honour it yet —
+    // it starts measuring on first request. TODO: wire through.
     let plan = Plan {
         scenarios: vec![scenario],
         vars,

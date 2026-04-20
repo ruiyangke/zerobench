@@ -8,10 +8,10 @@
 //!
 //! Shared histogram constants and helpers.
 //!
-//! Every crate that records latency samples into HDR histograms
-//! (`zerobench-sse`, `zerobench-ws`, `mio_h1`, `mio_h2`) uses the same
-//! bounds and precision so percentile math is consistent across
-//! protocols.
+//! Every backend that records latency samples into HDR histograms
+//! (`zerobench-backends::sse`, `zerobench-backends::ws`, `mio_h1`,
+//! `mio_h2`) uses the same bounds and precision so percentile math is
+//! consistent across protocols.
 
 use std::time::Duration;
 

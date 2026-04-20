@@ -317,9 +317,8 @@ pub enum HttpVersionPref {
     Auto,
     /// Force HTTP/1.1. Always available.
     Http1,
-    /// Force HTTP/2. Available when the `h2` feature is compiled into
-    /// `zerobench-http`; the dispatcher surfaces a clear error if the
-    /// feature is absent rather than silently downgrading.
+    /// Force HTTP/2. HTTP/2 support is always compiled in via
+    /// `zerobench-backends::http::mio_h2`.
     Http2,
 }
 

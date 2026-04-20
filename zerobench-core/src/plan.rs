@@ -613,9 +613,9 @@ fn default_emit_field() -> String {
 pub enum Protocol {
     /// HTTP request/response (via mio_h1 or mio_h2).
     Http,
-    /// Server-Sent Events (via zerobench-sse).
+    /// Server-Sent Events (via zerobench-backends::sse).
     Sse,
-    /// WebSocket (via zerobench-ws).
+    /// WebSocket (via zerobench-backends::ws).
     Ws,
 }
 

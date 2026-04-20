@@ -286,7 +286,7 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut steps: Vec<StepResult> = Vec::with_capacity(args.steps as usize);
 
     let tls_config = if target.tls {
-        Some(zerobench_http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
     } else {
         None
     };
@@ -306,7 +306,7 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
         let t_start = Instant::now();
         let stop: Option<Arc<AtomicBool>> = None;
-        let stats = zerobench_http::mio_h1::run_mio_threaded(
+        let stats = zerobench_backends::http::mio_h1::run_mio_threaded(
             &target,
             &opts,
             &plan,

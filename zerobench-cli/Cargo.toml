@@ -13,27 +13,18 @@ name = "zerobench"
 path = "src/main.rs"
 
 [features]
-default = ["h1"]
-full = ["h1", "h2", "sse", "ws", "tui", "script"]
+default = []
+full = ["tui"]
 
-# Protocols
-h1 = ["zerobench-http/mio-h1"]
-h2 = ["zerobench-http/mio-h2"]
-# Protocol modes
-ws = ["dep:zerobench-ws", "h1"]
-sse = ["dep:zerobench-sse", "h1"]
 # Front-ends
 tui = ["dep:zerobench-tui"]
-script = ["dep:zerobench-rhai", "h1"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
 zerobench-runtime = { workspace = true }
 zerobench-report = { workspace = true }
-zerobench-http = { workspace = true, default-features = false }
-zerobench-ws = { workspace = true, optional = true }
-zerobench-sse = { workspace = true, optional = true }
-zerobench-rhai = { workspace = true, optional = true }
+zerobench-backends = { workspace = true }
+zerobench-rhai = { workspace = true }
 zerobench-tui = { workspace = true, optional = true }
 
 base64 = { workspace = true }

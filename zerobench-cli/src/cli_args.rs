@@ -1,15 +1,3 @@
-//! ARCH STATUS: KEEP (prune features)
-//!
-//! 1,192 LoC — clap-derive struct hierarchy for every CLI flag. Stays
-//! in place; post-rewrite it's the same argument parser. Prune:
-//!   - Remove `#[cfg(feature = "…")]` gates on flag definitions — no
-//!     feature flags in target.
-//!   - Remove silent "feature not built" rejections in runtime-arg
-//!     validation — every flag always works.
-//! See ARCH-REVIEW §4 Q-D4, §7.
-//!
-//! ----------------------------------------------------------------------
-//!
 //! Command-line argument parsing via `clap` derive.
 //!
 //! Parsing produces a [`CliArgs`]; the conversion to a runnable
@@ -34,33 +22,17 @@ pub fn num_cpus() -> usize {
 // `--version` long form — features + build profile baked in at compile time.
 // ---------------------------------------------------------------------------
 
-// Per-feature suffixes. Each is `", name"` when its cfg flag is on,
-// else `""`. Using cfg attributes on `const` items gives us `&'static
-// str` literals that `concat!` can splice.
-#[cfg(feature = "h2")]
+// Per-feature suffixes. h2/sse/ws/script are always-on now (no feature
+// flags). `tui` stays optional for Phase 5 reasons.
 const FEAT_H2: &str = ", h2";
-#[cfg(not(feature = "h2"))]
-const FEAT_H2: &str = "";
-
-#[cfg(feature = "sse")]
 const FEAT_SSE: &str = ", sse";
-#[cfg(not(feature = "sse"))]
-const FEAT_SSE: &str = "";
-
-#[cfg(feature = "ws")]
 const FEAT_WS: &str = ", ws";
-#[cfg(not(feature = "ws"))]
-const FEAT_WS: &str = "";
+const FEAT_SCRIPT: &str = ", script";
 
 #[cfg(feature = "tui")]
 const FEAT_TUI: &str = ", tui";
 #[cfg(not(feature = "tui"))]
 const FEAT_TUI: &str = "";
-
-#[cfg(feature = "script")]
-const FEAT_SCRIPT: &str = ", script";
-#[cfg(not(feature = "script"))]
-const FEAT_SCRIPT: &str = "";
 
 #[cfg(debug_assertions)]
 const BUILD_PROFILE: &str = "debug";
@@ -351,11 +323,9 @@ pub enum CliFormat {
 pub enum Subcommand {
     /// Compare two JSON bench outputs and report deltas.
     Diff(DiffArgs),
-    /// Run a Rhai scenario script. Only available when built with
-    /// `--features script`. The script is evaluated once at startup to
-    /// produce a `Plan`; the Rhai engine is then dropped and the
-    /// benchmark runs as pure Rust.
-    #[cfg(feature = "script")]
+    /// Run a Rhai scenario script. The script is evaluated once at
+    /// startup to produce a `Plan`; the Rhai engine is then dropped and
+    /// the benchmark runs as pure Rust.
     Run(RunArgs),
     /// Rigorous steady-state measurement (v0.1.0). Runs N consecutive
     /// benchmark runs against `URL` with warmup + cooldown, ships
@@ -384,7 +354,6 @@ pub enum Subcommand {
 /// warmup, and transport. The flags here are safe overrides for the
 /// common "I want to re-run the same script with a longer duration"
 /// case — they win over whatever the script said.
-#[cfg(feature = "script")]
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
     /// Path to the `.rhai` script.
@@ -788,7 +757,6 @@ mod tests {
                 assert_eq!(da.current.to_str(), Some("/tmp/curr.json"));
                 assert!((da.threshold_p99 - 3.5).abs() < 1e-9);
             }
-            #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
             Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
@@ -812,7 +780,6 @@ mod tests {
                 assert!((da.threshold_p99 - 5.0).abs() < 1e-9);
                 assert!((da.threshold_rps - 2.0).abs() < 1e-9);
             }
-            #[cfg(feature = "script")]
             Subcommand::Run(_) => panic!("expected Diff, got Run"),
             Subcommand::Measure(_) => panic!("expected Diff, got Measure"),
             Subcommand::Probe(_) => panic!("expected Diff, got Probe"),
