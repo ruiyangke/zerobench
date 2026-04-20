@@ -1,3 +1,11 @@
+//! ARCH STATUS: DELETE — contents merge into zerobench-backends::sse
+//!
+//! zerobench-sse goes away as a crate. Modules (hold, fanout,
+//! reconnect_storm, line_parser) become submodules of zerobench-backends::sse.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench-sse — Server-Sent Events benchmarking runner.
 //!
 //! Protocol-native SSE workload per `docs/PHILOSOPHY.md` §4.3:

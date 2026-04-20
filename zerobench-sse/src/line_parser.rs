@@ -1,3 +1,12 @@
+//! ARCH STATUS: MOVE → zerobench-backends::sse::line_parser
+//!
+//! ARCH(keep): CROWN JEWEL — WHATWG EventSource-correct line framer,
+//! including the Id(Cow<[u8]>) event variant that handles chunk-boundary
+//! id: reassembly (fixes B4 from the prior review loop). Move byte-for-
+//! byte; do not rewrite. See ARCH-REVIEW §1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! SSE line framer.
 //!
 //! Consumes byte chunks from an already-dechunked HTTP body (hyper does

@@ -1,3 +1,13 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::conn
+//!
+//! Shared WS connection state machine used by every WS backend. Stays
+//! intact on move; the Ping-payload-cap (RFC §5.5) and DataFrame::Pong
+//! surface introduced in the recent review pass are load-bearing for
+//! the correlate-PingPong path.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! A single client-side WebSocket connection (mio/synchronous).
 //!
 //! Wraps a [`MioStream`] (plain TCP or TLS) plus the recv-buffer and

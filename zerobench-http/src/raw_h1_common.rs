@@ -1,3 +1,13 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::raw_h1_common
+//!
+//! ARCH(keep): shared assertion/extraction/header helpers (check_assertions,
+//! apply_extractions, capture_headers, build_raw_request, ConnectionMode,
+//! ContentLength). All three HTTP backends (mio_h1, cold_connect, mio_h2)
+//! call these. Move byte-for-byte.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Shared helpers for raw HTTP/1.1 request building and response parsing.
 //!
 //! Contains request building and response header parsing that is

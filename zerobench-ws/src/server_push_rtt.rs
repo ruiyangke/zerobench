@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::server_push_rtt
+//!
+//! Becomes one arm of the dispatch match. ARCH(recorder) at the
+//! inter-message-gap recording site.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! WebSocket server-push RTT benchmark — `docs/design-v0.1.0.md` §3.3
 //! `WsServerPushRtt`.
 //!

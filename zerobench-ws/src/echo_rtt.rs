@@ -1,3 +1,14 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::echo_rtt
+//!
+//! Becomes one arm of the dispatch match. ARCH(error-unify): RecvErr
+//! (Timeout / Transport / ProtocolMismatch) disappears — replaces with
+//! core's TransportError. ARCH(recorder) at the RTT-recorded site.
+//! The 4-variant CorrelateStrategy + MatchKey dispatch stays — that's
+//! load-bearing for the recent review-loop fixes.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §4.7, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! WebSocket echo-RTT — `docs/PHILOSOPHY.md` §4.4 and
 //! `docs/design-v0.1.0.md` §3.3.
 //!
@@ -212,6 +223,9 @@ fn run_one_echo_rtt(
             Ok(bytes) => {
                 let rtt = Instant::now().saturating_duration_since(intended_start);
                 let rtt_ns = duration_to_hist_ns(rtt);
+                // ARCH(recorder): triple-record (rtt histogram + live aggregate
+                // + live scenario). Collapses to recorder.record(sid, Sample{..}).
+                // See ARCH-REVIEW §4.3.
                 let _ = stats.rtt.record(rtt_ns);
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(bytes as u64);

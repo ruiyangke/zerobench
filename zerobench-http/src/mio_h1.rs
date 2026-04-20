@@ -1,3 +1,14 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::mio_h1
+//!
+//! THE reference backend. Becomes one arm of the static-dispatch match
+//! in zerobench-backends (Step::Request → http::mio_h1::run). Public
+//! function signature collapses behind `&RunCtx`. Multiple ARCH(recorder)
+//! sites inside this file (response-complete + pipeline-next paths) —
+//! they all collapse to one `recorder.record(sid, sample)` call each.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Mio-based raw HTTP/1.1 benchmark client — synchronous epoll event loop,
 //! zero async overhead.
 //!
@@ -864,6 +875,10 @@ pub fn run_mio_worker(
                         }
 
                         // --- Record stats ---
+                        // ARCH(recorder): triple-record site — collapses to
+                        //   recorder.record(sid, Sample { latency: co_free_latency,
+                        //                                 ttfb, bytes_sent, bytes_recv });
+                        // See ARCH-REVIEW §4.3.
                         stats.record(scenario_id, co_free_latency, ttfb, bytes_sent, bytes_recv);
                         if let Some(live) = live {
                             let lat_ns = co_free_latency.as_nanos() as u64;

@@ -1,3 +1,17 @@
+//! ARCH STATUS: MOVE → zerobench-backends::sse::fanout
+//!
+//! ARCH(fanout-core): HEAVY DUPLICATION with ws/fanout.rs. Extract:
+//!   - run_trigger_loop  (structurally identical to ws/fanout::run_trigger_loop)
+//!   - render_template   (identical)
+//!   - fire_trigger      (fire_http_trigger in ws/fanout; same func)
+//!   - post-run trigger↔event correlation pass
+//! All four go to zerobench-backends::fanout_core. This file keeps only
+//! the SSE-specific subscriber logic + the SseFanoutPlan handler.
+//!
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §B1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! SSE broadcast-latency benchmark — `docs/design-v0.1.0.md` §3.2
 //! `SseFanout` and `docs/PHILOSOPHY.md` §4.3.
 //!
@@ -324,6 +338,11 @@ pub fn run_sse_fanout_from_plan_threaded(
     }
     out
 }
+
+// ARCH(fanout-core): run_trigger_loop, fire_trigger, render_template
+// are duplicated byte-for-pattern with ws/fanout.rs equivalents.
+// Target: extract to zerobench-backends::fanout_core and call from
+// both. See ARCH-REVIEW §4.6, §B1.
 
 /// Fire HTTP POST triggers at `TRIGGER_INTERVAL_MS`, recording each
 /// send instant into `triggers`. The trigger URL is re-expanded from

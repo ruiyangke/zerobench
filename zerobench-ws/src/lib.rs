@@ -1,3 +1,12 @@
+//! ARCH STATUS: DELETE — contents merge into zerobench-backends::ws
+//!
+//! zerobench-ws goes away as a crate. Modules (conn, frame, handshake,
+//! echo_rtt, hold, server_push_rtt, fanout) become submodules of
+//! zerobench-backends::ws.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench-ws — RFC 6455 WebSocket benchmarking runner.
 //!
 //! Protocol-native WS workload per `docs/PHILOSOPHY.md` §4.4:

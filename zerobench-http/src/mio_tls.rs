@@ -1,3 +1,12 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::mio_tls
+//!
+//! Shared TLS machinery used by mio_h1, mio_h2, cold_connect, plus
+//! zerobench-ws/sse. Stays with http submodule because it wraps an
+//! h1-era MioStream abstraction tightly bound to HTTP's connect path.
+//! See docs/ARCH-REVIEW-2026-04-20.md §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! TLS wrapper for mio's `TcpStream` using `rustls` directly.
 //!
 //! No async runtime, no compio-tls, no tokio-rustls. Just the raw

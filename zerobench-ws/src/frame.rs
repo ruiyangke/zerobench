@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::frame
+//!
+//! ARCH(keep): CROWN JEWEL — RFC 6455 §5.2 compliant codec (masking,
+//! fragmentation, close codes, control-frame rules). Move byte-for-byte;
+//! do not rewrite. See ARCH-REVIEW §1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! RFC 6455 §5.2 frame codec.
 //!
 //! This module implements the wire format for WebSocket frames — the

@@ -1,4 +1,19 @@
+//! ARCH STATUS: DELETE — contents merge into zerobench-backends::http
+//!
+//! zerobench-http goes away as a crate. Its modules (cold_connect, mio_h1,
+//! mio_h2, mio_tls, raw_h1_common, simple_post) become submodules under
+//! zerobench-backends::http. All `#[cfg(feature = "mio-h1")]` /
+//! `#[cfg(feature = "mio-h2")]` gates disappear — no feature flags in the
+//! target.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! zerobench-http — HTTP/1 and HTTP/2 transports (mio/epoll, zero async).
+
+// ARCH(feature-delete): all `#[cfg(feature = "mio-h1")]` +
+// `#[cfg(feature = "mio-h2")]` gates vanish post-move. Every module is
+// always-on in zerobench-backends. See ARCH-REVIEW §4, Q4.
 
 // --- Shared H1 request/response helpers ---
 #[cfg(feature = "mio-h1")]

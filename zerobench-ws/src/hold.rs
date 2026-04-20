@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::hold
+//!
+//! Becomes one arm of the dispatch match. ARCH(recorder) at the
+//! frame-received site. heartbeat_frame field already wired.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! WebSocket idle-capacity benchmark — `docs/PHILOSOPHY.md` §4.4 and
 //! `docs/design-v0.1.0.md` §3.3 `WsHold`.
 //!

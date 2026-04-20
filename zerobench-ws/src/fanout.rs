@@ -1,3 +1,17 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::fanout
+//!
+//! ARCH(fanout-core): HEAVY DUPLICATION with sse/fanout.rs. Extract:
+//!   - run_trigger_loop    (mirror of sse/fanout::run_trigger_loop)
+//!   - fire_http_trigger   (mirror of sse/fanout::fire_trigger)
+//!   - render_template     (identical)
+//!   - post-run trigger↔frame correlation pass
+//! All four go to zerobench-backends::fanout_core. This file keeps only
+//! WS-specific subscriber logic + the WsFanoutPlan handler.
+//!
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §B1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! WebSocket broadcast-latency benchmark — `docs/design-v0.1.0.md` §3.3
 //! `WsFanout`.
 //!

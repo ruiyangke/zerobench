@@ -1,3 +1,12 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::simple_post
+//!
+//! ARCH(fanout-core): primary caller is the SSE + WS fanout trigger
+//! loops, which become one shared module in zerobench-backends::fanout_core.
+//! This file moves alongside but stays usable standalone.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.6, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Minimal one-shot HTTP POST — used by benchmark harness paths that
 //! need to fire an occasional side-channel request (fanout triggers,
 //! control-plane probes) without standing up the full mio_h1 pool.

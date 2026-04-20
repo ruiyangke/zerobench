@@ -1,3 +1,11 @@
+//! ARCH STATUS: MOVE → zerobench-backends::ws::handshake
+//!
+//! ARCH(keep): RFC 6455 §4 Upgrade handshake — Sec-WebSocket-Key/Accept
+//! computation, header validation. Move byte-for-byte.
+//! See ARCH-REVIEW §1, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! RFC 6455 §4 HTTP/1.1 Upgrade handshake.
 //!
 //! The client half is what we need: generate a Sec-WebSocket-Key, send

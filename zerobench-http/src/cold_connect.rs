@@ -1,3 +1,13 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::cold_connect
+//!
+//! Becomes one arm of the static-dispatch `match step { Step::HttpColdConnect(p)
+//! => … }` in zerobench-backends. Public function signature collapses: no more
+//! separate `target / opts / live / stop_flag` args — all fold into `&RunCtx`.
+//! ColdErr goes away (ARCH(error-unify) — see below).
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.7, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! HTTP cold-connect benchmark — fresh TCP+TLS+HTTP connection per op.
 //!
 //! Implements `docs/design-v0.1.0.md` §3.1 and `docs/PHILOSOPHY.md` §4.2.
@@ -255,6 +265,10 @@ fn run_worker(
                 // This is the meaningful signal for cold-connect: the server's
                 // accept + TLS + first-write latency together.
                 let full_ttfb = outcome.handshake + outcome.ttfb;
+                // ARCH(recorder): collapses to
+                //     recorder.record(sid, Sample { latency: total, ttfb: full_ttfb,
+                //                                   bytes_sent, bytes_recv });
+                // Kills the triple-record pattern. See ARCH-REVIEW §4.3.
                 task.record(
                     scenario_id,
                     total,
@@ -337,6 +351,10 @@ struct OpOutcome {
     extracted_headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+// ARCH(error-unify): replace with core's TransportError (post-move:
+// zerobench-runtime::TransportError). Every backend's op-level error
+// becomes one shared type; runtime's classify() is the single mapping
+// to ErrorKind. See ARCH-REVIEW §4.7.
 /// Categorised errors from a single cold-connect op.
 ///
 /// Each hard-failure variant carries enough context (the underlying

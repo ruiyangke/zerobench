@@ -1,3 +1,12 @@
+//! ARCH STATUS: MOVE → zerobench-backends::http::mio_h2
+//!
+//! Becomes one arm of the dispatch match. ARCH(recorder) at the body-done
+//! site. Feature gate `#[cfg(feature = "h2")]` on the caller side goes
+//! away — h2 always compiled.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! Mio-based HTTP/2 benchmark client — single TCP connection per thread with
 //! N concurrent H2 streams, driven by manual future polling from the
 //! synchronous mio event loop.
@@ -372,6 +381,7 @@ impl H2Conn {
                 let sid = stream.scenario_id;
                 let bs = stream.request_bytes;
                 let br = stream.response_bytes;
+                // ARCH(recorder): triple-record site — see ARCH-REVIEW §4.3.
                 stats.record(sid, co_free_latency, ttfb, bs, br);
                 if let Some(l) = live {
                     let lat_ns = co_free_latency.as_nanos() as u64;

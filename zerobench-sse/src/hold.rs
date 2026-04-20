@@ -1,3 +1,12 @@
+//! ARCH STATUS: MOVE → zerobench-backends::sse::hold
+//!
+//! Becomes one arm of the dispatch match. Multiple ARCH(recorder) sites
+//! (per-event live.record calls in feed_body). The reconnect path that
+//! landed recently stays — it's correct behaviour.
+//! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §4.3, §7.
+//!
+//! ----------------------------------------------------------------------
+//!
 //! SSE `hold` mode — the protocol-native SSE workload.
 //!
 //! Implements `docs/PHILOSOPHY.md` §4.3 and `docs/design-v0.1.0.md`
@@ -352,6 +361,11 @@ fn feed_body(
             }
             *last_event_at = Some(now);
             stats.events = stats.events.saturating_add(1);
+            // ARCH(recorder): double-record site (SSE has no TaskStats
+            // write here — stats.events is per-subscriber; live is the
+            // cross-cutting one). Collapses when Recorder gains an
+            // `observe(sid, sample)` mode for count-only observations.
+            // See ARCH-REVIEW §4.3.
             if let Some(live) = live {
                 let blen = payload.len() as u64;
                 live.record(gap_ns, 0, blen);
