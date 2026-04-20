@@ -2,14 +2,12 @@
 //!
 //! ARCH STATUS: REWRITE
 //!
-//! 957 LoC, contains THREE separate "dispatcher" functions — each is a
-//! 3-way Protocol match statement:
-//!   - run_mio_sync               (default subcommand path)
-//!   - dispatch_multi_protocol_plan (multi-scenario Rhai path)
-//!   - run_script_sync            (zerobench run X.rhai path)
-//! All three replaced by one call to
-//! `zerobench_backends::run_scenario(step, ctx)`. main.rs shrinks to
-//! argument routing + TUI-thread setup. Target: <200 LoC.
+//! Phase 2c collapsed the three protocol-group matches into
+//! `zerobench_backends::run_plan` calls (see ARCH-REVIEW §4.1). Still
+//! carries TUI-thread setup, dry-run output, and two dispatch wrappers
+//! (`run_mio_sync` for the default subcommand, `run_script_sync` for
+//! `zerobench run X.rhai`). Target: <200 LoC — next step is to fold
+//! TUI wiring into a shared runner.
 //! See docs/ARCH-REVIEW-2026-04-20.md §4.1, §6 Phase 4, §7.
 //!
 //! Synchronous, mio/epoll-based. Zero async runtime.
@@ -536,103 +534,33 @@ fn dispatch_multi_protocol_plan(
     num_threads: usize,
     target_rps: Option<f64>,
 ) -> Result<Summary, Box<dyn std::error::Error>> {
-    use zerobench_core::plan::Protocol;
-    use zerobench_core::stats::TaskStats;
-
-    // ARCH(dispatch): this protocol-group match (+ the sibling one at
-    // ~L806) is the third copy of backend routing in main.rs alone.
-    // Replaced by `zerobench_backends::run_scenario(step, ctx)` —
-    // single exhaustive match on Step. See ARCH-REVIEW §4.1.
-    let has_http = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Http);
-    let has_sse = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Sse);
-    let has_ws = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Ws);
-
-    let tls_config_http = if target.tls && has_http {
+    // Shared TLS config across all three protocol groups — the Rhai
+    // path pins ALPN to http/1.1 for every backend today.
+    let tls_config = if target.tls {
         Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
     } else {
         None
     };
 
-    let http_handle = if has_http {
-        let plan_c = plan.clone();
-        let target_c = target.clone();
-        let opts_c = opts.clone();
-        let tls = tls_config_http.clone();
-        let dur = plan.duration;
-        Some(std::thread::spawn(move || {
-            zerobench_backends::http::mio_h1::run_mio_threaded(
-                &target_c, &opts_c, &plan_c, num_threads, connections, dur, target_rps,
-                tls, None, None,
-            )
-        }))
-    } else {
-        None
+    let ctx = zerobench_backends::RunCtx {
+        target: target.clone(),
+        opts: opts.clone(),
+        duration: plan.duration,
+        num_threads,
+        connections,
+        target_rps,
+        tls_config,
+        live: None,
+        stop: None,
     };
-
-    let sse_handle = if has_sse {
-        let plan_c = plan.clone();
-        let target_c = target.clone();
-        let opts_c = opts.clone();
-        let tls = if target.tls {
-            Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
-        } else {
-            None
-        };
-        let dur = plan.duration;
-        // `dispatch_multi_protocol_plan` is the Rhai-scripted path; it
-        // does not wire TUI today, so pass None — adding it here
-        // requires threading a LiveSnapshot through the function's
-        // signature, which is a bigger surface change than this fix.
-        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
-        let _ = connections; // SseHold takes subscriber count from its own plan field.
-        Some(std::thread::spawn(move || {
-            zerobench_backends::sse::run_sse_hold_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
-            )
-        }))
-    } else {
-        None
-    };
-
-    let ws_handle = if has_ws {
-        let plan_c = plan.clone();
-        let opts_c = opts.clone();
-        let target_c = target.clone();
-        let tls = if target.tls {
-            Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
-        } else {
-            None
-        };
-        let dur = plan.duration;
-        // Multi-protocol dispatcher does not wire TUI; pass None.
-        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
-        Some(std::thread::spawn(move || {
-            zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
-            )
-        }))
-    } else {
-        None
-    };
-    let mut all_stats: Vec<TaskStats> = Vec::new();
-    if let Some(h) = http_handle {
-        all_stats.extend(h.join().map_err(|_| "HTTP backend thread panicked")?);
-    }
-    if let Some(h) = sse_handle {
-        all_stats.extend(h.join().map_err(|_| "SSE backend thread panicked")?);
-    }
-    if let Some(h) = ws_handle {
-        all_stats.extend(h.join().map_err(|_| "WS backend thread panicked")?);
-    }
-
+    let all_stats = zerobench_backends::run_plan(plan, &ctx);
     Ok(Summary::merge(all_stats, plan.duration))
 }
 
 fn run_script_sync(
     args: cli_args::RunArgs,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    use zerobench_core::plan::{Protocol, RateProfile, Step};
-    use zerobench_core::stats::TaskStats;
+    use zerobench_core::plan::{RateProfile, Step};
     use zerobench_core::template::Template;
     use zerobench_core::transport::TransportOpts;
 
@@ -768,134 +696,31 @@ fn run_script_sync(
     }
 
     // Single scenario OR --parallel → single dispatch covering all.
-    let has_http = plan
-        .scenarios
-        .iter()
-        .any(|s| s.protocol() == Protocol::Http);
-    let has_sse = plan
-        .scenarios
-        .iter()
-        .any(|s| s.protocol() == Protocol::Sse);
-    let has_ws = plan
-        .scenarios
-        .iter()
-        .any(|s| s.protocol() == Protocol::Ws);
-
     // `--saturate` trumps any rate in the script or CLI. Otherwise, if
     // the user passed --rate, use it. Otherwise, leave None and let the
     // dispatcher pick up the per-scenario RateProfile.
     let target_rps = target_rps_val;
 
-    // Each backend gets its own copy of the plan — they're all
-    // read-only views and `Plan` is cheap to clone (reference-counted
-    // buffers + a few smallvecs).
-    let tls_config_http = if target.tls && has_http {
+    // All three backend groups use HTTP/1.1 ALPN on the Rhai path —
+    // build one shared TLS config to hand to `run_plan`.
+    let tls_config = if target.tls {
         Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
     } else {
         None
     };
 
-    // Spawn the HTTP backend when any HTTP scenario exists.
-    let http_handle = if has_http {
-        let plan_c = plan.clone();
-        let target_c = target.clone();
-        let opts_c = opts.clone();
-        let tls = tls_config_http.clone();
-        let conns = args.connections;
-        let dur = plan.duration;
-        Some(std::thread::spawn(move || {
-            zerobench_backends::http::mio_h1::run_mio_threaded(
-                &target_c,
-                &opts_c,
-                &plan_c,
-                num_threads,
-                conns,
-                dur,
-                target_rps,
-                tls,
-                None,
-                None,
-            )
-        }))
-    } else {
-        None
+    let ctx = zerobench_backends::RunCtx {
+        target: target.clone(),
+        opts: opts.clone(),
+        duration: plan.duration,
+        num_threads,
+        connections: args.connections,
+        target_rps,
+        tls_config,
+        live: None,
+        stop: None,
     };
-
-    // SSE backend — one worker per `-c` connection, each running a
-    // stream at a time. SSE scenarios always use HTTP/1.1; TLS follows
-    // the shared target.
-    let sse_handle = if has_sse {
-        let plan_c = plan.clone();
-        let target_c = target.clone();
-        let opts_c = opts.clone();
-        let tls = if target.tls {
-            Some(zerobench_backends::http::mio_tls::build_tls_config(
-                &opts,
-                &[b"http/1.1"],
-            ))
-        } else {
-            None
-        };
-        let _ = args.connections; // SseHold drives subscriber count from its own plan field.
-        let dur = plan.duration;
-        // `run_script_sync` is the Rhai path; it does not wire TUI
-        // today, so live stays None. `run_mio_sync` (the default
-        // dispatch) is the TUI-aware path and threads `live` through
-        // its own backend calls.
-        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
-        Some(std::thread::spawn(move || {
-            zerobench_backends::sse::run_sse_hold_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
-            )
-        }))
-    } else {
-        None
-    };
-
-    // WS backend — one worker per `-c` connection, each opening a new
-    // connection per round-trip. Kept consistent with the SSE model so
-    // `-c` has the same meaning for both.
-    let ws_handle = if has_ws {
-        let plan_c = plan.clone();
-        let opts_c = opts.clone();
-        let target_c = target.clone();
-        let tls = if target.tls {
-            Some(zerobench_backends::http::mio_tls::build_tls_config(
-                &opts,
-                &[b"http/1.1"],
-            ))
-        } else {
-            None
-        };
-        let _ = args.connections; // WsEchoRtt drives conn count from its own plan field.
-        let dur = plan.duration;
-        // `run_script_sync` is the Rhai path; TUI is wired only for
-        // `run_mio_sync`. Pass None to stay consistent with the
-        // Rhai SSE path above.
-        let live_c: Option<std::sync::Arc<zerobench_runtime::LiveSnapshot>> = None;
-        Some(std::thread::spawn(move || {
-            zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
-                &target_c, &opts_c, &plan_c, dur, tls, live_c, None,
-            )
-        }))
-    } else {
-        None
-    };
-
-    // Wait for every backend and merge their per-worker stats into
-    // one aggregate `Vec<TaskStats>`. Each backend returns its own
-    // list of TaskStats (one per worker); we treat them as a flat
-    // collection — the final Summary::merge sums everything.
-    let mut all_stats: Vec<TaskStats> = Vec::new();
-    if let Some(h) = http_handle {
-        all_stats.extend(h.join().map_err(|_| "HTTP backend thread panicked")?);
-    }
-    if let Some(h) = sse_handle {
-        all_stats.extend(h.join().map_err(|_| "SSE backend thread panicked")?);
-    }
-    if let Some(h) = ws_handle {
-        all_stats.extend(h.join().map_err(|_| "WS backend thread panicked")?);
-    }
+    let all_stats = zerobench_backends::run_plan(&plan, &ctx);
 
     let summary = Summary::merge(all_stats, plan.duration);
 

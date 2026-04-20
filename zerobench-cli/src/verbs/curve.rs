@@ -1,9 +1,10 @@
 //! ARCH STATUS: REWRITE
 //!
-//! 603 LoC. Re-implements its own dispatch + plan building that
-//! parallels measure.rs — same ARCH(dispatch) + ARCH(builder-unify)
-//! smells. Post-rewrite: ~100 LoC wrapping runner.execute() in a
-//! rate-sweep loop.
+//! Phase 2c routed the HTTP backend call through
+//! `zerobench_backends::run_plan` — dispatch is now a single call. Still
+//! duplicates plan construction with measure.rs (ARCH(builder-unify))
+//! and its own runs/archive lifecycle. Post-rewrite: ~100 LoC wrapping
+//! runner.execute() in a rate-sweep loop.
 //! See ARCH-REVIEW §6 Phase 4, §B2.
 //!
 //! ----------------------------------------------------------------------
@@ -306,18 +307,18 @@ pub fn run(args: CurveArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
         let t_start = Instant::now();
         let stop: Option<Arc<AtomicBool>> = None;
-        let stats = zerobench_backends::http::mio_h1::run_mio_threaded(
-            &target,
-            &opts,
-            &plan,
-            args.threads.max(1),
-            args.connections,
-            step_duration,
-            Some(offered),
-            tls_config.clone(),
-            None,
+        let step_ctx = zerobench_backends::RunCtx {
+            target: target.clone(),
+            opts: opts.clone(),
+            duration: step_duration,
+            num_threads: args.threads.max(1),
+            connections: args.connections,
+            target_rps: Some(offered),
+            tls_config: tls_config.clone(),
+            live: None,
             stop,
-        );
+        };
+        let stats = zerobench_backends::run_plan(&plan, &step_ctx);
         let elapsed = t_start.elapsed();
         let summary = Summary::merge(stats, elapsed);
 

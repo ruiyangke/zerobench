@@ -1,16 +1,17 @@
 //! ARCH STATUS: REWRITE
 //!
-//! 1,468 LoC with a 693-LoC god function (`pub fn run`). Contains:
+//! Still contains the per-run lifecycle (warmup → measure → cooldown ×
+//! runs, archive, calibration gates) inline in `pub fn run`. Phase 2c
+//! collapsed the 9-arm dispatch matches into `zerobench_backends::run_plan`
+//! (see `ARCH-REVIEW §4.1`). The remaining restructuring:
 //!   - Plan construction from CLI args (~200 LoC) — see ARCH(builder-unify)
-//!   - Fingerprint + run_id, calibration, machine probe, archive setup
-//!   - A 9-arm dispatch match DUPLICATED for warmup + steady-state (~200 LoC)
-//!     — see ARCH(dispatch)
-//!   - Runs loop, summary merge, archive finalise, report render
+//!   - Runs loop / archive finalise belongs in a shared
+//!     `zerobench-runtime::runner` module that probe / curve / compare /
+//!     replay share.
 //!
-//! Target: ~150 LoC total. Extract runner infra into a shared
-//! `zerobench-runtime::runner` module that probe / curve / compare /
-//! replay share. `measure::run` becomes: build plan → runner.execute →
-//! render. See docs/ARCH-REVIEW-2026-04-20.md §6 Phase 4, §B2, §7.
+//! Target: ~150 LoC total. `measure::run` becomes: build plan →
+//! runner.execute → render. See docs/ARCH-REVIEW-2026-04-20.md §6
+//! Phase 4, §B2, §7.
 //!
 //! ----------------------------------------------------------------------
 //!
@@ -621,130 +622,18 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // stats we drop on the floor.
         if !args.warmup.is_zero() && run_idx == 0 {
             eprintln!("[warmup] {} (discarded)...", format_duration(args.warmup));
-            // Dispatch on the FIRST non-Pause step type, not just
-            // Protocol. A SseFanout plan warmed up with run_sse_hold
-            // would measure the wrong backend — and possibly
-            // exhaust the trigger rate budget / poison server
-            // state — before the real run starts.
-            let first_step = plan.scenarios.first().and_then(|s| {
-                s.steps.iter().find(|st| {
-                    !matches!(
-                        st,
-                        zerobench_core::plan::Step::Pause(_)
-                            | zerobench_core::plan::Step::PauseRandom { .. }
-                    )
-                })
-            });
-            // ARCH(dispatch): 9-arm warmup match. COLLAPSES with the
-            // sibling steady-state match at ~L760 into a single call to
-            // `zerobench_backends::run_scenario(step, ctx)`. See §4.1.
-            match first_step {
-                Some(zerobench_core::plan::Step::HttpColdConnect(_)) => {
-                    let _ = zerobench_backends::http::cold_connect::run_cold_connect_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.connections as u32,
-                        args.warmup,
-                        target_rate,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::SseHold(_)) => {
-                    let _ = zerobench_backends::sse::run_sse_hold_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::SseFanout(_)) => {
-                    let _ = zerobench_backends::sse::run_sse_fanout_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => {
-                    let _ = zerobench_backends::sse::run_sse_reconnect_storm_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::WsEchoRtt(_)) => {
-                    let _ = zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::WsHold(_)) => {
-                    let _ = zerobench_backends::ws::run_ws_hold_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => {
-                    let _ = zerobench_backends::ws::run_ws_server_push_rtt_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                Some(zerobench_core::plan::Step::WsFanout(_)) => {
-                    let _ = zerobench_backends::ws::run_ws_fanout_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.warmup,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-                // Default (Request / None / other) — HTTP backend.
-                _ => {
-                    let _ = zerobench_backends::http::mio_h1::run_mio_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.threads.max(1),
-                        args.connections,
-                        args.warmup,
-                        target_rate,
-                        tls_config.clone(),
-                        None,
-                        None,
-                    );
-                }
-            }
+            let warmup_ctx = zerobench_backends::RunCtx {
+                target: target.clone(),
+                opts: opts.clone(),
+                duration: args.warmup,
+                num_threads: args.threads.max(1),
+                connections: args.connections,
+                target_rps: target_rate,
+                tls_config: tls_config.clone(),
+                live: None,
+                stop: None,
+            };
+            let _ = zerobench_backends::run_plan(&plan, &warmup_ctx);
         }
 
         eprintln!(
@@ -755,147 +644,18 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             scenario_protocol,
         );
         let stop: Option<Arc<AtomicBool>> = None;
-        // Route to cold-connect when ANY HTTP scenario contains a
-        // HttpColdConnect step. Strictly correct per-scenario
-        // dispatch would require splitting the plan and driving each
-        // HTTP scenario through its own backend; the single-scenario
-        // measure verb never hits that path (the CLI-built plan has
-        // exactly one scenario), and mixed-cold/hot Rhai plans are
-        // a known limitation documented in the gap audit.
-        let any_http_is_cold = plan.scenarios.iter().any(|s| {
-            s.protocol() == Protocol::Http
-                && s.steps.iter().any(|st| {
-                    matches!(st, zerobench_core::plan::Step::HttpColdConnect(_))
-                })
-        });
-        let stats = match scenario_protocol {
-            Protocol::Http if any_http_is_cold => {
-                zerobench_backends::http::cold_connect::run_cold_connect_from_plan_threaded(
-                    &target,
-                    &opts,
-                    &plan,
-                    args.connections as u32,
-                    args.duration,
-                    target_rate,
-                    tls_config.clone(),
-                    None,
-                    stop,
-                )
-            }
-            Protocol::Http => zerobench_backends::http::mio_h1::run_mio_threaded(
-                &target,
-                &opts,
-                &plan,
-                args.threads.max(1),
-                args.connections,
-                args.duration,
-                target_rate,
-                tls_config.clone(),
-                None,
-                stop,
-            ),
-            Protocol::Sse => {
-                let first_sse_step = plan.scenarios.first().and_then(|s| {
-                    s.steps.iter().find(|st| {
-                        !matches!(
-                            st,
-                            zerobench_core::plan::Step::Pause(_)
-                                | zerobench_core::plan::Step::PauseRandom { .. }
-                        )
-                    })
-                });
-                match first_sse_step {
-                    Some(zerobench_core::plan::Step::SseFanout(_)) => {
-                        zerobench_backends::sse::run_sse_fanout_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.duration,
-                            tls_config.clone(),
-                            None,
-                            stop,
-                        )
-                    }
-                    Some(zerobench_core::plan::Step::SseReconnectStorm(_)) => {
-                        zerobench_backends::sse::run_sse_reconnect_storm_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.duration,
-                            tls_config.clone(),
-                            None,
-                            stop,
-                        )
-                    }
-                    _ => zerobench_backends::sse::run_sse_hold_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.duration,
-                        tls_config.clone(),
-                        None,
-                        stop,
-                    ),
-                }
-            }
-            Protocol::Ws => {
-                // Sub-dispatch within WS.
-                let first_ws_step = plan
-                    .scenarios
-                    .first()
-                    .and_then(|s| s.steps.iter().find(|st| {
-                        !matches!(
-                            st,
-                            zerobench_core::plan::Step::Pause(_)
-                                | zerobench_core::plan::Step::PauseRandom { .. }
-                        )
-                    }));
-                match first_ws_step {
-                    Some(zerobench_core::plan::Step::WsHold(_)) => {
-                        zerobench_backends::ws::run_ws_hold_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.duration,
-                            tls_config.clone(),
-                            None,
-                            stop,
-                        )
-                    }
-                    Some(zerobench_core::plan::Step::WsServerPushRtt(_)) => {
-                        zerobench_backends::ws::run_ws_server_push_rtt_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.duration,
-                            tls_config.clone(),
-                            None,
-                            stop,
-                        )
-                    }
-                    Some(zerobench_core::plan::Step::WsFanout(_)) => {
-                        zerobench_backends::ws::run_ws_fanout_from_plan_threaded(
-                            &target,
-                            &opts,
-                            &plan,
-                            args.duration,
-                            tls_config.clone(),
-                            None,
-                            stop,
-                        )
-                    }
-                    _ => zerobench_backends::ws::run_ws_echo_rtt_from_plan_threaded(
-                        &target,
-                        &opts,
-                        &plan,
-                        args.duration,
-                        tls_config.clone(),
-                        None,
-                        stop,
-                    ),
-                }
-            }
+        let steady_ctx = zerobench_backends::RunCtx {
+            target: target.clone(),
+            opts: opts.clone(),
+            duration: args.duration,
+            num_threads: args.threads.max(1),
+            connections: args.connections,
+            target_rps: target_rate,
+            tls_config: tls_config.clone(),
+            live: None,
+            stop,
         };
+        let stats = zerobench_backends::run_plan(&plan, &steady_ctx);
 
         // Op count semantics per protocol:
         //   HTTP → stats.requests is req count
