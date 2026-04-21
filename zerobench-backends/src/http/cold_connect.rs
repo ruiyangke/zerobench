@@ -39,7 +39,8 @@ use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use crate::http::mio_tls::{MioStream, MioTlsStream};
 use crate::http::raw_h1_common::{
-    apply_extractions, build_raw_request, capture_headers, check_assertions, ConnectionMode,
+    apply_extractions, build_raw_request, capture_headers, check_assertions,
+    find_transfer_encoding_chunked, ChunkProgress, ChunkedDecoder, ConnectionMode,
 };
 
 const POLL_TOKEN: Token = Token(0);
@@ -496,6 +497,7 @@ fn do_one_op(
     let mut status: u16 = 0;
     let mut content_length: usize = 0;
     let mut have_content_length = false;
+    let mut chunked_decoder: Option<ChunkedDecoder> = None;
     let mut captured_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     let read_deadline = Instant::now() + opts.request_timeout;
@@ -530,12 +532,18 @@ fn do_one_op(
                         match resp.parse(&read_buf[..pos]) {
                             Ok(httparse::Status::Complete(_)) => {
                                 status = resp.code.unwrap_or(0);
-                                for h in resp.headers.iter() {
-                                    if h.name.eq_ignore_ascii_case("content-length") {
-                                        if let Ok(s) = std::str::from_utf8(h.value) {
-                                            if let Ok(n) = s.trim().parse::<usize>() {
-                                                content_length = n;
-                                                have_content_length = true;
+                                if find_transfer_encoding_chunked(resp.headers) {
+                                    // Transfer-Encoding: chunked overrides
+                                    // Content-Length per RFC 9112 §6.1.
+                                    chunked_decoder = Some(ChunkedDecoder::new());
+                                } else {
+                                    for h in resp.headers.iter() {
+                                        if h.name.eq_ignore_ascii_case("content-length") {
+                                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                                if let Ok(n) = s.trim().parse::<usize>() {
+                                                    content_length = n;
+                                                    have_content_length = true;
+                                                }
                                             }
                                         }
                                     }
@@ -554,7 +562,17 @@ fn do_one_op(
                 }
 
                 if let Some(hdr) = header_end {
-                    if have_content_length
+                    if let Some(ref mut dec) = chunked_decoder {
+                        match dec.advance(&read_buf[hdr..]) {
+                            ChunkProgress::Done { .. } => break,
+                            ChunkProgress::NeedMore => {}
+                            ChunkProgress::Err(msg) => {
+                                return Err(TransportError::Protocol(format!(
+                                    "chunked response: {msg}"
+                                )));
+                            }
+                        }
+                    } else if have_content_length
                         && read_buf.len() - hdr >= content_length
                     {
                         break;

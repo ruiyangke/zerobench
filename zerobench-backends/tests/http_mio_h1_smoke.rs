@@ -534,3 +534,117 @@ fn mio_h1_tls_with_self_signed_cert() {
         stats.bytes_recv,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chunked response keep-alive — Node's HTTP server default
+// ---------------------------------------------------------------------------
+
+/// Spawn a blocking server that replies with a `Transfer-Encoding: chunked`
+/// response per request and KEEPS THE CONNECTION ALIVE. Exercises the
+/// chunked decoder + keep-alive pipelining path.
+fn spawn_chunked_server(stop: Arc<AtomicBool>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Body "pong" split into two chunks ("po", "ng") so we exercise
+    // multi-chunk framing, then the 0-chunk terminator with an empty
+    // trailer block.
+    let response = b"HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: keep-alive\r\n\
+\r\n\
+2\r\npo\r\n2\r\nng\r\n0\r\n\r\n";
+
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let stop = stop.clone();
+                    let response = response.to_vec();
+                    std::thread::spawn(move || {
+                        stream.set_nodelay(true).ok();
+                        let mut buf = [0u8; 4096];
+                        let mut scratch = Vec::with_capacity(8192);
+                        while !stop.load(Ordering::Relaxed) {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    scratch.extend_from_slice(&buf[..n]);
+                                    // For every CRLFCRLF seen, flush one response.
+                                    while let Some(end) =
+                                        scratch.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        scratch.drain(..end + 4);
+                                        if stream.write_all(&response).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(ref e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    addr
+}
+
+#[test]
+fn mio_worker_pipelines_chunked_responses() {
+    // Pre-fix behavior: each connection would complete exactly one
+    // request, then get marked `ConnState::Dead`, and the stats
+    // would show `total = connections` (e.g. 4 for 4 conns). With
+    // chunked support we expect keep-alive pipelining to produce
+    // many more requests per connection.
+    let stop = Arc::new(AtomicBool::new(false));
+    let addr = spawn_chunked_server(stop.clone());
+
+    let (plan, target) = simple_plan(addr);
+
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let ws = worker_stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        ws.store(true, Ordering::Relaxed);
+    });
+
+    let topts = zerobench_core::transport::TransportOpts::default();
+    let stats = zerobench_backends::http::mio_h1::run_mio_worker(
+        &plan,
+        &target,
+        &topts,
+        4, // 4 connections
+        &worker_stop,
+        None,
+        None,
+        None,
+    );
+
+    stop.store(true, Ordering::Relaxed);
+
+    // 1 second × 4 conns × chunked response ≈ 1K+ requests minimum.
+    // If keep-alive broke, we'd see ≤4.
+    assert!(
+        stats.requests > 100,
+        "chunked responses must be keep-alive (got only {} — regression?)",
+        stats.requests
+    );
+    assert_eq!(stats.errors.read, 0, "no read errors expected");
+    assert_eq!(stats.errors.connect, 0, "no connect errors expected");
+}

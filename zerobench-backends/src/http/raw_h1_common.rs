@@ -231,6 +231,187 @@ pub(crate) fn find_content_length_raw(headers: &[httparse::Header<'_>]) -> Conte
     ContentLength::Missing
 }
 
+/// Return `true` iff the response carries `Transfer-Encoding: chunked`.
+///
+/// RFC 9112 §6.1 allows comma-separated TE values; we scan each
+/// comma-split token case-insensitively. `chunked` must be the
+/// final coding in the list (§7.1), and we treat any presence of
+/// the token as "chunked" because a non-final `chunked` is a
+/// server bug we can't recover from either way.
+pub(crate) fn find_transfer_encoding_chunked(headers: &[httparse::Header<'_>]) -> bool {
+    for h in headers {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            let Ok(s) = std::str::from_utf8(h.value) else {
+                continue;
+            };
+            for token in s.split(',') {
+                if token.trim().eq_ignore_ascii_case("chunked") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Chunked transfer-encoding decoder
+// ---------------------------------------------------------------------------
+
+/// Incremental parser for `Transfer-Encoding: chunked` response
+/// bodies. Fed a `&[u8]` that grows as new reads arrive; tracks
+/// its own position so each `advance` call resumes where the
+/// previous one stopped.
+///
+/// Wire format (RFC 9112 §7.1):
+/// ```text
+///   <hex-size>[;ext]\r\n
+///   <size bytes>\r\n
+///   ...
+///   0\r\n
+///   [<trailer-field>\r\n]*
+///   \r\n
+/// ```
+///
+/// The decoder does not retain body bytes — it only frames the
+/// response so callers know when the body is fully received and
+/// the connection can be reused for the next keep-alive request.
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkedDecoder {
+    state: ChunkState,
+    pos: usize,
+}
+
+#[derive(Debug, Clone)]
+enum ChunkState {
+    /// Looking for the next chunk's size line.
+    Size,
+    /// Reading `remaining` bytes of chunk data, then a trailing `\r\n`.
+    Data { remaining: usize },
+    /// Last chunk (size=0) was consumed; now scanning the trailer
+    /// block for the terminating blank line.
+    Trailers,
+}
+
+/// Outcome of a single `ChunkedDecoder::advance` call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChunkProgress {
+    /// More body bytes are needed before any further framing
+    /// progress is possible.
+    NeedMore,
+    /// The full chunked body has been consumed. `consumed` is
+    /// the total byte count within the body slice — add this
+    /// to the caller's body start offset to skip past the
+    /// chunked payload.
+    Done { consumed: usize },
+    /// The stream is malformed — chunk size not hex, data
+    /// chunk missing trailing CRLF, etc. The caller must drop
+    /// the connection; resynchronising is impossible.
+    Err(&'static str),
+}
+
+impl Default for ChunkedDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkedDecoder {
+    /// Fresh decoder, positioned at the start of a body.
+    pub(crate) fn new() -> Self {
+        Self {
+            state: ChunkState::Size,
+            pos: 0,
+        }
+    }
+
+    /// Attempt to consume as much of `body` as possible. `body`
+    /// must be the post-headers portion of the response buffer
+    /// (not the full wire buffer).
+    ///
+    /// On `NeedMore` the caller should read more bytes into the
+    /// buffer and call `advance` again with the (grown) slice;
+    /// internal state is preserved across calls. On `Done` the
+    /// caller can mark the connection keep-alive.
+    pub(crate) fn advance(&mut self, body: &[u8]) -> ChunkProgress {
+        loop {
+            match self.state {
+                ChunkState::Size => {
+                    let Some(rem) = body.get(self.pos..) else {
+                        return ChunkProgress::NeedMore;
+                    };
+                    let Some(line_end) = memchr::memmem::find(rem, b"\r\n") else {
+                        return ChunkProgress::NeedMore;
+                    };
+                    let line = &rem[..line_end];
+                    // Drop optional chunk extensions after ';'.
+                    let size_bytes = match line.iter().position(|&b| b == b';') {
+                        Some(i) => &line[..i],
+                        None => line,
+                    };
+                    let size = match parse_hex_size(size_bytes) {
+                        Some(n) => n,
+                        None => return ChunkProgress::Err("invalid chunk size"),
+                    };
+                    self.pos += line_end + 2;
+                    if size == 0 {
+                        self.state = ChunkState::Trailers;
+                    } else {
+                        self.state = ChunkState::Data { remaining: size };
+                    }
+                }
+                ChunkState::Data { remaining } => {
+                    let need_end = self.pos.saturating_add(remaining).saturating_add(2);
+                    if body.len() < need_end {
+                        return ChunkProgress::NeedMore;
+                    }
+                    if &body[self.pos + remaining..self.pos + remaining + 2] != b"\r\n" {
+                        return ChunkProgress::Err("chunk missing trailing CRLF");
+                    }
+                    self.pos = need_end;
+                    self.state = ChunkState::Size;
+                }
+                ChunkState::Trailers => {
+                    let Some(rem) = body.get(self.pos..) else {
+                        return ChunkProgress::NeedMore;
+                    };
+                    if rem.len() < 2 {
+                        return ChunkProgress::NeedMore;
+                    }
+                    // Empty trailer block — fast path.
+                    if rem.starts_with(b"\r\n") {
+                        self.pos += 2;
+                        return ChunkProgress::Done { consumed: self.pos };
+                    }
+                    // Non-empty trailers: scan for \r\n\r\n terminator.
+                    match memchr::memmem::find(rem, b"\r\n\r\n") {
+                        Some(p) => {
+                            self.pos += p + 4;
+                            return ChunkProgress::Done { consumed: self.pos };
+                        }
+                        None => return ChunkProgress::NeedMore,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse `bytes` as an ASCII hex integer, ignoring leading and
+/// trailing whitespace. Returns `None` on empty input, non-hex
+/// digits, or overflow beyond `usize::MAX`.
+fn parse_hex_size(bytes: &[u8]) -> Option<usize> {
+    // Trim ASCII whitespace in-place (no alloc).
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace())? + 1;
+    let slice = &bytes[start..end];
+    if slice.is_empty() {
+        return None;
+    }
+    let s = std::str::from_utf8(slice).ok()?;
+    usize::from_str_radix(s, 16).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Post-response assertions / extractions (shared across HTTP backends)
 // ---------------------------------------------------------------------------
@@ -510,5 +691,165 @@ mod tests {
         let wire = std::str::from_utf8(&out).unwrap();
         assert_eq!(wire.matches("Connection:").count(), 0);
         assert_eq!(wire.matches("connection:").count(), 1, "wire = {wire}");
+    }
+
+    // ---------- Transfer-Encoding: chunked detection ----------
+
+    #[test]
+    fn te_chunked_detected() {
+        let headers = [httparse::Header {
+            name: "Transfer-Encoding",
+            value: b"chunked",
+        }];
+        assert!(find_transfer_encoding_chunked(&headers));
+    }
+
+    #[test]
+    fn te_chunked_case_insensitive() {
+        let headers = [httparse::Header {
+            name: "transfer-encoding",
+            value: b"Chunked",
+        }];
+        assert!(find_transfer_encoding_chunked(&headers));
+    }
+
+    #[test]
+    fn te_chunked_in_list_detected() {
+        let headers = [httparse::Header {
+            name: "Transfer-Encoding",
+            value: b"gzip, chunked",
+        }];
+        assert!(find_transfer_encoding_chunked(&headers));
+    }
+
+    #[test]
+    fn te_missing_returns_false() {
+        let headers = [httparse::Header {
+            name: "Content-Length",
+            value: b"5",
+        }];
+        assert!(!find_transfer_encoding_chunked(&headers));
+    }
+
+    #[test]
+    fn te_not_chunked_returns_false() {
+        let headers = [httparse::Header {
+            name: "Transfer-Encoding",
+            value: b"gzip",
+        }];
+        assert!(!find_transfer_encoding_chunked(&headers));
+    }
+
+    // ---------- ChunkedDecoder ----------
+
+    fn advance_all(dec: &mut ChunkedDecoder, body: &[u8]) -> ChunkProgress {
+        dec.advance(body)
+    }
+
+    #[test]
+    fn chunked_single_chunk_empty_trailer() {
+        // "hello" (5 bytes) then terminating 0-chunk + empty trailer.
+        let body = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            advance_all(&mut dec, body),
+            ChunkProgress::Done {
+                consumed: body.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn chunked_multi_chunk() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            dec.advance(body),
+            ChunkProgress::Done { consumed: body.len() }
+        );
+    }
+
+    #[test]
+    fn chunked_with_extensions_ignored() {
+        let body = b"5;ext=foo\r\nhello\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            dec.advance(body),
+            ChunkProgress::Done { consumed: body.len() }
+        );
+    }
+
+    #[test]
+    fn chunked_with_trailers() {
+        let body = b"3\r\nfoo\r\n0\r\nX-Trailer: yes\r\nX-Other: 42\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            dec.advance(body),
+            ChunkProgress::Done { consumed: body.len() }
+        );
+    }
+
+    #[test]
+    fn chunked_large_hex_size() {
+        // 0x100 = 256 bytes.
+        let mut body: Vec<u8> = b"100\r\n".to_vec();
+        body.extend(std::iter::repeat(b'A').take(256));
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            dec.advance(&body),
+            ChunkProgress::Done { consumed: body.len() }
+        );
+    }
+
+    #[test]
+    fn chunked_incremental_delivery_resumes() {
+        let full = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        // Feed up to just the size of the first chunk.
+        assert_eq!(dec.advance(&full[..3]), ChunkProgress::NeedMore);
+        // Feed up to mid-first-chunk.
+        assert_eq!(dec.advance(&full[..7]), ChunkProgress::NeedMore);
+        // Feed up to after-first-chunk terminator, start of second size.
+        assert_eq!(dec.advance(&full[..13]), ChunkProgress::NeedMore);
+        // Feed to end.
+        assert_eq!(
+            dec.advance(full),
+            ChunkProgress::Done { consumed: full.len() }
+        );
+    }
+
+    #[test]
+    fn chunked_invalid_hex_size_errors() {
+        let body = b"xyz\r\ndata\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(dec.advance(body), ChunkProgress::Err("invalid chunk size"));
+    }
+
+    #[test]
+    fn chunked_missing_trailing_crlf_errors() {
+        // 5-byte data chunk followed by wrong terminator.
+        let body = b"5\r\nhelloXX0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(
+            dec.advance(body),
+            ChunkProgress::Err("chunk missing trailing CRLF")
+        );
+    }
+
+    #[test]
+    fn chunked_empty_size_line_need_more() {
+        // Only got a partial size line — decoder must wait.
+        let body = b"5";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(dec.advance(body), ChunkProgress::NeedMore);
+    }
+
+    #[test]
+    fn chunked_zero_only_need_more_trailer() {
+        // `0\r\n` arrived but trailer `\r\n` not yet.
+        let body = b"0\r\n";
+        let mut dec = ChunkedDecoder::new();
+        assert_eq!(dec.advance(body), ChunkProgress::NeedMore);
     }
 }

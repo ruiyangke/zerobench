@@ -76,7 +76,8 @@ use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 
 use super::mio_tls::{MioStream, MioTlsStream};
 use super::raw_h1_common::{
-    build_raw_request, find_connection_close, find_content_length_raw, ConnectionMode,
+    build_raw_request, find_connection_close, find_content_length_raw,
+    find_transfer_encoding_chunked, ChunkProgress, ChunkedDecoder, ConnectionMode,
     ContentLength,
 };
 
@@ -265,6 +266,13 @@ enum ConnState {
         header_len: usize,
         content_length: usize,
     },
+    /// Reading a `Transfer-Encoding: chunked` body. The decoder
+    /// tracks chunk framing across multiple reads; `header_len` is
+    /// the offset in `read_buf` where the body begins.
+    ReadingChunkedBody {
+        header_len: usize,
+        decoder: ChunkedDecoder,
+    },
     /// Connection is dead — skip this slot for the rest of the run.
     Dead,
 }
@@ -390,6 +398,24 @@ impl Conn {
                 }
                 Ok(None)
             }
+            ConnState::ReadingChunkedBody { header_len, ref mut decoder } => {
+                let body = &self.read_buf[header_len..];
+                match decoder.advance(body) {
+                    ChunkProgress::NeedMore => Ok(None),
+                    ChunkProgress::Done { .. } => {
+                        let total = now.duration_since(self.t0);
+                        self.state = ConnState::Idle;
+                        Ok(Some((self.status, self.ttfb, total)))
+                    }
+                    ChunkProgress::Err(msg) => {
+                        self.state = ConnState::Dead;
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("chunked response: {msg}"),
+                        ))
+                    }
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -414,18 +440,66 @@ impl Conn {
         match resp.parse(&buf[..header_end]) {
             Ok(httparse::Status::Complete(hdr_len)) => {
                 let status = resp.code.unwrap_or(0);
-                let content_length = match find_content_length_raw(resp.headers) {
+                let is_chunked = find_transfer_encoding_chunked(resp.headers);
+                // Content-Length is ignored when Transfer-Encoding: chunked
+                // is present per RFC 9112 §6.1 (TE overrides CL).
+                let cl = find_content_length_raw(resp.headers);
+                let ttfb = now.duration_since(self.t0);
+                let keep_alive = !find_connection_close(resp.headers);
+
+                // Capture response headers for extraction (skip in static fast path).
+                if !self.skip_header_capture {
+                    self.extracted_headers.clear();
+                    for h in resp.headers.iter() {
+                        if h.name.is_empty() {
+                            break;
+                        }
+                        let name_lower: Vec<u8> =
+                            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
+                        self.extracted_headers
+                            .push((name_lower, h.value.to_vec()));
+                    }
+                }
+
+                if is_chunked {
+                    // Chunked body — run the decoder immediately in case
+                    // the whole body already arrived in this read.
+                    let mut decoder = ChunkedDecoder::new();
+                    match decoder.advance(&buf[hdr_len..]) {
+                        ChunkProgress::Done { .. } => {
+                            let total = now.duration_since(self.t0);
+                            if keep_alive {
+                                self.state = ConnState::Idle;
+                            } else {
+                                self.state = ConnState::Dead;
+                            }
+                            return Ok(Some((status, ttfb, total)));
+                        }
+                        ChunkProgress::NeedMore => {
+                            self.ttfb = ttfb;
+                            self.status = status;
+                            self.state = ConnState::ReadingChunkedBody {
+                                header_len: hdr_len,
+                                decoder,
+                            };
+                            return Ok(None);
+                        }
+                        ChunkProgress::Err(msg) => {
+                            self.state = ConnState::Dead;
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("chunked response: {msg}"),
+                            ));
+                        }
+                    }
+                }
+
+                let content_length = match cl {
                     ContentLength::Present(n) => n,
                     ContentLength::Missing => {
-                        // No CL. For keep-alive semantics we don't
-                        // support Transfer-Encoding: chunked on the
-                        // response path, and a missing CL on a
-                        // keep-alive connection is ambiguous about
-                        // body length. Conservatively treat as 0 and
-                        // drop the connection after: this matches
-                        // RFC 9110 §8.6 "close-delimited" fallback
-                        // without letting us mis-frame the next
-                        // response on an open pool slot.
+                        // No CL, no chunked. RFC 9110 §8.6 "close-delimited"
+                        // fallback: body ends at EOF, so we must not reuse
+                        // this connection even if keep-alive was claimed.
                         self.state = ConnState::Dead;
                         0
                     }
@@ -443,22 +517,6 @@ impl Conn {
                         ));
                     }
                 };
-                let ttfb = now.duration_since(self.t0);
-                let keep_alive = !find_connection_close(resp.headers);
-
-                // Capture response headers for extraction (skip in static fast path).
-                if !self.skip_header_capture {
-                    self.extracted_headers.clear();
-                    for h in resp.headers.iter() {
-                        if h.name.is_empty() {
-                            break;
-                        }
-                        let name_lower: Vec<u8> =
-                            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
-                        self.extracted_headers
-                            .push((name_lower, h.value.to_vec()));
-                    }
-                }
 
                 let body_received = buf.len() - hdr_len;
                 if body_received >= content_length {
@@ -834,7 +892,9 @@ pub fn run_mio_worker(
             if event.is_readable()
                 && matches!(
                     conn.state,
-                    ConnState::ReadingHeaders | ConnState::ReadingBody { .. }
+                    ConnState::ReadingHeaders
+                        | ConnState::ReadingBody { .. }
+                        | ConnState::ReadingChunkedBody { .. }
                 )
             {
                 match conn.try_read(batch_now) {
