@@ -57,7 +57,7 @@ impl<'a> Recorder<'a> {
 
     /// Record one completed op — writes TaskStats (if present) and
     /// both LiveSnapshot slots (aggregate + per-scenario).
-    #[inline]
+    #[inline(always)]
     pub fn record(&mut self, sid: u16, sample: Sample) {
         if let Some(ts) = self.task_stats.as_deref_mut() {
             ts.record(
@@ -78,7 +78,7 @@ impl<'a> Recorder<'a> {
     /// Like `record` but takes a pre-computed nanosecond latency. Used
     /// by WS/SSE where the histogram ns is already computed (to avoid
     /// `Duration`→ns round-trip drift on very small values).
-    #[inline]
+    #[inline(always)]
     pub fn record_ns(&mut self, sid: u16, latency_ns: u64, bytes_sent: u64, bytes_recv: u64) {
         if let Some(ts) = self.task_stats.as_deref_mut() {
             ts.record(
@@ -97,7 +97,7 @@ impl<'a> Recorder<'a> {
 
     /// Record one error — writes TaskStats.record_error (if present)
     /// plus both LiveSnapshot error counters.
-    #[inline]
+    #[inline(always)]
     pub fn record_error(&mut self, sid: u16, kind: ErrorKind) {
         if let Some(ts) = self.task_stats.as_deref_mut() {
             ts.record_error(sid, kind);
