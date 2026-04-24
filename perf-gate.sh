@@ -33,7 +33,7 @@ fi
 
 if [[ ! -x "$STUB" || ! -x "$BENCH" ]]; then
     echo "Building release binaries..." >&2
-    cargo build --release --features mio-h1,mio-h2,sse,ws,tui >&2
+    cargo build --release --features full >&2
     cargo build --release -p zerobench-stub >&2
 fi
 

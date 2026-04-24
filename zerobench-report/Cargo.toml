@@ -1,12 +1,16 @@
 [package]
 name = "zerobench-report"
-description = "Presentation and statistical comparison layer for zerobench"
+description = "Reporters (terminal / JSON / Prometheus) and statistical compare (bootstrap CI / AD / KS) for zerobench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "statistics", "bootstrap", "report", "regression"]
+categories = ["development-tools::profiling", "science"]
 
 [dependencies]
 zerobench-core = { workspace = true }

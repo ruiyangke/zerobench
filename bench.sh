@@ -13,7 +13,7 @@ RUNS=5
 NUMA="nix run nixpkgs#numactl --"
 
 echo "=== Building release ==="
-cargo build --release --features mio-h1,mio-h2,sse,ws,tui 2>&1 | tail -1
+cargo build --release --features full 2>&1 | tail -1
 cargo build --release -p zerobench-stub 2>&1 | tail -1
 
 echo ""

@@ -1,7 +1,7 @@
 ---
-status: draft
-version: v0.1.0-direction
-supersedes: docs/design.md (v0.0.1 architecture)
+status: stable
+version: v0.1.0
+supersedes: docs/_internal/design.md (v0.0.1 architecture, archived)
 date: 2026-04-18
 ---
 
@@ -18,17 +18,14 @@ date: 2026-04-18
 ## 0. Status and scope
 
 This document is the philosophical spec for v0.1.0. It supersedes the
-goals/non-goals of `docs/design.md`. The v0.0.1 architecture
-(two-phase Plan/execute, mio engine, Rhai DSL, HDR histograms) is
-retained. What changes is what we *ask the tool to do* and how we
-*judge success*.
+goals/non-goals of the pre-0.1.0 design (archived at
+`_internal/design.md`). The pre-0.1.0 architecture (two-phase
+Plan/execute, mio engine, Rhai DSL, HDR histograms) is retained; what
+changes is what we *ask the tool to do* and how we *judge success*.
 
-This is the upstream doc. A follow-up `design-v0.1.0.md` will
-translate each principle into type/API/module changes; that
-file is scheduled to be drafted post-review of this philosophy
-doc. Until then, type-level specifics should be inferred from
-the existing `design.md` (v0.0.1) plus the delta this philosophy
-sets.
+This is the upstream doc. The companion type-level spec is
+`design-v0.1.0.md`; for historical context (pre-0.1.0) see
+`_internal/design.md`.
 
 Reference prior art influencing this design: wrk2 (constant-throughput
 CO-free), HdrHistogram (HDR logs + percentile distributions), Gatling

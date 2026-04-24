@@ -1,12 +1,16 @@
 [package]
 name = "zerobench-runtime"
-description = "Runtime infrastructure for zerobench — LiveSnapshot, archive, calibrate, fingerprint, tls, rng, stop, json_scan"
+description = "Runtime infrastructure for zerobench — LiveSnapshot, archive, calibrate, fingerprint, TLS, recorder, runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "http", "load-testing", "hdr", "archive"]
+categories = ["development-tools::profiling"]
 
 [dependencies]
 zerobench-core = { workspace = true }

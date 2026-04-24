@@ -1,8 +1,17 @@
 ---
-status: draft
-version: v0.1.0-design
+status: stable
+version: v0.1.0
 upstream: docs/PHILOSOPHY.md
 date: 2026-04-19
+note: |
+    This document describes the *type-level* design of v0.1.0. The crate
+    layout it sketched (zerobench-http / zerobench-sse / zerobench-ws /
+    zerobench-rhai) was collapsed during the Phase 1-5 rewrite into the
+    published layout: zerobench-backends (http + sse + ws merged) and
+    zerobench-dsl (rhai renamed). The per-protocol "### 3.1 HTTP backend
+    (`zerobench-http`)" section headings below refer to *submodules* of
+    zerobench-backends, not crates. The rest of the design — Plan, Step,
+    Scenario, stats, archive, fingerprints, calibrate — is faithful.
 ---
 
 # zerobench v0.1.0 — Design

@@ -19,15 +19,8 @@ pub fn num_cpus() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// `--version` long form — features + build profile baked in at compile time.
+// `--version` long form — build profile baked in at compile time.
 // ---------------------------------------------------------------------------
-
-// Per-feature suffixes. h2/sse/ws/script are always-on now (no feature
-// flags). `tui` stays optional for Phase 5 reasons.
-const FEAT_H2: &str = ", h2";
-const FEAT_SSE: &str = ", sse";
-const FEAT_WS: &str = ", ws";
-const FEAT_SCRIPT: &str = ", script";
 
 #[cfg(feature = "tui")]
 const FEAT_TUI: &str = ", tui";
@@ -42,20 +35,20 @@ const BUILD_PROFILE: &str = "release";
 /// Compose the long version string at first call and leak into a
 /// `&'static str` clap can own. We can't `concat!` across non-literal
 /// `const` references, so we build it at startup instead. The leak is
-/// a tiny one-time allocation (~60 bytes) for the lifetime of the
-/// process, which is acceptable for a CLI tool.
+/// a tiny one-time allocation for the lifetime of the process, which
+/// is acceptable for a CLI tool.
+///
+/// HTTP/1, HTTP/2, SSE, and WebSocket are always-on — they don't appear
+/// in the feature list because there's no way to build `zerobench`
+/// without them.
 pub fn long_version() -> &'static str {
     use std::sync::OnceLock;
     static S: OnceLock<&'static str> = OnceLock::new();
     S.get_or_init(|| {
         let s = format!(
-            "{ver}\nFeatures: h1{h2}{sse}{ws}{tui}{script}\nBuild: {prof}, mio/epoll",
+            "{ver}\nProtocols: http/1, http/2, sse, websocket\nFeatures: default{tui}\nBuild: {prof}, mio/epoll",
             ver = env!("CARGO_PKG_VERSION"),
-            h2 = FEAT_H2,
-            sse = FEAT_SSE,
-            ws = FEAT_WS,
             tui = FEAT_TUI,
-            script = FEAT_SCRIPT,
             prof = BUILD_PROFILE,
         );
         Box::leak(s.into_boxed_str())
@@ -1162,10 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn long_version_lists_default_features() {
+    fn long_version_lists_protocols_and_features() {
         let s = long_version();
         assert!(s.starts_with(env!("CARGO_PKG_VERSION")));
-        assert!(s.contains("Features: h1"));
+        assert!(s.contains("Protocols: http/1, http/2, sse, websocket"));
+        assert!(s.contains("Features: default"));
         assert!(s.contains("mio/epoll"));
     }
 }

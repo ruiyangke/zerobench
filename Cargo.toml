@@ -12,21 +12,22 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/zeroship-dev/zerobench"
+homepage = "https://github.com/zeroship-dev/zerobench"
 authors = ["Ruiyang Ke"]
 
 [workspace.dependencies]
 # Local crates
-zerobench-core = { path = "zerobench-core", version = "0.0.1", default-features = false }
-zerobench-runtime = { path = "zerobench-runtime", version = "0.0.1" }
-zerobench-report = { path = "zerobench-report", version = "0.0.1" }
-zerobench-backends = { path = "zerobench-backends", version = "0.0.1" }
-zerobench-dsl = { path = "zerobench-dsl", version = "0.0.1" }
-zerobench-tui  = { path = "zerobench-tui",  version = "0.0.1" }
+zerobench-core = { path = "zerobench-core", version = "0.1.0", default-features = false }
+zerobench-runtime = { path = "zerobench-runtime", version = "0.1.0" }
+zerobench-report = { path = "zerobench-report", version = "0.1.0" }
+zerobench-backends = { path = "zerobench-backends", version = "0.1.0" }
+zerobench-dsl = { path = "zerobench-dsl", version = "0.1.0" }
+zerobench-tui  = { path = "zerobench-tui",  version = "0.1.0" }
 
 # Stub server deps (test infrastructure only)
 compio = { version = "0.18", features = ["io", "net", "runtime", "macros", "time", "tls"] }

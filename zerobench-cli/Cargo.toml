@@ -1,12 +1,16 @@
 [package]
 name = "zerobench"
-description = "Fast, correct, modern HTTP benchmarking tool — mio/epoll, zero async"
+description = "Fast, correct benchmarking for HTTP, SSE, and WebSocket — open-loop, HDR-precise, mio/epoll"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "http", "websocket", "load-testing", "cli"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 
 [[bin]]
 name = "zerobench"

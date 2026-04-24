@@ -1,12 +1,16 @@
 [package]
 name = "zerobench-core"
-description = "Core plan model, stats, templates, and reporter for zerobench"
+description = "Plan / Scenario / Step type vocabulary for zerobench — HDR stats, templates, variables, histogram"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "http", "load-testing", "hdr", "latency"]
+categories = ["development-tools::profiling", "command-line-utilities"]
 
 [dependencies]
 bytes = { workspace = true }

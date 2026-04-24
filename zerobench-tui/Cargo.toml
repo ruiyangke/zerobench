@@ -1,12 +1,16 @@
 [package]
 name = "zerobench-tui"
-description = "Live terminal dashboard for zerobench"
+description = "Live terminal dashboard for zerobench — ratatui-based, 10 Hz redraw"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "tui", "ratatui", "dashboard", "monitoring"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }

@@ -1,12 +1,16 @@
 [package]
 name = "zerobench-backends"
-description = "Every protocol backend for zerobench (HTTP/1, HTTP/2, SSE, WebSocket) — mio/epoll, zero async"
+description = "Protocol backends for zerobench: HTTP/1, HTTP/2, SSE, WebSocket — mio/epoll, zero async"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+readme = "../README.md"
+keywords = ["benchmark", "http", "websocket", "sse", "mio"]
+categories = ["development-tools::profiling", "network-programming"]
 
 [dependencies]
 zerobench-core = { workspace = true, default-features = false }
