@@ -12,11 +12,12 @@ env:
 
 jobs:
   check:
-    name: check + test (${{ matrix.features }})
-    runs-on: ubuntu-latest
+    name: check + test (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         features:
           - ""                      # default features
           - "--no-default-features"
@@ -27,6 +28,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace ${{ matrix.features }}
       - run: cargo test  --workspace ${{ matrix.features }}
+
+  msrv:
+    name: check MSRV (1.80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
 
   fmt:
     runs-on: ubuntu-latest
@@ -44,3 +54,14 @@ jobs:
         with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-features -- -D warnings
+
+  docs:
+    name: docs (warning-free)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features

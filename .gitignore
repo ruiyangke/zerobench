@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 **/*.rs.bk
 .DS_Store
 *.swp
@@ -7,3 +6,7 @@
 .vscode/
 *.profraw
 /tmp/
+
+# Cargo.lock is intentionally *tracked* — this repo ships the `zerobench`
+# binary and reproducible builds matter. Library-only crates should gitignore
+# Cargo.lock; this one shouldn't.

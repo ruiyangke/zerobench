@@ -61,7 +61,7 @@ rhai = { version = "1.19", features = ["sync"] }
 
 # TUI
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Concurrency
 parking_lot = "0.12"

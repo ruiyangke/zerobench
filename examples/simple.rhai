@@ -3,7 +3,7 @@
 // Run with:
 //   zerobench run examples/simple.rhai
 //
-// The zerobench-rhai loader compiles this script once, drops the Rhai
+// The zerobench-dsl loader compiles this script once, drops the Rhai
 // engine, and hands a pure-Rust Plan to the benchmark runner.
 
 scenario("events", |s| {

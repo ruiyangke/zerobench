@@ -36,6 +36,11 @@ cargo install zerobench --features full
 HTTP/1, HTTP/2, SSE, and WebSocket are always-on — they're not
 feature-gated. Only `tui` (the ratatui dashboard) is optional.
 
+**Platforms**: Linux and macOS. MSRV: Rust 1.80. Windows is not
+supported; the runtime uses epoll (Linux) / kqueue (macOS) directly
+via `mio`, and the machine-fingerprint collector reads `/proc`
+(Linux) or `sysctl` (macOS).
+
 ## Six verbs
 
 Each verb answers one question. No overlap.
