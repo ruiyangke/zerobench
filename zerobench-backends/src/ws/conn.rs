@@ -46,7 +46,7 @@ use crate::ws::handshake::{self, find_headers_end, HandshakeError};
 
 /// The high-level error type the connection layer surfaces.
 ///
-/// Lifted to the benchmark loop; it chooses which [`WsStats`] counter
+/// Lifted to the benchmark loop; it chooses which `WsStats` counter
 /// to bump for each variant. See `classify_error` in the ws backend.
 #[derive(Debug, thiserror::Error)]
 pub enum WsError {
@@ -357,7 +357,7 @@ impl WsConnection {
         }
     }
 
-    /// Like [`recv`] but returns `Ok(None)` once `timeout` elapses with
+    /// Like [`Self::recv`] but returns `Ok(None)` once `timeout` elapses with
     /// no data frame arriving. Control frames (Ping/Pong/Close) are
     /// still handled transparently, so this also keeps auto-Pong alive
     /// for callers that need bounded waits (e.g. `WsHold` between

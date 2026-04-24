@@ -7,9 +7,10 @@
 //!
 //! # Color
 //!
-//! [`ColorChoice::Auto`] consults [`IsTerminal`] on the sink (so output
-//! piped to a file stays clean) and honours the `NO_COLOR` env var per
-//! <https://no-color.org/>. `Always` / `Never` are self-explanatory.
+//! [`ColorChoice::Auto`] consults [`std::io::IsTerminal`] on the sink
+//! (so output piped to a file stays clean) and honours the `NO_COLOR`
+//! env var per <https://no-color.org/>. `Always` / `Never` are
+//! self-explanatory.
 //!
 //! # Duration formatting
 //!
@@ -41,7 +42,7 @@ use zerobench_runtime::live_snapshot::LiveTick;
 // ---------------------------------------------------------------------------
 
 /// Caller's preference for ANSI color. Mirrors clap's built-in
-/// [`clap::ColorChoice`] values so we can map cleanly from a CLI flag.
+/// `clap::ColorChoice` values so we can map cleanly from a CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorChoice {
     /// Always emit color codes regardless of terminal detection.
@@ -792,7 +793,7 @@ fn ws_latency_from_scenarios(summary: &Summary) -> (&'static str, u64, u64, u64,
 
 /// Return a borrowed reference to the histogram that carries the
 /// PRIMARY latency signal for this plan — the same slot the terminal
-/// report renders via [`pick_latency_source`], but as a histogram the
+/// report renders via `pick_latency_source`, but as a histogram the
 /// caller can feed into `write_histlog`.
 ///
 /// HTTP: `summary.latency`. SSE: `broadcast_rtt` if any scenario

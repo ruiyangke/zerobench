@@ -2,10 +2,10 @@
 //!
 //! # Compilation
 //!
-//! [`Template::compile`] scans the source once, producing a [`Vec<Part>`].
+//! [`Template::compile`] scans the source once, producing a `Vec<Part>`.
 //! Each `{{...}}` expression is looked up in the template vocabulary (see
 //! module docs in [`crate`]); literal bytes between expressions collapse
-//! into [`Part::Literal`].
+//! into `Part::Literal`.
 //!
 //! # Escape rules
 //!
@@ -244,7 +244,7 @@ pub(crate) enum Part {
     Line(LineSource),
 }
 
-/// Shared backing for [`Part::Line`]. Lines are loaded once at compile
+/// Shared backing for `Part::Line`. Lines are loaded once at compile
 /// time; the cursor atomically round-robins across all expansions.
 #[derive(Debug, Clone)]
 pub struct LineSource {

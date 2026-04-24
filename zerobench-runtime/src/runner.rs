@@ -220,7 +220,7 @@ impl RunHarness {
         }
     }
 
-    /// Materialise a per-window [`RunCtx`]-shaped value as a tuple of
+    /// Materialise a per-window `RunCtx`-shaped value as a tuple of
     /// fields the verb can hand to `zerobench_backends::RunCtx { ... }`.
     ///
     /// Returning a tuple instead of a typed struct keeps the runtime

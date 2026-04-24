@@ -35,8 +35,9 @@ pub enum ScriptError {
     Eval(String),
 
     /// A templated string (URL / header / body) failed to compile against
-    /// the shared [`VarRegistry`]. Surfaces which scenario + which field
-    /// the string came from so the user doesn't have to hunt.
+    /// the shared [`zerobench_core::var::VarRegistry`]. Surfaces which
+    /// scenario + which field the string came from so the user doesn't
+    /// have to hunt.
     #[error("template error in scenario {scenario:?}, {field}: {error}")]
     Template {
         /// Name of the scenario whose RequestBuilder held the bad string.

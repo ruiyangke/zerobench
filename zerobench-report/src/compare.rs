@@ -28,7 +28,7 @@
 //! The bootstrap PRNG is seeded from the plan + run_id pair so two
 //! invocations of `compare` against the same archived artefacts
 //! produce byte-identical output. Seed flows through
-//! [`BootstrapOptions::seed`] (defaults to a hash of the two
+//! [`CompareOptions::seed`] (defaults to a hash of the two
 //! run_ids).
 
 use hdrhistogram::Histogram;

@@ -359,7 +359,7 @@ fn write_hex16(v: u64, out: &mut Vec<u8>) {
 /// Drive `WsEchoRtt` scenarios from a multi-protocol Plan.
 ///
 /// For each `Step::WsEchoRtt` scenario, spawns `connections` worker
-/// threads, each running [`run_one_echo_rtt`] for the minimum of
+/// threads, each running `run_one_echo_rtt` for the minimum of
 /// `hold_for` (from the plan) and `duration` (from the caller).
 ///
 /// Returns a `Vec<TaskStats>`, one per scenario.

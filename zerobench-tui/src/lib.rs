@@ -22,8 +22,8 @@
 //!
 //! - A 10 Hz render tick — redraws the ratatui terminal.
 //! - A 1 Hz snapshot tick — swaps the `LiveSnapshot` bucket and
-//!   ingests the resulting [`LiveTick`] into state.
-//! - Non-blocking keyboard polling — see [`handle_key`].
+//!   ingests the resulting [`zerobench_runtime::LiveTick`] into state.
+//! - Non-blocking keyboard polling — see `handle_key`.
 //!
 //! Coalescing everything into one loop (rather than spawning
 //! independent tasks) keeps the `DashboardState` owned by a single

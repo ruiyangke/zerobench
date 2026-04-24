@@ -238,8 +238,9 @@ pub struct TickRecord {
 }
 
 /// Per-scenario counters for one tick window — the TUI-facing
-/// projection of [`ScenarioTick`]. Percentiles are pre-computed to
-/// avoid histogram queries on the render path.
+/// projection of [`zerobench_runtime::live_snapshot::ScenarioTick`].
+/// Percentiles are pre-computed to avoid histogram queries on the
+/// render path.
 #[derive(Debug, Clone)]
 pub struct ScenarioTickRecord {
     pub requests: u64,
@@ -376,7 +377,7 @@ pub struct DashboardState {
     pub marker: Marker,
 
     /// Bounded ring of log events shown in the log pane. Capped at
-    /// [`MAX_LOG_ENTRIES`]. Currently no events are emitted; the
+    /// `MAX_LOG_ENTRIES`. Currently no events are emitted; the
     /// structure is scaffolded for wiring.
     pub log_entries: VecDeque<LogEntry>,
     /// Scroll offset for the log pane's `List` widget.

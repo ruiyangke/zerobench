@@ -1,7 +1,8 @@
 //! Command-line argument parsing via `clap` derive.
 //!
 //! Parsing produces a [`CliArgs`]; the conversion to a runnable
-//! [`Plan`] / [`Target`] / [`TransportOpts`] triple lives in
+//! [`zerobench_core::plan::Plan`] / [`zerobench_core::transport::Target`] /
+//! [`zerobench_core::transport::TransportOpts`] triple lives in
 //! [`crate::plan_from_cli`] so this file stays a thin, declarative
 //! schema.
 

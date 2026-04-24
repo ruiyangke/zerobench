@@ -32,7 +32,7 @@
 //! # TLS support
 //!
 //! When the target is `https://`, connections are wrapped in a
-//! [`MioTlsStream`](super::mio_tls::MioTlsStream) backed by `rustls`.
+//! [`MioTlsStream`] backed by `rustls`.
 //! The TLS handshake is driven to completion via mio poll events before
 //! the request loop starts. The `--insecure` flag disables certificate
 //! verification (self-signed, expired, hostname mismatch).

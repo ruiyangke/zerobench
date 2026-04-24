@@ -506,7 +506,8 @@ fn write_report<W: Write>(
 /// transport(s), dispatch the run, and render the report.
 ///
 /// The Rhai engine lives only inside `load_script` — this function sees
-/// a pure Rust [`Plan`] and never pulls in the interpreter again. CLI
+/// a pure Rust [`zerobench_core::plan::Plan`] and never pulls in the
+/// interpreter again. CLI
 /// overrides (`--duration`, `--rate`) mutate the Plan in-place after
 /// load; `--connections` / TLS / timeouts shape the transport opts.
 ///

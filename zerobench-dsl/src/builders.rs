@@ -7,10 +7,10 @@
 //! # Shared-state pattern
 //!
 //! Rhai's `Dynamic` needs types to be `Clone`, and with the `sync` feature
-//! also `Send + Sync`. Every builder here is an [`Arc`]`<`[`Mutex`]`<State>>`
+//! also `Send + Sync`. Every builder here is an [`std::sync::Arc`]`<`[`std::sync::Mutex`]`<State>>`
 //! newtype — cloning the builder clones the `Arc`, so method chains like
 //! `.header("a", "b").json(...)` all mutate the same underlying state.
-//! The [`define_builder!`] macro collapses this pattern: each invocation
+//! The `define_builder!` macro collapses this pattern: each invocation
 //! produces the wrapper struct, an `Arc<Mutex<..>>`-backed `Default` impl,
 //! and the `modify`/`with_state`/`take_state` helper surface.
 //!
@@ -27,7 +27,7 @@
 //! finalized, and then the engine is dropped. The resulting [`Plan`] is
 //! a pure Rust data structure — no Rhai traces remain.
 //!
-//! Per-protocol construction in [`compile_step`] delegates to the shared
+//! Per-protocol construction in `compile_step` delegates to the shared
 //! typed constructors in `zerobench_core::plan_builder`. Adding a field
 //! to a `*Plan` struct happens in one place there; the CLI's
 //! `plan_from_cli.rs` / `verbs/*` and this DSL both feed the same
@@ -225,7 +225,7 @@ macro_rules! register_setter_fn {
 // ---------------------------------------------------------------------------
 
 define_builder! {
-    /// Shared-state wrapper around [`PlanBuilderState`]. The public handle
+    /// Shared-state wrapper around `PlanBuilderState`. The public handle
     /// Rhai scripts interact with via the `scenario`, `rate`, `duration`,
     /// `warmup`, `transport`, `saturate`, `env`, and `var` top-level
     /// functions.
@@ -280,8 +280,9 @@ impl PlanBuilder {
 
     /// Peek at the raw URL source of the first wire-step (Request, SSE,
     /// or WS) in the first scenario — used by the CLI to derive a
-    /// connection [`Target`] before the plan is finalized. Returns
-    /// `None` if no scenarios have wire steps (all pauses, or empty).
+    /// connection [`zerobench_core::transport::Target`] before the plan
+    /// is finalized. Returns `None` if no scenarios have wire steps
+    /// (all pauses, or empty).
     ///
     /// `{{...}}` templates in the URL are returned verbatim: the caller
     /// must either strip them (cheap case: user wrote a literal URL with

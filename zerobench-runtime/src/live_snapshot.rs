@@ -11,7 +11,7 @@
 //!
 //! # Design: sharded HDR histograms
 //!
-//! The latency histogram is sharded across [`LATENCY_SHARDS`] mutexes
+//! The latency histogram is sharded across `LATENCY_SHARDS` mutexes
 //! keyed by a per-thread hash. A single-mutex design was serialising
 //! every worker at ~1M req/s; each thread sticking to its own shard
 //! reduces expected contention to `1/SHARDS` of what a round-robin or

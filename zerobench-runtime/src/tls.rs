@@ -17,7 +17,7 @@
 //!
 //! # Insecure mode
 //!
-//! `TransportOpts::insecure_tls = true` swaps in [`InsecureVerifier`],
+//! `TransportOpts::insecure_tls = true` swaps in `InsecureVerifier`,
 //! which accepts **any** certificate chain, hostname, and signature.
 //! This matches the semantics of `curl -k` / `wget --no-check-certificate`
 //! and is the usual ask for benchmarking against self-signed internal
@@ -37,7 +37,7 @@
 //! | SSE (typically HTTP/1.1)  | `&[]` or `[b"http/1.1"]`  |
 //!
 //! An empty ALPN list means "don't advertise any protocol"; rustls will
-//! then leave [`rustls::ClientConnection::alpn_protocol`] as `None`, and
+//! then leave `rustls::ClientConnection::alpn_protocol` as `None`, and
 //! the server's ALPN extension is ignored.
 
 use std::sync::Arc;

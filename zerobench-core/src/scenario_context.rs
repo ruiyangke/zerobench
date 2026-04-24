@@ -9,8 +9,8 @@
 //! - A per-worker monotonic counter consumed by `{{counter}}`.
 //!
 //! The context is borrowed by the dispatcher from the worker task for the
-//! duration of each iteration, passed by `&mut` into
-//! [`crate::transport::Transport::exchange`], and reused across iterations
+//! duration of each iteration, passed by `&mut` into each backend's
+//! `exchange` / `run_one_*` entry point, and reused across iterations
 //! via [`ScenarioContext::clear_all`] so no per-iteration allocation is
 //! needed beyond the extracted values themselves.
 //!

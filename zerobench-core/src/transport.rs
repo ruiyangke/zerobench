@@ -44,7 +44,7 @@ pub enum AddrFamily {
 /// Constructed from a URL-ish string via [`Target::parse`], or built
 /// directly by front-ends that already have the parts (Rhai scripts,
 /// request-file parser). The URL's path / query / fragment are *not*
-/// part of the target — those belong on [`RequestPlan::url`].
+/// part of the target — those belong on [`crate::plan::RequestPlan::url`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// Server hostname or IP literal (no surrounding brackets on IPv6).
@@ -75,7 +75,7 @@ impl Target {
     /// - `https://host:port/path?query`     — path/query ignored
     ///
     /// The path, query, and fragment are deliberately discarded — those
-    /// belong on the [`RequestPlan`], not on the connection target.
+    /// belong on the [`crate::plan::RequestPlan`], not on the connection target.
     pub fn parse(url: &str) -> Result<Self, TargetError> {
         // Scheme.
         let (scheme, rest) = url
@@ -181,7 +181,7 @@ impl Target {
     /// 2. Otherwise the system resolver is consulted and the first
     ///    address matching `self.addr_family` is returned.
     ///
-    /// Returns [`io::ErrorKind::NotFound`] / [`io::ErrorKind::AddrNotAvailable`]
+    /// Returns [`std::io::ErrorKind::NotFound`] / [`std::io::ErrorKind::AddrNotAvailable`]
     /// when no address matches the request — callers map this to
     /// `zerobench_runtime::transport::TransportError::Connect` at the wire layer.
     pub fn resolve(&self, opts: &TransportOpts) -> std::io::Result<SocketAddr> {

@@ -6,7 +6,7 @@
 //!
 //! Modules:
 //!   - [`archive`]       — run-archive sidecar I/O (plan.json / env.json / result.json / histlog)
-//!   - [`calibrate`]     — client-side loopback self-check (§9.6.2)
+//!   - [`mod@calibrate`] — client-side loopback self-check (§9.6.2)
 //!   - [`fingerprint`]   — plan_hash / url_fingerprint / target_fingerprint / run_id
 //!   - [`json_scan`]     — byte-level JSON field lookup (used by fanout Timestamp mode)
 //!   - [`live_snapshot`] — sharded HDR histogram + counters, read per-tick by TUI

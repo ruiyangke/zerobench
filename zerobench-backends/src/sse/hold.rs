@@ -486,7 +486,7 @@ fn parse_hex(s: &[u8]) -> usize {
 /// Drive `SseHold` scenarios from a multi-protocol Plan.
 ///
 /// For each `Step::SseHold` scenario, spawns `subscribers` worker
-/// threads, each running [`run_one_hold`] for the minimum of
+/// threads, each running `run_hold_scenario` for the minimum of
 /// `hold_for` (from the plan) and `duration` (from the caller).
 ///
 /// Returns a `Vec<TaskStats>` with one entry per scenario, containing
