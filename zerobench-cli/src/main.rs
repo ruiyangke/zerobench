@@ -199,9 +199,9 @@ fn format_duration(d: std::time::Duration) -> String {
     let s = d.as_secs();
     if s == 0 {
         format!("{}ms", d.as_millis())
-    } else if s % 3600 == 0 {
+    } else if s.is_multiple_of(3600) {
         format!("{}h", s / 3600)
-    } else if s % 60 == 0 {
+    } else if s.is_multiple_of(60) {
         format!("{}m", s / 60)
     } else if s > 60 {
         let m = s / 60;
