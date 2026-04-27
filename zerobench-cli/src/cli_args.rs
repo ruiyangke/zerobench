@@ -72,7 +72,7 @@ pub fn long_version() -> &'static str {
         zerobench --ws   ws://localhost:8080/chat  -c 100       # WebSocket bench\n  \
         zerobench diff baseline.json current.json               # regression diff\n\
         \n\
-        Full help: `zerobench --help`. Docs: https://github.com/zeroship-dev/zerobench\
+        Full help: `zerobench --help`. Docs: https://github.com/ruiyangke/zerobench\
         "
 )]
 pub struct CliArgs {
