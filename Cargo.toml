@@ -14,7 +14,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+# MSRV is 1.85 — clap_lex (transitive via clap 4.6) needs edition2024,
+# which stabilised in Rust 1.85.
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/ruiyangke/zerobench"
 homepage = "https://github.com/ruiyangke/zerobench"

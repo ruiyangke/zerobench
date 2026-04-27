@@ -70,7 +70,7 @@ pub struct MachineFingerprint {
     pub cpu_cores_physical: Option<usize>,
     /// Instruction set feature flags (`avx2`, `sse4_2`, …). Empty vec
     /// when undetectable.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cpu_flags: Vec<String>,
 
     // -------------------------------------------------------------------
