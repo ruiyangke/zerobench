@@ -54,7 +54,7 @@ pub fn fire_http_post(
 ) -> io::Result<()> {
     let addr = target
         .resolve(opts)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("resolve: {e}")))?;
+        .map_err(|e| io::Error::other(format!("resolve: {e}")))?;
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(4);

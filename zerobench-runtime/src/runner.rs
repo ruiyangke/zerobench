@@ -113,7 +113,7 @@ pub fn calibrate(
     // Guard: HDR's `value_at_percentile` on an empty histogram returns
     // 0/1 silently, so we'd pass the jitter gate even with no samples.
     // Treat "no samples" as a broken self-check.
-    if result.jitter.len() == 0 {
+    if result.jitter.is_empty() {
         return Err(
             "client self-check produced no jitter samples — calibration \
              is broken; cannot verify the scheduler noise floor. Pass \

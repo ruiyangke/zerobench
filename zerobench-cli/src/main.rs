@@ -407,9 +407,7 @@ fn run_mio_sync(args: &CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> 
     render_report(&summary, &plan, args.format, args.output.as_deref(), color)?;
 
     let total_errors = summary.errors.total();
-    if total_errors > 0 {
-        Ok(ExitCode::from(1))
-    } else if summary.requests == 0 {
+    if total_errors > 0 || summary.requests == 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)

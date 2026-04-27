@@ -73,7 +73,7 @@ fn render_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     let marker = state.marker;
 
-    let owned = vec![
+    let owned = [
         OwnedDataset::line(
             "p50",
             state

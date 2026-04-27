@@ -704,8 +704,7 @@ pub fn ad_test(a: &Histogram<u64>, b: &Histogram<u64>) -> AdResult {
     // A² = ((N-1)/N) · Σ_{j=1..L-1} h_j·(N·M_j − n·H_j)² / (H_j·(N−H_j))
     // (division by n·m · N is implicit; see Scholz-Stephens eq. 1.2a).
     let mut acc = 0.0_f64;
-    for i in 0..steps.len().saturating_sub(1) {
-        let (h_j, m_j, h_cum) = steps[i];
+    for &(h_j, m_j, h_cum) in steps.iter().take(steps.len().saturating_sub(1)) {
         let m_j = m_j as f64;
         let h_cum = h_cum as f64;
         let h_j = h_j as f64;
@@ -842,7 +841,7 @@ fn ad_p_value(t: f64) -> f64 {
         // (α=0.005, 0.001) bracket.
         let slope =
             (TABLE[TABLE.len() - 2].0.ln() - last.0.ln()) / (last.1 - TABLE[TABLE.len() - 2].1);
-        return (last.0.ln() + slope * (t - last.1)).exp().min(1.0).max(0.0);
+        return (last.0.ln() + slope * (t - last.1)).exp().clamp(0.0, 1.0);
     }
     // Interpolate between the two brackets surrounding t.
     for i in 0..TABLE.len() - 1 {

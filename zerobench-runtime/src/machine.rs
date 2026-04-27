@@ -239,12 +239,12 @@ fn collect_fd_limits() -> (Option<u64>, Option<u64>) {
         let soft = if lim.rlim_cur == libc::RLIM_INFINITY {
             u64::MAX
         } else {
-            lim.rlim_cur as u64
+            lim.rlim_cur
         };
         let hard = if lim.rlim_max == libc::RLIM_INFINITY {
             u64::MAX
         } else {
-            lim.rlim_max as u64
+            lim.rlim_max
         };
         (Some(soft), Some(hard))
     }
@@ -310,7 +310,7 @@ fn collect_ram_gib() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             // 1 GiB = 1024 * 1024 KiB. /proc/meminfo reports in KiB.
             return Some(kb / (1024 * 1024));
         }

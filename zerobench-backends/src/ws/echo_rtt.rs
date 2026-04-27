@@ -308,7 +308,7 @@ fn recv_matching(
             }
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 let matched = match key {
-                    MatchKey::Prefix16(id) => b.len() >= 16 && &b[..16] == &id[..],
+                    MatchKey::Prefix16(id) => b.len() >= 16 && b[..16] == id[..],
                     MatchKey::ExactBytes(_) => false, // Ping/Pong path; data frames don't correlate
                     MatchKey::Substring(marker) => memchr::memmem::find(&b, marker).is_some(),
                     MatchKey::Any => true,

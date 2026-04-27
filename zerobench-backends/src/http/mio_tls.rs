@@ -59,7 +59,7 @@ impl MioTlsStream {
         let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad SNI: {e}")))?;
         let tls = rustls::ClientConnection::new(config, server_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls: {e}")))?;
+            .map_err(|e| io::Error::other(format!("tls: {e}")))?;
         Ok(Self { tls, tcp })
     }
 
@@ -304,6 +304,12 @@ impl Write for MioTlsStream {
 
 /// Unified stream type for the mio backends. Callers read/write through
 /// this enum and don't need to branch on TLS vs plain TCP.
+//
+// The `Tls` variant is significantly larger than `Plain` (rustls
+// connection state + buffers ~1 KiB), but boxing it would force a heap
+// indirection on every read/write of every connection — exactly the
+// hot path. Hot variants are dominant; the size disparity is fine.
+#[allow(clippy::large_enum_variant)]
 pub enum MioStream {
     /// Plain (unencrypted) TCP stream.
     Plain(TcpStream),

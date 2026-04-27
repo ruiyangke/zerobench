@@ -370,13 +370,7 @@ impl LiveTick {
 }
 
 fn clamp_ns(ns: u64) -> u64 {
-    if ns < HIST_LO_NS {
-        HIST_LO_NS
-    } else if ns > HIST_HI_NS {
-        HIST_HI_NS
-    } else {
-        ns
-    }
+    ns.clamp(HIST_LO_NS, HIST_HI_NS)
 }
 
 /// Atomically swap each shard with a fresh empty histogram and merge

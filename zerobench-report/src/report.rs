@@ -706,11 +706,7 @@ fn pick_latency_source(summary: &Summary, plan: &Plan) -> (&'static str, u64, u6
 
     // HTTP-or-mixed: aggregate.
     let hist = &summary.latency;
-    let label = if protocols.len() > 1 {
-        "latency"
-    } else {
-        "latency"
-    };
+    let label = "latency";
     (
         label,
         if hist.is_empty() {
@@ -858,9 +854,7 @@ fn ns_to_seconds(ns: u64) -> f64 {
 /// Prometheus-friendly f64 — no NaN / Infinity (both map to 0), fixed
 /// decimal with enough precision for a ns-scale value in seconds.
 fn format_f64(x: f64) -> String {
-    if !x.is_finite() {
-        "0".to_string()
-    } else if x == 0.0 {
+    if !x.is_finite() || x == 0.0 {
         "0".to_string()
     } else {
         format!("{x:.6}")

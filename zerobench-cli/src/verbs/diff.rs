@@ -12,7 +12,7 @@
 //! sufficient as a regression gate when thresholds are set.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
@@ -413,8 +413,8 @@ fn load_export(path: &PathBuf) -> Result<SummaryExport, Box<dyn std::error::Erro
 /// parse. Callers treat distribution-level tests as opt-in via
 /// presence of the sidecar.
 fn try_load_sibling_histograms(
-    baseline_json: &PathBuf,
-    current_json: &PathBuf,
+    baseline_json: &Path,
+    current_json: &Path,
 ) -> Option<(hdrhistogram::Histogram<u64>, hdrhistogram::Histogram<u64>)> {
     let a_path = baseline_json.with_file_name("result.histlog");
     let b_path = current_json.with_file_name("result.histlog");

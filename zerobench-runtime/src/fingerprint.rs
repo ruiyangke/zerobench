@@ -3,14 +3,14 @@
 //! Implements `docs/design-v0.1.0.md` §7.1:
 //!
 //! - [`plan_hash`]      — sha256 of the JCS-canonical JSON of the Plan
-//!                         (tool version excluded so upgrades don't
-//!                         split archive groups).
+//!   (tool version excluded so upgrades don't
+//!   split archive groups).
 //! - [`url_fingerprint`] — sha256 over `{scheme, host, port, sni, plan_name, ip_family}`.
-//!                         The **stable grouping key**: all runs
-//!                         against the same URL land together even when
-//!                         DNS rotates.
+//!   The **stable grouping key**: all runs
+//!   against the same URL land together even when
+//!   DNS rotates.
 //! - [`target_fingerprint`] — sha256 over `{scheme, host, resolved_IPs (sorted), port, sni, plan_hash}`.
-//!                             Identifies "same plan against same backend".
+//!   Identifies "same plan against same backend".
 //! - [`run_id`]         — `<UTC-ISO-timestamp>-<plan_hash[:8]>-<target_fp[:8]>`.
 //!
 //! # Canonicalisation

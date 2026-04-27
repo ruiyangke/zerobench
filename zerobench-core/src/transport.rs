@@ -93,9 +93,7 @@ impl Target {
 
         // Strip path/query/fragment — the authority is whatever precedes
         // the first '/', '?', or '#'.
-        let authority_end = rest
-            .find(['/', '?', '#'])
-            .unwrap_or(rest.len());
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
         if authority.is_empty() {
             return Err(TargetError::MissingHost);

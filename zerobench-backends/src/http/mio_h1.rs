@@ -595,6 +595,7 @@ use crate::http::raw_h1_common::{apply_extractions, check_assertions};
 ///
 /// When all connections are busy and tokens pile up, the surplus is counted
 /// as `keepup` errors — requests that *would* have been sent but couldn't.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mio_worker(
     plan: &Plan,
     target: &Target,
@@ -1060,8 +1061,7 @@ pub fn run_mio_worker(
         }
     }
 
-    // Drop the recorder so `stats` is no longer borrowed.
-    drop(recorder);
+    // The recorder borrows `stats`; let NLL drop it so we can return.
     stats
 }
 
@@ -1083,6 +1083,7 @@ pub fn run_mio_worker(
 /// Fixes the `-c N -t T` bug where `div_ceil(total_conns, num_threads) *
 /// num_threads` over-allocated by up to `num_threads - 1` connections
 /// when `total_conns` didn't divide evenly.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mio_threaded(
     target: &Target,
     opts: &TransportOpts,

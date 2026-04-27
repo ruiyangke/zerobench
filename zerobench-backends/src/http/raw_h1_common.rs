@@ -425,7 +425,7 @@ pub fn check_assertions(plan: &RequestPlan, status: u16, total_latency: Duration
     for check in &plan.checks {
         let pass = match check {
             Assertion::StatusEq(code) => status == *code,
-            Assertion::StatusIn(codes) => codes.iter().any(|c| *c == status),
+            Assertion::StatusIn(codes) => codes.contains(&status),
             Assertion::LatencyUnder(d) => total_latency < *d,
         };
         if !pass {

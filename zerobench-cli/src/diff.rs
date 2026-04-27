@@ -461,8 +461,8 @@ fn write_terminal(
     const METRIC_W: usize = 28;
     writeln!(
         out,
-        "{:<METRIC_W$}{:>14}{:>14}{:>12}  {}",
-        "metric", "baseline", "current", "delta", "status"
+        "{:<METRIC_W$}{:>14}{:>14}{:>12}  status",
+        "metric", "baseline", "current", "delta"
     )?;
     writeln!(out, "{}", "─".repeat(METRIC_W + 14 + 14 + 12 + 10))?;
     for d in deltas {

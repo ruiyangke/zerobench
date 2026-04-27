@@ -234,10 +234,8 @@ fn push_auth_header(
 
     let auth_value = if let Some(user_pass) = &args.basic_auth {
         Some(format!("Basic {}", B64.encode(user_pass.as_bytes())))
-    } else if let Some(token) = &args.bearer {
-        Some(format!("Bearer {token}"))
     } else {
-        None
+        args.bearer.as_ref().map(|token| format!("Bearer {token}"))
     };
 
     let Some(value) = auth_value else {

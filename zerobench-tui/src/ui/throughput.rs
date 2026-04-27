@@ -166,7 +166,7 @@ fn render_bytes_chart(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     let marker = state.marker;
 
-    let owned = vec![
+    let owned = [
         OwnedDataset::line(
             "recv",
             state

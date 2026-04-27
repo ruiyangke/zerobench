@@ -311,22 +311,19 @@ impl ArchiveWriter {
 
     /// Write `plan.json`. Pretty-printed for human review.
     pub fn write_plan(&self, plan: &Plan) -> io::Result<()> {
-        let bytes =
-            serde_json::to_vec_pretty(plan).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(plan).map_err(io::Error::other)?;
         self.write_file("plan.json", &bytes)
     }
 
     /// Write `machine.json`.
     pub fn write_machine(&self, fp: &MachineFingerprint) -> io::Result<()> {
-        let bytes =
-            serde_json::to_vec_pretty(fp).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(fp).map_err(io::Error::other)?;
         self.write_file("machine.json", &bytes)
     }
 
     /// Write `env.json`.
     pub fn write_env(&self, env: &EnvRecord) -> io::Result<()> {
-        let bytes =
-            serde_json::to_vec_pretty(env).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(env).map_err(io::Error::other)?;
         self.write_file("env.json", &bytes)
     }
 
@@ -338,8 +335,7 @@ impl ArchiveWriter {
     /// compressed-log format that external tooling (HdrHistogram
     /// Plotter, jHiccup, wrk2) reads directly.
     pub fn write_result(&self, result: &SummaryExport) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(result)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(result).map_err(io::Error::other)?;
         self.write_file("result.json", &bytes)
     }
 
@@ -372,23 +368,19 @@ impl ArchiveWriter {
             builder.with_start_time(start);
             let mut writer = builder
                 .begin_log_with(&mut buf, &mut serializer)
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("histlog begin: {e:?}"))
-                })?;
+                .map_err(|e| io::Error::other(format!("histlog begin: {e:?}")))?;
 
             if let Some(c) = comment {
-                writer.write_comment(c).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("histlog comment: {e:?}"))
-                })?;
+                writer
+                    .write_comment(c)
+                    .map_err(|e| io::Error::other(format!("histlog comment: {e:?}")))?;
             }
 
             // Use the same `SystemTime` base for both start and
             // interval-offset: offset = `start.duration_since(start) = 0`.
             writer
                 .write_histogram(hist, Duration::ZERO, duration, None)
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("histlog write: {e:?}"))
-                })?;
+                .map_err(|e| io::Error::other(format!("histlog write: {e:?}")))?;
             // IntervalLogWriter flushes on drop.
         }
 
@@ -400,8 +392,7 @@ impl ArchiveWriter {
     /// that finds `INDEX.json` can assume the archive is complete and
     /// consistent; its absence signals a partial / crashed run.
     pub fn finalise(&self, index: &Index) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(index)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(index).map_err(io::Error::other)?;
         self.write_file("INDEX.json", &bytes)
     }
 
@@ -442,10 +433,10 @@ pub fn load_histogram_from_histlog(path: &Path) -> io::Result<Histogram<u64>> {
     use base64::Engine as _;
 
     let bytes = fs::read(path)?;
-    let mut iter = IntervalLogIterator::new(&bytes);
+    let iter = IntervalLogIterator::new(&bytes);
     let mut deserializer = Deserializer::new();
 
-    while let Some(entry) = iter.next() {
+    for entry in iter {
         let entry = entry.map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("histlog parse: {e:?}"))
         })?;

@@ -231,7 +231,7 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
     let x_min = 0.0_f64;
     let x_max = state.total_duration.as_secs_f64().max(1.0);
 
-    let owned = vec![
+    let owned = [
         OwnedDataset::line("2xx %", s_2xx, PALETTE[0], marker),
         OwnedDataset::line("4xx %", s_4xx, PALETTE[2], marker),
         OwnedDataset::line("5xx %", s_5xx, PALETTE[3], marker),

@@ -250,7 +250,7 @@ fn parse_target_strict(url: &str) -> Result<Target, ScriptError> {
     // Find the authority end — first `/`, `?`, or `#` after `://`.
     let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
     let authority_end = url[after_scheme..]
-        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .map(|i| after_scheme + i)
         .unwrap_or(url.len());
     let authority = &url[..authority_end];

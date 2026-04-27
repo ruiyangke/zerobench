@@ -566,10 +566,7 @@ fn wait_for_interest(
                 continue;
             }
             if event.is_error() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "socket error during calibration",
-                ));
+                return Err(io::Error::other("socket error during calibration"));
             }
             let readable_ok = desired == Interest::READABLE && event.is_readable();
             let writable_ok = desired == Interest::WRITABLE && event.is_writable();

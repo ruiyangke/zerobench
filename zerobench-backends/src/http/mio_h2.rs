@@ -480,12 +480,7 @@ fn handshake_blocking(
     loop {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(Ok((sr, conn))) => return Ok((sr, conn)),
-            Poll::Ready(Err(e)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("h2 handshake: {e}"),
-                ))
-            }
+            Poll::Ready(Err(e)) => return Err(io::Error::other(format!("h2 handshake: {e}"))),
             Poll::Pending => {
                 // Wait for socket readiness via mio, then re-poll.
                 let _ = poll.poll(events, Some(Duration::from_millis(50)));
@@ -500,6 +495,7 @@ fn handshake_blocking(
 
 /// Run the mio + H2 event loop on the calling thread. Blocks until `stop`
 /// is set. Returns per-thread stats.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mio_h2_worker(
     plan: &Plan,
     target: &Target,
@@ -734,8 +730,7 @@ pub fn run_mio_h2_worker(
         }
     }
 
-    // Drop the recorder so `stats` is no longer borrowed.
-    drop(recorder);
+    // The recorder borrows `stats`; let NLL drop it so we can return.
     stats
 }
 
@@ -751,6 +746,7 @@ pub fn run_mio_h2_worker(
 /// workers take `floor + 1` streams, the rest take the floor. `num_threads`
 /// is clamped to `min(num_threads, total_streams)` so we never spin up
 /// workers that own zero streams.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mio_h2_threaded(
     target: &Target,
     opts: &TransportOpts,
@@ -929,7 +925,7 @@ fn extract_path_and_query(url: &str) -> std::borrow::Cow<'_, str> {
 
     let (rest, absolute) = if let Some(pos) = url.find("://") {
         let after_scheme = &url[pos + 3..];
-        match after_scheme.find(|c: char| c == '/' || c == '?' || c == '#') {
+        match after_scheme.find(['/', '?', '#']) {
             Some(i) => (&after_scheme[i..], true),
             None => return Cow::Borrowed("/"),
         }
