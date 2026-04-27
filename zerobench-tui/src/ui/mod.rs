@@ -156,7 +156,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState, short: b
         if state.run_completed {
             Span::styled("done", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
         } else if matches!(status, common::Status::Red) && state.total_requests == 0 {
-            Span::styled("connection failed", Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "connection failed",
+                Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled(
                 format!("{elapsed_s:.1}s / {total_s}s"),
@@ -254,7 +257,10 @@ fn render_transport_line(frame: &mut Frame, area: Rect, state: &DashboardState) 
     let row = Line::from(vec![
         Span::styled(" ▸ ", Style::new().fg(ACCENT)),
         Span::styled(
-            format!("{} · {} · {}", mode_label, state.transport.protocol, tls_label,),
+            format!(
+                "{} · {} · {}",
+                mode_label, state.transport.protocol, tls_label,
+            ),
             Style::new().fg(Color::Gray),
         ),
     ]);
@@ -304,13 +310,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &DashboardState) {
 // Tab body — dispatches to the selected tab's render fn.
 // ---------------------------------------------------------------------------
 
-fn render_tab_body(
-    frame: &mut Frame,
-    area: Rect,
-    state: &DashboardState,
-    tall: bool,
-    short: bool,
-) {
+fn render_tab_body(frame: &mut Frame, area: Rect, state: &DashboardState, tall: bool, short: bool) {
     let wide = area.width >= 140;
 
     // Log pane takes the bottom rows when toggled on, but only if
@@ -400,14 +400,21 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     if let Some(path) = save_msg {
         let line = Line::from(vec![
-            Span::styled(" ✓ saved: ", Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ✓ saved: ",
+                Style::new().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(path, Style::new().fg(Color::White)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
-    let paused = if state.paused_rendering { " [PAUSED]" } else { "" };
+    let paused = if state.paused_rendering {
+        " [PAUSED]"
+    } else {
+        ""
+    };
     let log_flag = if state.log_visible { " [log]" } else { "" };
     let text = format!(
         " [1-4] tab  [?] help  [s] save  [+/-] zoom  [m] marker  [r] reset  [p] pause{paused}  [l] log{log_flag}  [q] quit "

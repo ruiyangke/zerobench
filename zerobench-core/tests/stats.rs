@@ -13,7 +13,13 @@ fn records_sub_microsecond_samples_without_rounding_up() {
     // precision guarantee for local-loopback benchmarking.
     let mut s = TaskStats::new(1);
     for _ in 0..10_000 {
-        s.record(0, Duration::from_nanos(500), Duration::from_nanos(500), 0, 0);
+        s.record(
+            0,
+            Duration::from_nanos(500),
+            Duration::from_nanos(500),
+            0,
+            0,
+        );
     }
     let p50 = s.latency.value_at_percentile(50.0);
     // With 3 significant figures and a value of 500ns, HDR's precision
@@ -30,21 +36,39 @@ fn merge_3_tasks_sums_requests() {
     let a = {
         let mut t = TaskStats::new(1);
         for _ in 0..1000 {
-            t.record(0, Duration::from_micros(100), Duration::from_micros(10), 10, 20);
+            t.record(
+                0,
+                Duration::from_micros(100),
+                Duration::from_micros(10),
+                10,
+                20,
+            );
         }
         t
     };
     let b = {
         let mut t = TaskStats::new(1);
         for _ in 0..1000 {
-            t.record(0, Duration::from_micros(200), Duration::from_micros(20), 5, 15);
+            t.record(
+                0,
+                Duration::from_micros(200),
+                Duration::from_micros(20),
+                5,
+                15,
+            );
         }
         t
     };
     let c = {
         let mut t = TaskStats::new(1);
         for _ in 0..1000 {
-            t.record(0, Duration::from_micros(300), Duration::from_micros(30), 1, 3);
+            t.record(
+                0,
+                Duration::from_micros(300),
+                Duration::from_micros(30),
+                1,
+                3,
+            );
         }
         t
     };
@@ -61,7 +85,13 @@ fn merge_3_tasks_sums_requests() {
 fn requests_per_sec_matches_duration() {
     let mut t = TaskStats::new(1);
     for _ in 0..500 {
-        t.record(0, Duration::from_micros(100), Duration::from_micros(10), 0, 0);
+        t.record(
+            0,
+            Duration::from_micros(100),
+            Duration::from_micros(10),
+            0,
+            0,
+        );
     }
     let sum = Summary::merge(vec![t], Duration::from_millis(500));
     // 500 requests in 500ms = 1000 rps.
@@ -151,7 +181,13 @@ fn per_scenario_stats_roll_up_on_merge() {
         a.record(0, Duration::from_micros(50), Duration::from_micros(5), 0, 0);
     }
     for _ in 0..50 {
-        a.record(1, Duration::from_micros(500), Duration::from_micros(50), 0, 0);
+        a.record(
+            1,
+            Duration::from_micros(500),
+            Duration::from_micros(50),
+            0,
+            0,
+        );
     }
 
     let mut b = TaskStats::new(2);
@@ -159,7 +195,13 @@ fn per_scenario_stats_roll_up_on_merge() {
         b.record(0, Duration::from_micros(60), Duration::from_micros(6), 0, 0);
     }
     for _ in 0..25 {
-        b.record(1, Duration::from_micros(600), Duration::from_micros(60), 0, 0);
+        b.record(
+            1,
+            Duration::from_micros(600),
+            Duration::from_micros(60),
+            0,
+            0,
+        );
     }
 
     let sum = Summary::merge(vec![a, b], Duration::from_secs(1));
@@ -180,29 +222,26 @@ fn latency_p_returns_zero_for_empty_summary() {
 fn latency_p_returns_nanosecond_durations() {
     let mut t = TaskStats::new(1);
     for _ in 0..10_000 {
-        t.record(0, Duration::from_nanos(1_000), Duration::from_nanos(100), 0, 0);
+        t.record(
+            0,
+            Duration::from_nanos(1_000),
+            Duration::from_nanos(100),
+            0,
+            0,
+        );
     }
     let sum = Summary::merge(vec![t], Duration::from_secs(1));
     let p50 = sum.latency_p(50.0);
     // Within HDR's 3-sig-fig precision: 1000ns ±0.5.
     let p50_ns = p50.as_nanos() as u64;
-    assert!(
-        (990..=1010).contains(&p50_ns),
-        "p50 drifted: {p50_ns}ns",
-    );
+    assert!((990..=1010).contains(&p50_ns), "p50 drifted: {p50_ns}ns",);
 }
 
 #[test]
 fn clamp_high_samples_to_max_instead_of_dropping() {
     // Extreme latency: 10 minutes. Must not panic; gets clamped to max.
     let mut t = TaskStats::new(1);
-    t.record(
-        0,
-        Duration::from_secs(600),
-        Duration::from_secs(600),
-        0,
-        0,
-    );
+    t.record(0, Duration::from_secs(600), Duration::from_secs(600), 0, 0);
     assert_eq!(t.requests, 1);
     // Max recorded value must reflect the clamp.
     let max_ns = t.latency.max();

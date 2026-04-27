@@ -714,9 +714,7 @@ mod tests {
             SmallVec::new(),
             Duration::from_secs(25),
             HeartbeatFrame::Ping,
-            TriggerSpec::DedicatedWsConnection {
-                payload: lit("go"),
-            },
+            TriggerSpec::DedicatedWsConnection { payload: lit("go") },
             FanoutMode::Timestamp {
                 emit_field: "emit_ns".into(),
             },

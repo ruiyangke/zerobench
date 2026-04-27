@@ -33,11 +33,11 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use rustls::ClientConfig;
 
+use rand::SeedableRng;
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{CorrelateStrategy, Plan, Protocol, Step, WsEchoRttPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
-use rand::SeedableRng;
 use zerobench_core::BenchRng;
 use zerobench_runtime::transport::TransportError;
 use zerobench_runtime::Recorder;
@@ -225,12 +225,7 @@ fn run_one_echo_rtt(
                 let _ = stats.rtt.record(rtt_ns);
                 stats.messages_recv += 1;
                 stats.bytes_recv = stats.bytes_recv.saturating_add(bytes as u64);
-                recorder.record_ns(
-                    scenario_id,
-                    rtt_ns,
-                    send_buf.len() as u64,
-                    bytes as u64,
-                );
+                recorder.record_ns(scenario_id, rtt_ns, send_buf.len() as u64, bytes as u64);
             }
             Err(TransportError::Timeout) => {
                 // Deadline fired while waiting for echo — stop cleanly.
@@ -313,13 +308,9 @@ fn recv_matching(
             }
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 let matched = match key {
-                    MatchKey::Prefix16(id) => {
-                        b.len() >= 16 && &b[..16] == &id[..]
-                    }
+                    MatchKey::Prefix16(id) => b.len() >= 16 && &b[..16] == &id[..],
                     MatchKey::ExactBytes(_) => false, // Ping/Pong path; data frames don't correlate
-                    MatchKey::Substring(marker) => {
-                        memchr::memmem::find(&b, marker).is_some()
-                    }
+                    MatchKey::Substring(marker) => memchr::memmem::find(&b, marker).is_some(),
                     MatchKey::Any => true,
                 };
                 if matched {
@@ -531,7 +522,9 @@ fn extract_ws_path(url: &zerobench_core::Template) -> String {
     };
     url.expand_into(&mut buf, &mut ctx);
     let s = String::from_utf8_lossy(&buf).to_string();
-    if let Some(idx) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+    if let Some(idx) = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
     {
         s[idx..].to_string()
     } else {
@@ -575,9 +568,7 @@ mod tests {
                 return;
             };
             std::thread::spawn(move || {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
                 // --- Handshake ---
                 let mut req = Vec::new();
@@ -654,8 +645,7 @@ mod tests {
                                 break;
                             }
                             payload_len = u64::from_be_bytes([
-                                buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-                                buf[9],
+                                buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
                             ]) as usize;
                             hdr = 10;
                         }
@@ -668,8 +658,7 @@ mod tests {
                         } else {
                             [0u8; 4]
                         };
-                        let mut payload =
-                            buf[mask_off..mask_off + payload_len].to_vec();
+                        let mut payload = buf[mask_off..mask_off + payload_len].to_vec();
                         if masked {
                             for (i, b) in payload.iter_mut().enumerate() {
                                 *b ^= mask[i % 4];
@@ -711,13 +700,14 @@ mod tests {
 
     fn echo_plan_for(addr: SocketAddr, n: u32, rate: f64) -> (Plan, Target) {
         let mut vars = VarRegistry::new();
-        let url =
-            Template::compile(&format!("ws://{addr}/chat"), &mut vars).unwrap();
+        let url = Template::compile(&format!("ws://{addr}/chat"), &mut vars).unwrap();
         let payload = Template::compile("hello", &mut vars).unwrap();
         let plan = Plan {
             scenarios: vec![Scenario {
                 name: "ws-echo-rtt-test".into(),
-                rate: RateProfile::Saturate { max_concurrency: n as usize },
+                rate: RateProfile::Saturate {
+                    max_concurrency: n as usize,
+                },
                 steps: vec![Step::WsEchoRtt(WsEchoRttPlan {
                     url,
                     headers: SmallVec::new(),

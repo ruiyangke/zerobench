@@ -214,10 +214,7 @@ impl ScenarioContext {
     /// Prefer this over the `take` / `return` pair when the whole
     /// expansion happens inside a single scope — the closure form
     /// statically prevents forgetting to return the buffer.
-    pub fn with_url_buf<R>(
-        &mut self,
-        f: impl FnOnce(&mut Vec<u8>, ExpandCtx<'_>) -> R,
-    ) -> R {
+    pub fn with_url_buf<R>(&mut self, f: impl FnOnce(&mut Vec<u8>, ExpandCtx<'_>) -> R) -> R {
         let mut buf = std::mem::take(&mut self.url_buf);
         buf.clear();
         let result = {
@@ -231,7 +228,6 @@ impl ScenarioContext {
         self.url_buf = buf;
         result
     }
-
 }
 
 // ---------------------------------------------------------------------------

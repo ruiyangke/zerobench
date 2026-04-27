@@ -479,10 +479,7 @@ fn estimate_dynamic(p: &Part) -> usize {
 /// exception is the DEFAULT for `{{env:NAME:DEFAULT}}`, which is
 /// preserved verbatim — a user might legitimately want spaces in a
 /// default value.
-fn parse_expression(
-    expr: &str,
-    vars: &mut VarRegistry,
-) -> Result<(Part, usize), TemplateError> {
+fn parse_expression(expr: &str, vars: &mut VarRegistry) -> Result<(Part, usize), TemplateError> {
     // Simple (no-arg) variables — match against the trimmed expression so
     // `{{ uuid }}` is equivalent to `{{uuid}}`.
     match expr.trim() {
@@ -521,9 +518,9 @@ fn parse_expression(
                 return Ok((Part::Literal(Bytes::from(value)), size));
             }
             "rand_int" => {
-                let (a, b) = tail.split_once(':').ok_or_else(|| {
-                    TemplateError::InvalidRandInt(tail.to_string())
-                })?;
+                let (a, b) = tail
+                    .split_once(':')
+                    .ok_or_else(|| TemplateError::InvalidRandInt(tail.to_string()))?;
                 let min: i64 = a
                     .trim()
                     .parse()
@@ -691,7 +688,9 @@ fn write_i64(out: &mut Vec<u8>, n: i64) {
 /// We implement manual calendar conversion rather than pulling in `chrono`
 /// or `time`: the math is trivial and the binary savings are real.
 fn write_iso8601_utc(out: &mut Vec<u8>) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let total_secs = now.as_secs() as i64;
     let millis = now.subsec_millis();
 
@@ -778,8 +777,7 @@ fn write_rand_hex(out: &mut Vec<u8>, bytes: usize, rng: &mut BenchRng) {
 }
 
 fn write_rand_str(out: &mut Vec<u8>, len: usize, rng: &mut BenchRng) {
-    const ALPHABET: &[u8; 62] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for _ in 0..len {
         let idx = rng.gen_range(0..ALPHABET.len());
         out.push(ALPHABET[idx]);

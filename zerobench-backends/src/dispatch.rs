@@ -61,7 +61,10 @@ pub struct RunCtx {
 /// `Vec<TaskStats>`. Callers fold the result through
 /// `Summary::merge(stats, ctx.duration)`.
 pub fn run_plan(plan: &Plan, ctx: &RunCtx) -> Vec<TaskStats> {
-    let has_http = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Http);
+    let has_http = plan
+        .scenarios
+        .iter()
+        .any(|s| s.protocol() == Protocol::Http);
     let has_sse = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Sse);
     let has_ws = plan.scenarios.iter().any(|s| s.protocol() == Protocol::Ws);
 
@@ -155,7 +158,9 @@ fn first_wire_step(plan: &Plan) -> Option<&Step> {
 fn any_http_is_cold(plan: &Plan) -> bool {
     plan.scenarios.iter().any(|s| {
         s.protocol() == Protocol::Http
-            && s.steps.iter().any(|st| matches!(st, Step::HttpColdConnect(_)))
+            && s.steps
+                .iter()
+                .any(|st| matches!(st, Step::HttpColdConnect(_)))
     })
 }
 
@@ -228,17 +233,15 @@ fn run_one_protocol(plan: &Plan, ctx: &RunCtx) -> Vec<TaskStats> {
             ctx.live.as_ref().map(Arc::clone),
             ctx.stop.as_ref().map(Arc::clone),
         ),
-        Some(Step::SseReconnectStorm(_)) => {
-            crate::sse::run_sse_reconnect_storm_from_plan_threaded(
-                &ctx.target,
-                &ctx.opts,
-                plan,
-                ctx.duration,
-                ctx.tls_config.clone(),
-                ctx.live.as_ref().map(Arc::clone),
-                ctx.stop.as_ref().map(Arc::clone),
-            )
-        }
+        Some(Step::SseReconnectStorm(_)) => crate::sse::run_sse_reconnect_storm_from_plan_threaded(
+            &ctx.target,
+            &ctx.opts,
+            plan,
+            ctx.duration,
+            ctx.tls_config.clone(),
+            ctx.live.as_ref().map(Arc::clone),
+            ctx.stop.as_ref().map(Arc::clone),
+        ),
         Some(Step::WsEchoRtt(_)) => crate::ws::run_ws_echo_rtt_from_plan_threaded(
             &ctx.target,
             &ctx.opts,
@@ -276,9 +279,9 @@ fn run_one_protocol(plan: &Plan, ctx: &RunCtx) -> Vec<TaskStats> {
             ctx.stop.as_ref().map(Arc::clone),
         ),
         // Pause/PauseRandom already filtered by `first_wire_step`.
-        Some(Step::Pause(_)) | Some(Step::PauseRandom { .. }) => unreachable!(
-            "Pause steps are filtered by first_wire_step"
-        ),
+        Some(Step::Pause(_)) | Some(Step::PauseRandom { .. }) => {
+            unreachable!("Pause steps are filtered by first_wire_step")
+        }
         // Empty scenarios — default to the HTTP backend so it can
         // silently skip (mio_h1's pick_scenario filters scenarios
         // with no Request step). Matches the existing behaviour in
@@ -310,9 +313,7 @@ mod tests {
     use std::time::Instant;
 
     use smallvec::SmallVec;
-    use zerobench_core::plan::{
-        Mode, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step,
-    };
+    use zerobench_core::plan::{Mode, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step};
     use zerobench_core::template::Template;
     use zerobench_core::transport::Target;
     use zerobench_core::var::VarRegistry;
@@ -452,7 +453,10 @@ mod tests {
         // mio_h1 returns one TaskStats per worker thread. Dispatch
         // picked the right backend if we got any stats back within
         // the duration budget.
-        assert!(!stats.is_empty(), "expected mio_h1 to return at least one TaskStats");
+        assert!(
+            !stats.is_empty(),
+            "expected mio_h1 to return at least one TaskStats"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "dispatch should not block much past ctx.duration — took {elapsed:?}"
@@ -477,7 +481,10 @@ mod tests {
         // cold_connect's threaded runner returns one TaskStats per
         // cold scenario — not sharded across workers like mio_h1.
         // Either way, it must return SOMETHING and not hang.
-        assert!(!stats.is_empty(), "cold_connect backend produced no TaskStats");
+        assert!(
+            !stats.is_empty(),
+            "cold_connect backend produced no TaskStats"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "cold_connect dispatch took too long: {elapsed:?}"
@@ -541,13 +548,16 @@ mod tests {
     fn first_wire_step_skips_pauses() {
         let mut plan = make_http_plan(1, false);
         // Prepend a Pause step.
-        plan.scenarios[0].steps.insert(0, Step::Pause(Duration::from_millis(1)));
         plan.scenarios[0]
             .steps
-            .insert(1, Step::PauseRandom {
+            .insert(0, Step::Pause(Duration::from_millis(1)));
+        plan.scenarios[0].steps.insert(
+            1,
+            Step::PauseRandom {
                 min: Duration::ZERO,
                 max: Duration::from_millis(1),
-            });
+            },
+        );
         let first = first_wire_step(&plan);
         assert!(matches!(first, Some(Step::Request(_))));
     }

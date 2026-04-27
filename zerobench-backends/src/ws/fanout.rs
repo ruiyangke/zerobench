@@ -23,9 +23,7 @@ use rand::SeedableRng;
 use rustls::ClientConfig;
 
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS};
-use zerobench_core::plan::{
-    FanoutMode, Plan, Protocol, Step, TriggerSpec, WsFanoutPlan,
-};
+use zerobench_core::plan::{FanoutMode, Plan, Protocol, Step, TriggerSpec, WsFanoutPlan};
 use zerobench_core::stats::{TaskStats, WsExtras};
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_core::BenchRng;
@@ -211,10 +209,9 @@ pub fn run_ws_fanout_from_plan_threaded(
                 let mut matched = false;
                 while let Some(&&ev) = frame_iter.peek() {
                     if ev.received_at >= t_sent {
-                        let delta = duration_to_hist_ns(
-                            ev.received_at.saturating_duration_since(t_sent),
-                        )
-                        .clamp(HIST_LO_NS, HIST_HI_NS);
+                        let delta =
+                            duration_to_hist_ns(ev.received_at.saturating_duration_since(t_sent))
+                                .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         frame_iter.next();
                         matched = true;

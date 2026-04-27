@@ -282,9 +282,9 @@ impl RunHarness {
 /// `WsEchoRtt` measures "messages" not "frames".
 pub fn op_label_for(plan: &Plan) -> &'static str {
     let first_step = plan.scenarios.first().and_then(|s| {
-        s.steps.iter().find(|st| {
-            !matches!(st, Step::Pause(_) | Step::PauseRandom { .. })
-        })
+        s.steps
+            .iter()
+            .find(|st| !matches!(st, Step::Pause(_) | Step::PauseRandom { .. }))
     });
     match first_step {
         Some(Step::HttpColdConnect(_)) => "cold-connects",
@@ -547,11 +547,11 @@ mod tests {
     /// Build a plan with a single scenario from the given `scenario_*`
     /// builder return. Prepends a Pause step to the scenario so the
     /// `op_label_for` Pause-skipping path is always exercised.
-    fn plan_with(
-        mut scenario: zerobench_core::plan::Scenario,
-    ) -> Plan {
+    fn plan_with(mut scenario: zerobench_core::plan::Scenario) -> Plan {
         // Insert Pause at the front to assert `op_label_for` skips it.
-        scenario.steps.insert(0, Step::Pause(Duration::from_millis(1)));
+        scenario
+            .steps
+            .insert(0, Step::Pause(Duration::from_millis(1)));
         let mut b = PlanBuilder::new();
         b.name("t").duration(Duration::from_secs(1));
         b.push_scenario(scenario);

@@ -168,8 +168,14 @@ fn renders_transport_info_line() {
 fn renders_tab_bar_with_all_four_tabs() {
     let state = fresh_state(None);
     let (_, content) = render_state(&state);
-    assert!(content.contains("Overview"), "missing Overview tab:\n{content}");
-    assert!(content.contains("Latency"), "missing Latency tab:\n{content}");
+    assert!(
+        content.contains("Overview"),
+        "missing Overview tab:\n{content}"
+    );
+    assert!(
+        content.contains("Latency"),
+        "missing Latency tab:\n{content}"
+    );
     assert!(
         content.contains("Throughput"),
         "missing Throughput tab:\n{content}"
@@ -181,10 +187,22 @@ fn renders_tab_bar_with_all_four_tabs() {
 fn renders_keybind_footer() {
     let state = fresh_state(None);
     let (_, content) = render_state(&state);
-    assert!(content.contains("[q] quit"), "missing quit keybind:\n{content}");
-    assert!(content.contains("[?] help"), "missing help keybind:\n{content}");
-    assert!(content.contains("[r] reset"), "missing reset keybind:\n{content}");
-    assert!(content.contains("[s] save"), "missing save keybind:\n{content}");
+    assert!(
+        content.contains("[q] quit"),
+        "missing quit keybind:\n{content}"
+    );
+    assert!(
+        content.contains("[?] help"),
+        "missing help keybind:\n{content}"
+    );
+    assert!(
+        content.contains("[r] reset"),
+        "missing reset keybind:\n{content}"
+    );
+    assert!(
+        content.contains("[s] save"),
+        "missing save keybind:\n{content}"
+    );
     assert!(content.contains("[1-4]"), "missing tab keybind:\n{content}");
 }
 
@@ -405,7 +423,10 @@ fn pause_flag_does_not_break_rendering() {
     state.ingest(tick(1, 100, 1_000));
     let (_, content) = render_state(&state);
     assert!(content.contains("zerobench"));
-    assert!(content.contains("PAUSED"), "missing pause indicator:\n{content}");
+    assert!(
+        content.contains("PAUSED"),
+        "missing pause indicator:\n{content}"
+    );
 }
 
 #[test]
@@ -501,13 +522,22 @@ fn switching_tab_changes_rendered_body() {
 
     // Overview: should show "totals" panel.
     let overview = render_on(&mut terminal, &state);
-    assert!(overview.contains("totals"), "overview missing totals:\n{overview}");
+    assert!(
+        overview.contains("totals"),
+        "overview missing totals:\n{overview}"
+    );
 
     // Switch to Throughput — expect summary/bytes panels.
     state.current_tab = Tab::Throughput;
     let thr = render_on(&mut terminal, &state);
-    assert!(thr.contains("summary"), "throughput missing summary:\n{thr}");
-    assert!(thr.contains("bytes/s"), "throughput missing bytes/s:\n{thr}");
+    assert!(
+        thr.contains("summary"),
+        "throughput missing summary:\n{thr}"
+    );
+    assert!(
+        thr.contains("bytes/s"),
+        "throughput missing bytes/s:\n{thr}"
+    );
     // And must *not* still say "totals" (that was Overview-only).
     assert!(
         !thr.contains("── totals"),

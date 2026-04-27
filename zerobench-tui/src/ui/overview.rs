@@ -57,7 +57,11 @@ fn render_wide(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Fill(2), Constraint::Fill(1), Constraint::Fill(1)])
+        .constraints([
+            Constraint::Fill(2),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
         .split(rows[0]);
     let bot = Layout::default()
         .direction(Direction::Horizontal)
@@ -221,7 +225,9 @@ fn render_error_summary(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
 fn render_totals_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let e = &state.total_errors;
-    let success = state.total_requests.saturating_sub(e.status_4xx + e.status_5xx);
+    let success = state
+        .total_requests
+        .saturating_sub(e.status_4xx + e.status_5xx);
     let (last_sent, last_recv) = state.last_tick_bytes();
 
     let dim = Style::new().fg(Color::Gray);
@@ -312,12 +318,7 @@ fn render_latency_bars(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 percentile_line("p90  ", p90, max_f, bar_width, PALETTE[1]),
                 percentile_line("p99  ", p99, max_f, bar_width, PALETTE[2]),
                 percentile_line_with_suffix(
-                    "p99.9",
-                    p99_9,
-                    max_f,
-                    bar_width,
-                    PALETTE[3],
-                    delta_span,
+                    "p99.9", p99_9, max_f, bar_width, PALETTE[3], delta_span,
                 ),
                 percentile_line("max  ", max, max_f, bar_width, CRITICAL),
             ]

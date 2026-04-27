@@ -141,9 +141,7 @@ pub fn build_raw_request(
     });
     if !user_has_connection {
         match connection {
-            ConnectionMode::KeepAlive => {
-                out.extend_from_slice(b"Connection: keep-alive\r\n")
-            }
+            ConnectionMode::KeepAlive => out.extend_from_slice(b"Connection: keep-alive\r\n"),
             ConnectionMode::Close => out.extend_from_slice(b"Connection: close\r\n"),
         }
     }
@@ -185,9 +183,7 @@ pub fn build_raw_request(
 
 /// Find the start index of `needle` in `haystack`.
 pub fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,11 +420,7 @@ fn parse_hex_size(bytes: &[u8]) -> Option<usize> {
 /// Shared between `mio_h1`, `cold_connect`, and `mio_h2` so a DSL
 /// `.expect_status(200)` is enforced regardless of which backend the
 /// CLI routes to.
-pub fn check_assertions(
-    plan: &RequestPlan,
-    status: u16,
-    total_latency: Duration,
-) -> u32 {
+pub fn check_assertions(plan: &RequestPlan, status: u16, total_latency: Duration) -> u32 {
     let mut failures = 0u32;
     for check in &plan.checks {
         let pass = match check {
@@ -500,8 +492,12 @@ pub fn capture_headers(resp: &httparse::Response<'_, '_>) -> Vec<(Vec<u8>, Vec<u
         if h.name.is_empty() {
             break;
         }
-        let name_lower: Vec<u8> =
-            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
+        let name_lower: Vec<u8> = h
+            .name
+            .as_bytes()
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect();
         out.push((name_lower, h.value.to_vec()));
     }
     out
@@ -539,7 +535,10 @@ mod tests {
                 value: b"42",
             },
         ];
-        assert_eq!(find_content_length_raw(&headers), ContentLength::Present(42));
+        assert_eq!(
+            find_content_length_raw(&headers),
+            ContentLength::Present(42)
+        );
     }
 
     #[test]
@@ -557,10 +556,7 @@ mod tests {
             name: "Content-Length",
             value: b"not-a-number",
         }];
-        assert_eq!(
-            find_content_length_raw(&headers),
-            ContentLength::Malformed
-        );
+        assert_eq!(find_content_length_raw(&headers), ContentLength::Malformed);
     }
 
     #[test]
@@ -569,10 +565,7 @@ mod tests {
             name: "Content-Length",
             value: b"-1",
         }];
-        assert_eq!(
-            find_content_length_raw(&headers),
-            ContentLength::Malformed
-        );
+        assert_eq!(find_content_length_raw(&headers), ContentLength::Malformed);
     }
 
     #[test]
@@ -581,10 +574,7 @@ mod tests {
             name: "Content-Length",
             value: &[0xff, 0xfe, 0xfd],
         }];
-        assert_eq!(
-            find_content_length_raw(&headers),
-            ContentLength::Malformed
-        );
+        assert_eq!(find_content_length_raw(&headers), ContentLength::Malformed);
     }
 
     #[test]
@@ -639,7 +629,14 @@ mod tests {
         let plan = mk_plan("http://127.0.0.1:8080/x");
         let mut ctx = mk_ctx();
         let mut out = Vec::new();
-        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::KeepAlive, &mut out).unwrap();
+        build_raw_request(
+            &plan,
+            &mut ctx,
+            &mk_target(),
+            ConnectionMode::KeepAlive,
+            &mut out,
+        )
+        .unwrap();
         let wire = std::str::from_utf8(&out).unwrap();
         assert!(wire.contains("Connection: keep-alive\r\n"), "wire = {wire}");
         assert!(!wire.contains("Connection: close"), "wire = {wire}");
@@ -650,7 +647,14 @@ mod tests {
         let plan = mk_plan("http://127.0.0.1:8080/x");
         let mut ctx = mk_ctx();
         let mut out = Vec::new();
-        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::Close, &mut out).unwrap();
+        build_raw_request(
+            &plan,
+            &mut ctx,
+            &mk_target(),
+            ConnectionMode::Close,
+            &mut out,
+        )
+        .unwrap();
         let wire = std::str::from_utf8(&out).unwrap();
         assert!(wire.contains("Connection: close\r\n"), "wire = {wire}");
         assert!(!wire.contains("Connection: keep-alive"), "wire = {wire}");
@@ -669,7 +673,14 @@ mod tests {
 
         let mut ctx = mk_ctx();
         let mut out = Vec::new();
-        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::Close, &mut out).unwrap();
+        build_raw_request(
+            &plan,
+            &mut ctx,
+            &mk_target(),
+            ConnectionMode::Close,
+            &mut out,
+        )
+        .unwrap();
         let wire = std::str::from_utf8(&out).unwrap();
         // Exactly one Connection line, and it's the user's.
         assert_eq!(wire.matches("Connection:").count(), 1, "wire = {wire}");
@@ -687,7 +698,14 @@ mod tests {
 
         let mut ctx = mk_ctx();
         let mut out = Vec::new();
-        build_raw_request(&plan, &mut ctx, &mk_target(), ConnectionMode::KeepAlive, &mut out).unwrap();
+        build_raw_request(
+            &plan,
+            &mut ctx,
+            &mk_target(),
+            ConnectionMode::KeepAlive,
+            &mut out,
+        )
+        .unwrap();
         let wire = std::str::from_utf8(&out).unwrap();
         assert_eq!(wire.matches("Connection:").count(), 0);
         assert_eq!(wire.matches("connection:").count(), 1, "wire = {wire}");
@@ -765,7 +783,9 @@ mod tests {
         let mut dec = ChunkedDecoder::new();
         assert_eq!(
             dec.advance(body),
-            ChunkProgress::Done { consumed: body.len() }
+            ChunkProgress::Done {
+                consumed: body.len()
+            }
         );
     }
 
@@ -775,7 +795,9 @@ mod tests {
         let mut dec = ChunkedDecoder::new();
         assert_eq!(
             dec.advance(body),
-            ChunkProgress::Done { consumed: body.len() }
+            ChunkProgress::Done {
+                consumed: body.len()
+            }
         );
     }
 
@@ -785,7 +807,9 @@ mod tests {
         let mut dec = ChunkedDecoder::new();
         assert_eq!(
             dec.advance(body),
-            ChunkProgress::Done { consumed: body.len() }
+            ChunkProgress::Done {
+                consumed: body.len()
+            }
         );
     }
 
@@ -798,7 +822,9 @@ mod tests {
         let mut dec = ChunkedDecoder::new();
         assert_eq!(
             dec.advance(&body),
-            ChunkProgress::Done { consumed: body.len() }
+            ChunkProgress::Done {
+                consumed: body.len()
+            }
         );
     }
 
@@ -815,7 +841,9 @@ mod tests {
         // Feed to end.
         assert_eq!(
             dec.advance(full),
-            ChunkProgress::Done { consumed: full.len() }
+            ChunkProgress::Done {
+                consumed: full.len()
+            }
         );
     }
 

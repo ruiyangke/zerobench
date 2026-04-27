@@ -63,9 +63,7 @@ pub enum ScriptError {
     /// Both a global `rate(...)` and a per-scenario `.rate(...)` were
     /// used. Pick one — they mean incompatible things (global distributes
     /// by weight; per-scenario is absolute).
-    #[error(
-        "conflicting rate: global `rate()` and per-scenario `.rate()` are mutually exclusive"
-    )]
+    #[error("conflicting rate: global `rate()` and per-scenario `.rate()` are mutually exclusive")]
     ConflictingRate,
 
     /// `env("NAME")` without a default was called for a variable that
@@ -83,9 +81,7 @@ pub enum ScriptError {
     /// The first request URL contains `{{...}}` templates in the host
     /// portion. The target host is resolved once at startup to open the
     /// connection pool, so it cannot be templated per iteration.
-    #[error(
-        "first request URL {0:?} has a templated host — the connection target must be static"
-    )]
+    #[error("first request URL {0:?} has a templated host — the connection target must be static")]
     TemplatedHost(String),
 
     /// Couldn't parse the first request URL as a URL at all.

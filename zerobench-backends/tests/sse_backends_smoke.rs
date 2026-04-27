@@ -28,9 +28,7 @@ use zerobench_core::var::VarRegistry;
 
 /// Read one HTTP/1.1 request off `stream`. Returns `(method, path,
 /// headers_blob)` so the dispatcher can route by path.
-fn read_http_request(
-    stream: &mut TcpStream,
-) -> std::io::Result<(String, String, String)> {
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String, String)> {
     let mut req = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {
@@ -104,9 +102,7 @@ fn spawn_sse_fanout_stub(triggers_seen: Arc<AtomicU32>) -> SocketAddr {
         let subs = Arc::clone(&subs);
         let triggers_seen = Arc::clone(&triggers_seen);
         std::thread::spawn(move || {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
             let (method, path, _raw) = match read_http_request(&mut stream) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -136,12 +132,10 @@ fn spawn_sse_fanout_stub(triggers_seen: Arc<AtomicU32>) -> SocketAddr {
                       Connection: close\r\n\r\n",
                 );
                 let mut guard = subs.lock().unwrap();
-                guard
-                    .retain_mut(|s| write_sse_chunk(s, "data: broadcast\n\n").is_ok());
+                guard.retain_mut(|s| write_sse_chunk(s, "data: broadcast\n\n").is_ok());
                 return;
             }
-            let _ =
-                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         });
     });
     std::thread::sleep(Duration::from_millis(50));
@@ -155,8 +149,7 @@ fn sse_fanout_receives_broadcasts_after_triggers() {
 
     let mut vars = VarRegistry::new();
     let sub_url = Template::compile(&format!("http://{addr}/events"), &mut vars).unwrap();
-    let trigger_url =
-        Template::compile(&format!("http://{addr}/broadcast"), &mut vars).unwrap();
+    let trigger_url = Template::compile(&format!("http://{addr}/broadcast"), &mut vars).unwrap();
 
     let fanout = SseFanoutPlan {
         subscribers: SseHoldPlan {
@@ -203,10 +196,7 @@ fn sse_fanout_receives_broadcasts_after_triggers() {
     // The fanout trigger cadence in the backend is fixed at
     // TRIGGER_INTERVAL_MS; over 2s we expect multiple hits.
     let triggered = triggers.load(Ordering::Relaxed);
-    assert!(
-        triggered >= 1,
-        "expected ≥1 HTTP trigger; got {triggered}"
-    );
+    assert!(triggered >= 1, "expected ≥1 HTTP trigger; got {triggered}");
     // Each subscriber gets the primer event plus any broadcasts —
     // at least one event per subscriber should have been recorded.
     let sse = stats[0].per_scenario[0]
@@ -289,10 +279,7 @@ fn sse_hold_reconnect_restarts_session_on_server_close() {
 /// connection after `events_per_session` events. Used to drive the
 /// reconnect-storm backend through multiple session cycles inside
 /// the test's duration window.
-fn spawn_sse_reconnect_stub(
-    events_per_session: usize,
-    interval: Duration,
-) -> SocketAddr {
+fn spawn_sse_reconnect_stub(events_per_session: usize, interval: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || loop {
@@ -300,9 +287,7 @@ fn spawn_sse_reconnect_stub(
             return;
         };
         std::thread::spawn(move || {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .ok();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             let (_method, _path, _raw) = match read_http_request(&mut stream) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -395,10 +380,7 @@ fn sse_reconnect_storm_cycles_sessions_and_extracts_ids() {
 
     assert_eq!(stats.len(), 1);
     let ts = &stats[0];
-    let sse = ts.per_scenario[0]
-        .sse
-        .as_ref()
-        .expect("sse extras present");
+    let sse = ts.per_scenario[0].sse.as_ref().expect("sse extras present");
     // Each session emits 4 events; the 1.2s window should see at
     // least 2 sessions worth.
     assert!(

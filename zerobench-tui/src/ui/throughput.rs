@@ -92,11 +92,7 @@ fn render_rps_timeseries(frame: &mut Frame, area: Rect, state: &DashboardState) 
         ));
     }
 
-    let observed_max = owned[0]
-        .data
-        .iter()
-        .map(|p| p.1)
-        .fold(0.0_f64, f64::max);
+    let observed_max = owned[0].data.iter().map(|p| p.1).fold(0.0_f64, f64::max);
     let y_max = match state.target_rate {
         Some(t) => (observed_max.max(t) * 1.15).max(1.0),
         None => (observed_max * 1.15).max(1.0),

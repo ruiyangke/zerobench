@@ -5,23 +5,22 @@
 //! no I/O, no hot-path infrastructure, no presentation.
 //!
 //! Modules:
-//!   - [`plan`]             — `Plan`, `Scenario`, `Step` (closed enum), all
-//!                            per-protocol `*Plan` structs, `RateProfile`,
-//!                            `Protocol`, `Mode`, assertions/extracts
-//!   - [`plan_builder`]     — typed `PlanBuilder` + `scenario_*` free
-//!                            functions. The one place CLI + DSL agree on
-//!                            how to pack `*Plan` structs.
-//!   - [`stats`]            — `TaskStats`, `ScenarioStats` with typed
-//!                            `SseExtras`/`WsExtras`, `Summary`, error counters
-//!   - [`template`]         — `Template` + `ExpandCtx` (`{{…}}` substitution)
-//!   - [`var`]              — `VarRegistry` + `VarSlot` (response extracts)
-//!   - [`scenario_context`] — per-iteration execution context
-//!   - [`request_file`]     — `.http` request-file parser
-//!   - [`transport`]        — `Target`, `TransportOpts`, `HttpVersionPref`,
-//!                            `TargetError` (runtime `TransportError` lives in
-//!                            `zerobench-runtime::transport`)
-//!   - [`histogram`]        — HDR histogram constants + helpers
-//!   - [`rng`]              — per-worker `BenchRng` (entropy-seeded Xoshiro)
+//!
+//! - [`plan`] — `Plan`, `Scenario`, `Step` (closed enum), all per-protocol
+//!   `*Plan` structs, `RateProfile`, `Protocol`, `Mode`, assertions/extracts.
+//! - [`plan_builder`] — typed `PlanBuilder` + `scenario_*` free functions.
+//!   The one place CLI + DSL agree on how to pack `*Plan` structs.
+//! - [`stats`] — `TaskStats`, `ScenarioStats` with typed
+//!   `SseExtras`/`WsExtras`, `Summary`, error counters.
+//! - [`template`] — `Template` + `ExpandCtx` (`{{…}}` substitution).
+//! - [`var`] — `VarRegistry` + `VarSlot` (response extracts).
+//! - [`scenario_context`] — per-iteration execution context.
+//! - [`request_file`] — `.http` request-file parser.
+//! - [`transport`] — `Target`, `TransportOpts`, `HttpVersionPref`,
+//!   `TargetError` (runtime `TransportError` lives in
+//!   `zerobench-runtime::transport`).
+//! - [`histogram`] — HDR histogram constants + helpers.
+//! - [`rng`] — per-worker `BenchRng` (entropy-seeded Xoshiro).
 //!
 //! Runtime infrastructure (LiveSnapshot, archive, calibrate, fingerprint,
 //! tls, stop, json_scan, machine) lives in `zerobench-runtime`.

@@ -230,11 +230,10 @@ pub fn parse_request_bytes(
         }
     }
 
-    let (_req_line_no, request_line) = request_line.ok_or_else(|| {
-        RequestFileError::MissingRequestLine {
+    let (_req_line_no, request_line) =
+        request_line.ok_or_else(|| RequestFileError::MissingRequestLine {
             file: source_name.to_string(),
-        }
-    })?;
+        })?;
 
     // ---- Parse the request line -----------------------------------------
     let (method, raw_target, version) =
@@ -250,9 +249,7 @@ pub fn parse_request_bytes(
     let mut host_value: Option<&str> = None;
     for (line_no, line) in header_lines {
         let (name, value) = line.split_once(':').ok_or_else(|| {
-            RequestFileError::MalformedHeader(format!(
-                "{source_name}:{line_no}: {line}"
-            ))
+            RequestFileError::MalformedHeader(format!("{source_name}:{line_no}: {line}"))
         })?;
         let name_trimmed = name.trim();
         if name_trimmed.is_empty() {
@@ -327,24 +324,21 @@ pub fn parse_request_bytes(
     };
 
     // ---- Compile templates ----------------------------------------------
-    let url_tpl =
-        Template::compile(&full_url, vars).map_err(|e| RequestFileError::Template {
-            field: format!("{source_name}: url"),
-            error: e,
-        })?;
+    let url_tpl = Template::compile(&full_url, vars).map_err(|e| RequestFileError::Template {
+        field: format!("{source_name}: url"),
+        error: e,
+    })?;
 
     let mut headers: SmallVec<[(Template, Template); 8]> = SmallVec::new();
     for (name, value) in raw_headers {
-        let name_tpl =
-            Template::compile(name, vars).map_err(|e| RequestFileError::Template {
-                field: format!("{source_name}: header name {name:?}"),
-                error: e,
-            })?;
-        let value_tpl =
-            Template::compile(value, vars).map_err(|e| RequestFileError::Template {
-                field: format!("{source_name}: header value for {name:?}"),
-                error: e,
-            })?;
+        let name_tpl = Template::compile(name, vars).map_err(|e| RequestFileError::Template {
+            field: format!("{source_name}: header name {name:?}"),
+            error: e,
+        })?;
+        let value_tpl = Template::compile(value, vars).map_err(|e| RequestFileError::Template {
+            field: format!("{source_name}: header value for {name:?}"),
+            error: e,
+        })?;
         headers.push((name_tpl, value_tpl));
     }
 
@@ -365,7 +359,9 @@ pub fn parse_request_bytes(
     } else {
         // Non-UTF-8 body — binary payload. Pass through verbatim; no
         // template expansion possible.
-        Some(BodySource::Static(bytes::Bytes::copy_from_slice(body_bytes)))
+        Some(BodySource::Static(bytes::Bytes::copy_from_slice(
+            body_bytes,
+        )))
     };
 
     Ok(ParsedRequest {
@@ -386,9 +382,7 @@ fn parse_request_line<'a>(
     source: &str,
     line_no: usize,
 ) -> Result<(Method, &'a str, &'a str), RequestFileError> {
-    let mk_err = || {
-        RequestFileError::InvalidRequestLine(format!("{source}:{line_no}: {line}"))
-    };
+    let mk_err = || RequestFileError::InvalidRequestLine(format!("{source}:{line_no}: {line}"));
 
     // Expect exactly three whitespace-separated tokens.
     let mut parts = line.split_whitespace();
@@ -404,11 +398,7 @@ fn parse_request_line<'a>(
     Ok((method, target, version))
 }
 
-fn validate_version(
-    version: &str,
-    source: &str,
-    line_no: usize,
-) -> Result<(), RequestFileError> {
+fn validate_version(version: &str, source: &str, line_no: usize) -> Result<(), RequestFileError> {
     match version {
         "HTTP/1.1" | "HTTP/1.0" => Ok(()),
         // curl sometimes emits lowercase `http/1.1` in its trace output.
@@ -508,10 +498,7 @@ pub fn parse_scenario_dir(dir: &Path) -> Result<Vec<ScenarioEntry>, RequestFileE
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let file_name_is_hidden = entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.');
+        let file_name_is_hidden = entry.file_name().to_string_lossy().starts_with('.');
         if file_name_is_hidden {
             continue;
         }
@@ -635,10 +622,7 @@ fn parse_scenarios_toml(
         };
         let weight = sc.weight.unwrap_or(0.0).max(0.0);
         // Advisory existence check — this catches typos early.
-        let exists = path.exists()
-            || dir
-                .join(format!("{}.http", name))
-                .exists();
+        let exists = path.exists() || dir.join(format!("{}.http", name)).exists();
         if !exists {
             return Err(RequestFileError::Scenario(format!(
                 "scenarios.toml: referenced file `{}` not found in {}",

@@ -139,7 +139,7 @@ impl Default for Plan {
 ///
 /// See `docs/PHILOSOPHY.md` §5 (the seven verbs) and
 /// `docs/design-v0.1.0.md` §2 (the dispatcher).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Mode {
     /// Smoke test. 5s default, 1 run, no archive, no calibration gate.
@@ -149,6 +149,7 @@ pub enum Mode {
     /// Rigorous steady-state measurement. 60s × 3 runs default, with
     /// 15s warmup, 10s cooldown, auto-archive, auto-compare vs
     /// baseline. The v0.1.0 headline verb.
+    #[default]
     Measure,
     /// Long-duration `measure` — 5min default, 1 run. Same code path as
     /// `Measure`, different defaults; no in-tool leak/drift analysis.
@@ -173,12 +174,6 @@ pub enum Mode {
     Diff,
 }
 
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Measure
-    }
-}
-
 /// Knee-detection policy for `Mode::Curve`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -199,22 +194,17 @@ pub enum KneeCriterion {
 }
 
 /// How `compare` interleaves runs across the two sides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompareSchedule {
     /// Round-robin with cooldown between every run (default; minimises
     /// per-side system-drift correlation). See `docs/PHILOSOPHY.md`
     /// §5.3.
+    #[default]
     Interleaved,
     /// All A runs, then all B runs. For targets that share stateful
     /// resources incompatible with quick context-switching.
     Serial,
-}
-
-impl Default for CompareSchedule {
-    fn default() -> Self {
-        Self::Interleaved
-    }
 }
 
 /// One named traffic stream — a sequence of steps executed top-to-bottom
@@ -239,7 +229,9 @@ impl Scenario {
     pub fn new(name: impl Into<String>, steps: Vec<Step>) -> Self {
         Self {
             name: name.into(),
-            rate: RateProfile::Saturate { max_concurrency: 50 },
+            rate: RateProfile::Saturate {
+                max_concurrency: 50,
+            },
             steps,
         }
     }
@@ -293,9 +285,9 @@ impl RateProfile {
                 to: to * factor,
                 over: *over,
             },
-            Self::Stepped(steps) => Self::Stepped(
-                steps.iter().map(|(d, r)| (*d, r * factor)).collect(),
-            ),
+            Self::Stepped(steps) => {
+                Self::Stepped(steps.iter().map(|(d, r)| (*d, r * factor)).collect())
+            }
             Self::Saturate { max_concurrency } => Self::Saturate {
                 max_concurrency: ((*max_concurrency as f64 * factor).ceil() as usize).max(1),
             },
@@ -536,21 +528,16 @@ pub enum FanoutMode {
 /// Heartbeat frame shape for `WsHoldPlan`. `Ping` is the zero-intrusion
 /// default (RFC 6455 §5.5.2 control frame); `TextApp` is the fallback
 /// for servers that don't honour Ping frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeartbeatFrame {
     /// WebSocket Ping frame (opcode 0x9) — RFC 6455 compliant servers
     /// echo with Pong (0xA) automatically.
+    #[default]
     Ping,
     /// Application-level text frame. Used when the server-side code
     /// doesn't respond to Ping (some older Socket.IO / proxies).
     TextApp,
-}
-
-impl Default for HeartbeatFrame {
-    fn default() -> Self {
-        Self::Ping
-    }
 }
 
 /// Strategy for matching a server echo to the client's send in
@@ -821,7 +808,9 @@ mod tests {
 
     #[test]
     fn scale_saturate() {
-        let p = RateProfile::Saturate { max_concurrency: 100 };
+        let p = RateProfile::Saturate {
+            max_concurrency: 100,
+        };
         match p.scale(0.25) {
             RateProfile::Saturate { max_concurrency } => {
                 assert_eq!(max_concurrency, 25);
@@ -848,10 +837,7 @@ mod tests {
 
     #[test]
     fn protocol_http_when_first_step_is_request() {
-        let sc = Scenario::new(
-            "h",
-            vec![Step::Request(RequestPlan::get(lit("/")))],
-        );
+        let sc = Scenario::new("h", vec![Step::Request(RequestPlan::get(lit("/")))]);
         assert_eq!(sc.protocol(), Protocol::Http);
     }
 

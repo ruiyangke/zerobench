@@ -34,13 +34,11 @@ use mio::net::TcpStream as MioTcp;
 use mio::{Events, Interest, Poll, Token};
 use rustls::ClientConfig;
 
+use crate::http::mio_tls::MioStream;
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS};
-use zerobench_core::plan::{
-    FanoutMode, Plan, Protocol, SseFanoutPlan, Step, TriggerSpec,
-};
+use zerobench_core::plan::{FanoutMode, Plan, Protocol, SseFanoutPlan, Step, TriggerSpec};
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
-use crate::http::mio_tls::MioStream;
 use zerobench_runtime::LiveSnapshot;
 
 use crate::sse::line_parser::{SseEvent, SseLineParser};
@@ -118,7 +116,9 @@ pub fn run_sse_fanout_from_plan_threaded(
             Step::SseFanout(p) => Some(p.clone()),
             _ => None,
         });
-        let Some(fanout_plan) = fanout_plan else { continue };
+        let Some(fanout_plan) = fanout_plan else {
+            continue;
+        };
 
         // Mode dispatch:
         //   - TriggerRtt: record each broadcast's received Instant
@@ -278,10 +278,9 @@ pub fn run_sse_fanout_from_plan_threaded(
                 let mut matched = false;
                 while let Some(&&ev) = ev_iter.peek() {
                     if ev.received_at >= t_sent {
-                        let delta = duration_to_hist_ns(
-                            ev.received_at.saturating_duration_since(t_sent),
-                        )
-                        .clamp(HIST_LO_NS, HIST_HI_NS);
+                        let delta =
+                            duration_to_hist_ns(ev.received_at.saturating_duration_since(t_sent))
+                                .clamp(HIST_LO_NS, HIST_HI_NS);
                         let _ = rtt_hist.record(delta);
                         ev_iter.next();
                         matched = true;
@@ -330,12 +329,12 @@ pub fn run_sse_fanout_from_plan_threaded(
 }
 
 /// Build the subscribe request (re-uses hold's request format).
-fn build_subscribe_request(
-    target: &Target,
-    plan: &SseFanoutPlan,
-) -> Vec<u8> {
+fn build_subscribe_request(target: &Target, plan: &SseFanoutPlan) -> Vec<u8> {
     let url = crate::fanout_core::render_template(&plan.subscribers.url);
-    let path = match url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j)) {
+    let path = match url
+        .find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         Some(p) => url[p..].to_string(),
         None => "/".to_string(),
     };
@@ -392,7 +391,11 @@ fn run_one_subscriber(
     let _ = tcp.set_nodelay(true);
     if poll
         .registry()
-        .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
+        .register(
+            &mut tcp,
+            POLL_TOKEN,
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .is_err()
     {
         stats.errors_connect += 1;
@@ -495,8 +498,7 @@ fn run_one_subscriber(
                     match memchr::memmem::find(&pre_body, b"\r\n\r\n").map(|p| p + 4) {
                         Some(hdr_end) => {
                             let grown_before = pre_body.len() - n;
-                            let body_start_in_slice =
-                                hdr_end.saturating_sub(grown_before);
+                            let body_start_in_slice = hdr_end.saturating_sub(grown_before);
                             header_done = true;
                             &slice[body_start_in_slice..]
                         }

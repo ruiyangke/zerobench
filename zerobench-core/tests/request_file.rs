@@ -275,7 +275,10 @@ fn malformed_header_without_colon_errors() {
             assert!(detail.contains("NotAHeader"));
             assert!(detail.contains("bad.http"));
             // Header is on line 3 (line 1 = request line).
-            assert!(detail.contains(":3"), "expected line 3 prefix, got {detail}");
+            assert!(
+                detail.contains(":3"),
+                "expected line 3 prefix, got {detail}"
+            );
         }
         other => panic!("expected MalformedHeader, got {other:?}"),
     }
@@ -357,9 +360,7 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "zerobench-{label}-{pid}-{seq}-{nanos}"
-        ));
+        let path = std::env::temp_dir().join(format!("zerobench-{label}-{pid}-{seq}-{nanos}"));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }

@@ -153,7 +153,9 @@ fn generated_keys_have_correct_shape() {
     assert_eq!(k.len(), 24);
     assert!(k.ends_with('='));
     // Base64 decodes back to our 16 bytes.
-    let decoded = base64::engine::general_purpose::STANDARD.decode(&k).unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&k)
+        .unwrap();
     assert_eq!(decoded, bytes);
 }
 

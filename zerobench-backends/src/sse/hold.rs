@@ -28,12 +28,12 @@ use mio::net::TcpStream as MioTcp;
 use mio::{Events, Interest, Poll, Token};
 use rustls::ClientConfig;
 
+use crate::http::mio_tls::{MioStream, MioTlsStream};
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist, HIST_HI_NS, HIST_LO_NS};
 use zerobench_core::plan::{Plan, Protocol, SseHoldPlan, Step};
 use zerobench_core::stats::{SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_runtime::Recorder;
-use crate::http::mio_tls::{MioStream, MioTlsStream};
 
 use crate::sse::line_parser::{SseEvent, SseLineParser};
 
@@ -196,8 +196,7 @@ fn drive_subscriber(
                         return DriveOutcome::Alive;
                     }
                     Err(_) => {
-                        sub.stats.errors_connect =
-                            sub.stats.errors_connect.saturating_add(1);
+                        sub.stats.errors_connect = sub.stats.errors_connect.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                 }
@@ -209,8 +208,7 @@ fn drive_subscriber(
             }
             SubState::TlsHandshaking => {
                 if let Err(_e) = sub.stream.drive_tls_io() {
-                    sub.stats.errors_connect =
-                        sub.stats.errors_connect.saturating_add(1);
+                    sub.stats.errors_connect = sub.stats.errors_connect.saturating_add(1);
                     return DriveOutcome::Dead;
                 }
                 if sub.stream.is_handshaking() {
@@ -227,8 +225,7 @@ fn drive_subscriber(
                 }
                 match sub.stream.write(remaining) {
                     Ok(0) => {
-                        sub.stats.errors_connect =
-                            sub.stats.errors_connect.saturating_add(1);
+                        sub.stats.errors_connect = sub.stats.errors_connect.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                     Ok(n) => {
@@ -238,8 +235,7 @@ fn drive_subscriber(
                         return DriveOutcome::Alive;
                     }
                     Err(_) => {
-                        sub.stats.errors_connect =
-                            sub.stats.errors_connect.saturating_add(1);
+                        sub.stats.errors_connect = sub.stats.errors_connect.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                 }
@@ -248,8 +244,7 @@ fn drive_subscriber(
                 let mut buf = [0u8; 4096];
                 match sub.stream.read(&mut buf) {
                     Ok(0) => {
-                        sub.stats.errors_read =
-                            sub.stats.errors_read.saturating_add(1);
+                        sub.stats.errors_read = sub.stats.errors_read.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                     Ok(n) => {
@@ -257,16 +252,14 @@ fn drive_subscriber(
                         if sub.first_byte_at.is_none() {
                             sub.first_byte_at = Some(now);
                             if let Some(t_sent) = sub.t_request_sent {
-                                sub.stats.ttfb =
-                                    Some(now.saturating_duration_since(t_sent));
+                                sub.stats.ttfb = Some(now.saturating_duration_since(t_sent));
                             }
                         }
                         sub.stats.bytes_received =
                             sub.stats.bytes_received.saturating_add(n as u64);
                         sub.pre_body.extend_from_slice(&buf[..n]);
                         if let Some(hdr_end) = find_header_end(&sub.pre_body) {
-                            let body_tail: Vec<u8> =
-                                sub.pre_body[hdr_end..].to_vec();
+                            let body_tail: Vec<u8> = sub.pre_body[hdr_end..].to_vec();
                             sub.pre_body.clear();
                             sub.state = SubState::ReadingBody;
                             if !body_tail.is_empty() {
@@ -280,8 +273,7 @@ fn drive_subscriber(
                         return DriveOutcome::Alive;
                     }
                     Err(_) => {
-                        sub.stats.errors_read =
-                            sub.stats.errors_read.saturating_add(1);
+                        sub.stats.errors_read = sub.stats.errors_read.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                 }
@@ -299,8 +291,7 @@ fn drive_subscriber(
                         return DriveOutcome::Alive;
                     }
                     Err(_) => {
-                        sub.stats.errors_read =
-                            sub.stats.errors_read.saturating_add(1);
+                        sub.stats.errors_read = sub.stats.errors_read.saturating_add(1);
                         return DriveOutcome::Dead;
                     }
                 }
@@ -327,12 +318,7 @@ fn drive_subscriber(
 /// we have no prior gap, so we record `0` — it's a known
 /// small-percentile artefact (one sample per subscriber) and lets
 /// the scenario's requests count stay consistent with the TUI.
-fn feed_body(
-    sub: &mut Subscriber,
-    input: &[u8],
-    recorder: &mut Recorder<'_>,
-    scenario_id: u16,
-) {
+fn feed_body(sub: &mut Subscriber, input: &[u8], recorder: &mut Recorder<'_>, scenario_id: u16) {
     let mut decoded: Vec<u8> = Vec::with_capacity(input.len());
     let _ended = sub.decoder.decode(input, &mut decoded);
     if decoded.is_empty() {
@@ -389,7 +375,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 // Chunked transfer-encoding decoder
 //
 // Copied verbatim from lib.rs to keep hold.rs standalone for the SseHold backend.
-//  
+//
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ChunkDecoder {
@@ -634,13 +620,7 @@ fn run_hold_scenario(
     // continue independently.
     let mut subs: Vec<Option<Subscriber>> = Vec::with_capacity(n_subs);
     for i in 0..n_subs {
-        match create_subscriber(
-            addr,
-            target,
-            tls_config.as_ref(),
-            Token(i),
-            poll.registry(),
-        ) {
+        match create_subscriber(addr, target, tls_config.as_ref(), Token(i), poll.registry()) {
             Ok(sub) => subs.push(Some(sub)),
             Err(_) => {
                 rollup.errors_connect = rollup.errors_connect.saturating_add(1);
@@ -665,7 +645,9 @@ fn run_hold_scenario(
         }
         for event in events.iter() {
             let idx = event.token().0;
-            let Some(slot) = subs.get_mut(idx) else { continue };
+            let Some(slot) = subs.get_mut(idx) else {
+                continue;
+            };
             let Some(sub) = slot.as_mut() else { continue };
             if sub.state == SubState::Dead {
                 continue;
@@ -677,11 +659,9 @@ fn run_hold_scenario(
                     // Classify as connect error if we hadn't yet sent
                     // the request; otherwise as read error.
                     if sub.t_request_sent.is_none() {
-                        sub.stats.errors_connect =
-                            sub.stats.errors_connect.saturating_add(1);
+                        sub.stats.errors_connect = sub.stats.errors_connect.saturating_add(1);
                     } else {
-                        sub.stats.errors_read =
-                            sub.stats.errors_read.saturating_add(1);
+                        sub.stats.errors_read = sub.stats.errors_read.saturating_add(1);
                     }
                 }
                 sub.state = SubState::Dead;
@@ -696,8 +676,7 @@ fn run_hold_scenario(
                 sub.stream.flush_tls();
             }
 
-            if let DriveOutcome::Dead =
-                drive_subscriber(sub, &request, &mut recorder, scenario_id)
+            if let DriveOutcome::Dead = drive_subscriber(sub, &request, &mut recorder, scenario_id)
             {
                 sub.state = SubState::Dead;
                 alive -= 1;
@@ -717,9 +696,7 @@ fn run_hold_scenario(
                     let prior_last_event = sub.last_event_at;
                     let old = subs[idx].take();
                     if let Some(mut old_sub) = old {
-                        let _ = poll.registry().deregister(
-                            old_sub.stream.tcp_stream_mut(),
-                        );
+                        let _ = poll.registry().deregister(old_sub.stream.tcp_stream_mut());
                     }
                     match create_subscriber(
                         addr,
@@ -753,13 +730,11 @@ fn run_hold_scenario(
         }
         let _ = rollup.event_gap.add(&s.stats.event_gap);
         rollup.events = rollup.events.saturating_add(s.stats.events);
-        rollup.bytes_received =
-            rollup.bytes_received.saturating_add(s.stats.bytes_received);
+        rollup.bytes_received = rollup.bytes_received.saturating_add(s.stats.bytes_received);
         if s.stats.saw_done {
             rollup.streams_completed = rollup.streams_completed.saturating_add(1);
         }
-        rollup.errors_connect =
-            rollup.errors_connect.saturating_add(s.stats.errors_connect);
+        rollup.errors_connect = rollup.errors_connect.saturating_add(s.stats.errors_connect);
         rollup.errors_read = rollup.errors_read.saturating_add(s.stats.errors_read);
     }
 
@@ -801,7 +776,10 @@ fn extract_path(url: &zerobench_core::Template) -> String {
     };
     url.expand_into(&mut buf, &mut ctx);
     let s = String::from_utf8_lossy(&buf).to_string();
-    if let Some(path_start) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j)) {
+    if let Some(path_start) = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         s[path_start..].to_string()
     } else {
         "/".to_string()
@@ -815,7 +793,6 @@ fn extract_path(url: &zerobench_core::Template) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::{Shutdown, TcpListener};
     use std::sync::Arc;
 
@@ -870,8 +847,7 @@ mod tests {
         use zerobench_core::Template;
 
         let mut vars = VarRegistry::new();
-        let url =
-            Template::compile(&format!("http://{addr}/stream"), &mut vars).unwrap();
+        let url = Template::compile(&format!("http://{addr}/stream"), &mut vars).unwrap();
 
         let hold_plan = SseHoldPlan {
             url,
@@ -884,7 +860,9 @@ mod tests {
         let plan = Plan {
             scenarios: vec![Scenario {
                 name: "sse-hold-test".into(),
-                rate: RateProfile::Saturate { max_concurrency: subs as usize },
+                rate: RateProfile::Saturate {
+                    max_concurrency: subs as usize,
+                },
                 steps: vec![Step::SseHold(hold_plan)],
             }],
             vars,
@@ -1045,8 +1023,7 @@ mod tests {
     fn hold_reports_connect_error_when_server_absent() {
         // Point at a port nothing listens on.
         let phantom_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let (plan, target) =
-            single_hold_plan(phantom_addr, 2, Duration::from_millis(100));
+        let (plan, target) = single_hold_plan(phantom_addr, 2, Duration::from_millis(100));
         let mut opts = TransportOpts::default();
         opts.connect_timeout = Duration::from_millis(200);
         let stop = Arc::new(AtomicBool::new(false));
@@ -1061,7 +1038,11 @@ mod tests {
             Some(stop),
         );
         let ts = &stats[0];
-        assert!(ts.errors.connect >= 1, "expected connect errors; got {:?}", ts.errors);
+        assert!(
+            ts.errors.connect >= 1,
+            "expected connect errors; got {:?}",
+            ts.errors
+        );
         let sse = ts.per_scenario[0].sse.as_ref().unwrap();
         assert_eq!(sse.chunks, 0, "no events when connect fails");
     }

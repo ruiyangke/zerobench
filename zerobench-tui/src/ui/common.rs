@@ -86,11 +86,7 @@ pub enum Status {
 ///
 /// `actual_pct` is the actual/target ratio in percent (0..=200, as
 /// returned by [`crate::state::DashboardState::actual_vs_target_pct`]).
-pub fn compute_status(
-    actual_pct: Option<f64>,
-    total_requests: u64,
-    total_errors: u64,
-) -> Status {
+pub fn compute_status(actual_pct: Option<f64>, total_requests: u64, total_errors: u64) -> Status {
     // Connection-failed-at-startup: all errors, zero requests. Users
     // need instant red feedback when literally nothing is working.
     if total_requests == 0 && total_errors > 0 {
@@ -354,20 +350,11 @@ mod tests {
     #[test]
     fn compute_status_rate_thresholds() {
         // 0.0005% error rate — well below 1%, stays Green.
-        assert_eq!(
-            compute_status(None, 1_000_000, 5),
-            Status::Green
-        );
+        assert_eq!(compute_status(None, 1_000_000, 5), Status::Green);
         // 2% error rate — between 1% and 5%, bumps Green → Yellow.
-        assert_eq!(
-            compute_status(None, 1_000_000, 20_000),
-            Status::Yellow
-        );
+        assert_eq!(compute_status(None, 1_000_000, 20_000), Status::Yellow);
         // 10% error rate — above 5%, forced Red regardless of target.
-        assert_eq!(
-            compute_status(None, 1_000_000, 100_000),
-            Status::Red
-        );
+        assert_eq!(compute_status(None, 1_000_000, 100_000), Status::Red);
         // Zero requests + any errors = connection failed at startup.
         assert_eq!(compute_status(None, 0, 10), Status::Red);
         // Zero errors, any request count — Green (no error signal).
@@ -384,23 +371,14 @@ mod tests {
             Status::Yellow
         );
         // 2% error rate + Red target band stays Red.
-        assert_eq!(
-            compute_status(Some(50.0), 1_000_000, 20_000),
-            Status::Red
-        );
+        assert_eq!(compute_status(Some(50.0), 1_000_000, 20_000), Status::Red);
     }
 
     #[test]
     fn compute_status_boundary_values() {
         // Exactly 1% — just at the Yellow threshold.
-        assert_eq!(
-            compute_status(None, 99_000, 1_000),
-            Status::Yellow
-        );
+        assert_eq!(compute_status(None, 99_000, 1_000), Status::Yellow);
         // Exactly 5% — just at the Red threshold.
-        assert_eq!(
-            compute_status(None, 95_000, 5_000),
-            Status::Red
-        );
+        assert_eq!(compute_status(None, 95_000, 5_000), Status::Red);
     }
 }

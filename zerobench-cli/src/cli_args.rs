@@ -87,28 +87,36 @@ pub struct CliArgs {
     pub url: Option<String>,
 
     // ---------- Input ----------
-
     /// Parse a single `.http` request file (curl `--trace-ascii` format).
-    #[arg(long = "request-file", conflicts_with = "requests",
-          help_heading = "Input")]
+    #[arg(
+        long = "request-file",
+        conflicts_with = "requests",
+        help_heading = "Input"
+    )]
     pub request_file: Option<PathBuf>,
 
     /// Parse every `*.http` in DIR as a scenario. Weights via
     /// `scenarios.toml`; equal when absent.
-    #[arg(long = "requests", conflicts_with = "request_file",
-          help_heading = "Input")]
+    #[arg(
+        long = "requests",
+        conflicts_with = "request_file",
+        help_heading = "Input"
+    )]
     pub requests: Option<PathBuf>,
 
     // ---------- Load ----------
-
     /// OS worker threads (each has its own mio poll). Default: CPU cores.
     #[arg(short = 't', long = "threads", default_value_t = num_cpus(),
           help_heading = "Load")]
     pub threads: usize,
 
     /// Max concurrent connections (H1) or streams (H2).
-    #[arg(short = 'c', long = "connections", default_value_t = 50,
-          help_heading = "Load")]
+    #[arg(
+        short = 'c',
+        long = "connections",
+        default_value_t = 50,
+        help_heading = "Load"
+    )]
     pub connections: usize,
 
     /// Measurement duration (`10s`, `1m`, `2m30s`).
@@ -137,10 +145,8 @@ pub struct CliArgs {
     pub warmup: Option<Duration>,
 
     // ---------- Request ----------
-
     /// HTTP method (default: GET; promoted to POST when a body is given).
-    #[arg(short = 'X', long = "method",
-          help_heading = "Request")]
+    #[arg(short = 'X', long = "method", help_heading = "Request")]
     pub method: Option<String>,
 
     /// Add a header. Repeat for multiple. Form: `Name: Value`.
@@ -161,14 +167,12 @@ pub struct CliArgs {
     pub body_file: Option<PathBuf>,
 
     /// JSON body. Sets `Content-Type: application/json` and implies POST.
-    #[arg(long = "json", conflicts_with = "form",
-          help_heading = "Request")]
+    #[arg(long = "json", conflicts_with = "form", help_heading = "Request")]
     pub json: Option<String>,
 
     /// Form body (`k=v&other=thing`). Sets
     /// `Content-Type: application/x-www-form-urlencoded` and implies POST.
-    #[arg(long = "form",
-          help_heading = "Request")]
+    #[arg(long = "form", help_heading = "Request")]
     pub form: Option<String>,
 
     /// Basic auth `user:pass`. Adds `Authorization: Basic <b64>`.
@@ -179,15 +183,12 @@ pub struct CliArgs {
     pub basic_auth: Option<String>,
 
     /// Bearer token. Adds `Authorization: Bearer <token>`.
-    #[arg(long = "bearer",
-          help_heading = "Request")]
+    #[arg(long = "bearer", help_heading = "Request")]
     pub bearer: Option<String>,
 
     // ---------- Assertions ----------
-
     /// Assertion: exact status code.
-    #[arg(long = "expect-status",
-          help_heading = "Assertions")]
+    #[arg(long = "expect-status", help_heading = "Assertions")]
     pub expect_status: Option<u16>,
 
     /// Assertion: status code in list (e.g. `200,201,204`).
@@ -197,7 +198,6 @@ pub struct CliArgs {
     pub expect_status_in: Option<StatusList>,
 
     // ---------- Protocol ----------
-
     /// Preferred HTTP version. `auto` lets HTTPS ALPN pick; HTTP stays H1.
     #[arg(long = "http-version", value_enum,
           default_value_t = CliHttpVersion::Auto,
@@ -212,7 +212,6 @@ pub struct CliArgs {
     pub http2_prior_knowledge: bool,
 
     // ---------- Network ----------
-
     /// TCP+TLS connect timeout.
     #[arg(long = "connect-timeout", default_value = "5s",
           value_parser = parse_duration_flag,
@@ -237,7 +236,6 @@ pub struct CliArgs {
     pub resolve: Vec<(String, u16, String)>,
 
     // ---------- Output ----------
-
     /// Color output preference.
     #[arg(long = "color", value_enum, default_value_t = CliColor::Auto,
           help_heading = "Output")]
@@ -256,8 +254,7 @@ pub struct CliArgs {
     pub tui: bool,
 
     /// Write final report to FILE instead of stdout. Affects all formats.
-    #[arg(short = 'o', long = "output",
-          help_heading = "Output")]
+    #[arg(short = 'o', long = "output", help_heading = "Output")]
     pub output: Option<PathBuf>,
 
     /// Parse args, build plan, resolve DNS, print the config, exit 0.
@@ -483,9 +480,7 @@ pub enum DiffFormat {
 /// Parse a duration spec (`10s`, `1m`, `2m30s`, `500ms`).
 pub fn parse_duration_flag(s: &str) -> Result<Duration, String> {
     parse_duration(s).ok_or_else(|| {
-        format!(
-            "invalid duration {s:?}; expected forms like `10s`, `1m`, `2m30s`, `500ms`"
-        )
+        format!("invalid duration {s:?}; expected forms like `10s`, `1m`, `2m30s`, `500ms`")
     })
 }
 
@@ -572,19 +567,14 @@ pub fn parse_threshold_flag(s: &str) -> Result<f64, String> {
         return Err(format!("threshold must be finite, got {n}"));
     }
     if n < 0.0 {
-        return Err(format!(
-            "threshold must be >= 0 (percent), got {n}"
-        ));
+        return Err(format!("threshold must be >= 0 (percent), got {n}"));
     }
     Ok(n)
 }
 
 /// Parse a comma-separated list of status codes.
 pub fn parse_status_list(s: &str) -> Result<StatusList, String> {
-    let out: Result<Vec<u16>, _> = s
-        .split(',')
-        .map(|t| t.trim().parse::<u16>())
-        .collect();
+    let out: Result<Vec<u16>, _> = s.split(',').map(|t| t.trim().parse::<u16>()).collect();
     out.map(StatusList)
         .map_err(|e| format!("invalid status list {s:?}: {e}"))
 }
@@ -597,9 +587,7 @@ pub fn parse_basic_auth_flag(s: &str) -> Result<String, String> {
         return Err("empty basic-auth value".into());
     }
     if !s.contains(':') {
-        return Err(format!(
-            "expected 'USER:PASS' for --basic-auth, got {s:?}"
-        ));
+        return Err(format!("expected 'USER:PASS' for --basic-auth, got {s:?}"));
     }
     Ok(s.to_string())
 }
@@ -643,14 +631,8 @@ mod tests {
     fn parse_duration_forms() {
         assert_eq!(parse_duration("10s"), Some(Duration::from_secs(10)));
         assert_eq!(parse_duration("1m"), Some(Duration::from_secs(60)));
-        assert_eq!(
-            parse_duration("2m30s"),
-            Some(Duration::from_secs(150))
-        );
-        assert_eq!(
-            parse_duration("500ms"),
-            Some(Duration::from_millis(500))
-        );
+        assert_eq!(parse_duration("2m30s"), Some(Duration::from_secs(150)));
+        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
         assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
         // Bare number defaults to seconds.
         assert_eq!(parse_duration("30"), Some(Duration::from_secs(30)));
@@ -707,13 +689,9 @@ mod tests {
 
     #[test]
     fn args_request_file_implies_no_url_needed() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--request-file",
-            "/tmp/foo.http",
-            "--saturate",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--request-file", "/tmp/foo.http", "--saturate"])
+                .unwrap();
         assert_eq!(
             args.request_file.as_deref().unwrap().to_str(),
             Some("/tmp/foo.http"),
@@ -762,13 +740,8 @@ mod tests {
 
     #[test]
     fn args_diff_defaults_are_sensible() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "diff",
-            "base.json",
-            "curr.json",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "diff", "base.json", "curr.json"]).unwrap();
         match args.command.as_ref().expect("subcommand") {
             Subcommand::Diff(da) => {
                 assert!((da.threshold_p99 - 5.0).abs() < 1e-9);
@@ -814,8 +787,7 @@ mod tests {
 
     #[test]
     fn args_default_duration_is_30s() {
-        let args = CliArgs::try_parse_from(["zerobench", "http://127.0.0.1:1/"])
-            .unwrap();
+        let args = CliArgs::try_parse_from(["zerobench", "http://127.0.0.1:1/"]).unwrap();
         assert_eq!(args.duration, Duration::from_secs(30));
         assert_eq!(args.connections, 50);
     }
@@ -838,13 +810,9 @@ mod tests {
 
     #[test]
     fn args_requests_dir_conflicts_with_positional_url() {
-        let err = CliArgs::try_parse_from([
-            "zerobench",
-            "--requests",
-            "/tmp/dir",
-            "http://example/",
-        ])
-        .unwrap_err();
+        let err =
+            CliArgs::try_parse_from(["zerobench", "--requests", "/tmp/dir", "http://example/"])
+                .unwrap_err();
         assert!(
             format!("{err}").contains("cannot be used"),
             "expected conflict error, got: {err}"
@@ -912,12 +880,8 @@ mod tests {
 
     #[test]
     fn args_threads_defaults_to_cpu_count() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--saturate",
-            "http://127.0.0.1:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--saturate", "http://127.0.0.1:1/"]).unwrap();
         // Default should be num_cpus(), which is >= 1.
         assert!(args.threads >= 1);
         assert_eq!(args.threads, num_cpus());
@@ -927,64 +891,40 @@ mod tests {
 
     #[test]
     fn args_warmup_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--warmup",
-            "5s",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args = CliArgs::try_parse_from(["zerobench", "--warmup", "5s", "http://h:1/"]).unwrap();
         assert_eq!(args.warmup, Some(Duration::from_secs(5)));
     }
 
     #[test]
     fn args_warmup_invalid_form_rejected() {
-        let err = CliArgs::try_parse_from([
-            "zerobench",
-            "--warmup",
-            "abc",
-            "http://h:1/",
-        ])
-        .unwrap_err();
+        let err =
+            CliArgs::try_parse_from(["zerobench", "--warmup", "abc", "http://h:1/"]).unwrap_err();
         let msg = format!("{err}").to_lowercase();
         assert!(msg.contains("invalid") || msg.contains("duration"));
     }
 
     #[test]
     fn args_basic_auth_parses_and_keeps_value() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--basic-auth",
-            "alice:hunter2",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--basic-auth", "alice:hunter2", "http://h:1/"])
+                .unwrap();
         assert_eq!(args.basic_auth.as_deref(), Some("alice:hunter2"));
         assert!(args.bearer.is_none());
     }
 
     #[test]
     fn args_basic_auth_requires_colon() {
-        let err = CliArgs::try_parse_from([
-            "zerobench",
-            "--basic-auth",
-            "no-colon-here",
-            "http://h:1/",
-        ])
-        .unwrap_err();
+        let err =
+            CliArgs::try_parse_from(["zerobench", "--basic-auth", "no-colon-here", "http://h:1/"])
+                .unwrap_err();
         let msg = format!("{err}").to_lowercase();
         assert!(msg.contains("user:pass") || msg.contains("expected"));
     }
 
     #[test]
     fn args_bearer_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--bearer",
-            "eyJabc",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--bearer", "eyJabc", "http://h:1/"]).unwrap();
         assert_eq!(args.bearer.as_deref(), Some("eyJabc"));
     }
 
@@ -1004,25 +944,16 @@ mod tests {
 
     #[test]
     fn args_json_body_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--json",
-            "{\"k\":1}",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--json", "{\"k\":1}", "http://h:1/"]).unwrap();
         assert_eq!(args.json.as_deref(), Some("{\"k\":1}"));
     }
 
     #[test]
     fn args_form_body_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--form",
-            "k=v&other=thing",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "--form", "k=v&other=thing", "http://h:1/"])
+                .unwrap();
         assert_eq!(args.form.as_deref(), Some("k=v&other=thing"));
     }
 
@@ -1085,37 +1016,23 @@ mod tests {
 
     #[test]
     fn args_resolve_rejects_missing_parts() {
-        let err = CliArgs::try_parse_from([
-            "zerobench",
-            "--resolve",
-            "bad-value",
-            "http://h:1/",
-        ])
-        .unwrap_err();
+        let err = CliArgs::try_parse_from(["zerobench", "--resolve", "bad-value", "http://h:1/"])
+            .unwrap_err();
         let msg = format!("{err}").to_lowercase();
         assert!(msg.contains("host:port:addr") || msg.contains("invalid"));
     }
 
     #[test]
     fn args_http2_prior_knowledge_flag() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--http2-prior-knowledge",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args = CliArgs::try_parse_from(["zerobench", "--http2-prior-knowledge", "http://h:1/"])
+            .unwrap();
         assert!(args.http2_prior_knowledge);
     }
 
     #[test]
     fn args_output_file_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "-o",
-            "/tmp/report.txt",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args =
+            CliArgs::try_parse_from(["zerobench", "-o", "/tmp/report.txt", "http://h:1/"]).unwrap();
         assert_eq!(
             args.output.as_deref().and_then(|p| p.to_str()),
             Some("/tmp/report.txt"),
@@ -1124,12 +1041,7 @@ mod tests {
 
     #[test]
     fn args_dry_run_flag_parses() {
-        let args = CliArgs::try_parse_from([
-            "zerobench",
-            "--dry-run",
-            "http://h:1/",
-        ])
-        .unwrap();
+        let args = CliArgs::try_parse_from(["zerobench", "--dry-run", "http://h:1/"]).unwrap();
         assert!(args.dry_run);
     }
 

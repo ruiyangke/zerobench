@@ -89,9 +89,21 @@ fn make_summary_and_plan() -> (Summary, Plan) {
     // argument; its contents don't affect the Prometheus output.
     let mut ts = TaskStats::new(1);
     for _ in 0..100 {
-        ts.record(0, Duration::from_micros(120), Duration::from_micros(50), 80, 160);
+        ts.record(
+            0,
+            Duration::from_micros(120),
+            Duration::from_micros(50),
+            80,
+            160,
+        );
     }
-    ts.record(0, Duration::from_millis(10), Duration::from_millis(5), 80, 160);
+    ts.record(
+        0,
+        Duration::from_millis(10),
+        Duration::from_millis(5),
+        80,
+        160,
+    );
     ts.errors.connect = 0;
     ts.errors.status_5xx = 2;
     let summary = Summary::merge(vec![ts], Duration::from_secs(30));

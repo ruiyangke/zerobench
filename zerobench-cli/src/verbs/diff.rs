@@ -240,7 +240,10 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     "AD two-sample: A²={:.3}  T={:.3}  p={:.4}  N={}/{}  → {verdict}",
                     r.a_squared, r.standardized, r.p_value, r.n_a, r.n_b
                 );
-                if matches!(r.significance, Significance::Significant | Significance::NotSignificant) {
+                if matches!(
+                    r.significance,
+                    Significance::Significant | Significance::NotSignificant
+                ) {
                     dist_pvalues.push(("AD", r.p_value));
                 }
             }
@@ -258,7 +261,10 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     "KS two-sample: D={:.4}  p={:.4}  N={}/{}  → {verdict}",
                     r.d_statistic, r.p_value, r.n_a, r.n_b
                 );
-                if matches!(r.significance, Significance::Significant | Significance::NotSignificant) {
+                if matches!(
+                    r.significance,
+                    Significance::Significant | Significance::NotSignificant
+                ) {
                     dist_pvalues.push(("KS", r.p_value));
                 }
             }
@@ -269,10 +275,7 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 println!();
                 println!("Holm-Bonferroni adjusted (family-wise α):");
                 for (i, (name, raw_p)) in dist_pvalues.iter().enumerate() {
-                    println!(
-                        "  {name:6}: raw p={raw_p:.4}  → adjusted p={:.4}",
-                        adj[i]
-                    );
+                    println!("  {name:6}: raw p={raw_p:.4}  → adjusted p={:.4}", adj[i]);
                 }
             }
         }
@@ -332,17 +335,14 @@ pub fn run(args: CompareArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             false
         }
         Some(raw) => {
-            let thresholds = parse_regress_spec(raw)
-                .map_err(|e| format!("--regress-on: {e}"))?;
+            let thresholds = parse_regress_spec(raw).map_err(|e| format!("--regress-on: {e}"))?;
             let mut any = false;
             for t in &thresholds {
                 // Prefer the compare-engine result (uses CI when available)
                 // over raw-delta check. Map MetricId → Metric and find
                 // the result; fall back to raw-row path if not matched.
                 let engine_metric = metric_id_to_engine(t.metric);
-                if let Some(result) =
-                    results.iter().find(|r| r.metric == engine_metric)
-                {
+                if let Some(result) = results.iter().find(|r| r.metric == engine_metric) {
                     if result.regressed_beyond(t.delta.abs()) {
                         let how = match result.strategy {
                             StrategyUsed::RunBootstrap => "bootstrap-CI",
@@ -538,12 +538,7 @@ fn check_threshold(delta_pct: f64, t: &RegressThreshold) -> bool {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn render_table(
-    a: &SummaryExport,
-    b: &SummaryExport,
-    rows: &[Row],
-    _args: &CompareArgs,
-) {
+fn render_table(a: &SummaryExport, b: &SummaryExport, rows: &[Row], _args: &CompareArgs) {
     println!("compare");
     println!(
         "  baseline  {:>12}  rate   p50   p99   p99.9   errors",

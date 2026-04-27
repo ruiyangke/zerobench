@@ -64,7 +64,9 @@ impl ColorChoice {
                 if !is_tty {
                     return false;
                 }
-                std::env::var_os("NO_COLOR").map(|v| v.is_empty()).unwrap_or(true)
+                std::env::var_os("NO_COLOR")
+                    .map(|v| v.is_empty())
+                    .unwrap_or(true)
             }
         }
     }
@@ -316,9 +318,7 @@ pub fn print_terminal(
                     let extras = sc.ws.as_ref();
                     let msgs = extras.map(|e| e.messages_recv).unwrap_or(0);
                     let rtt_p99 = match extras {
-                        Some(e) if !e.rtt.is_empty() => {
-                            format_ns(e.rtt.value_at_percentile(99.0))
-                        }
+                        Some(e) if !e.rtt.is_empty() => format_ns(e.rtt.value_at_percentile(99.0)),
                         _ => "n/a".to_string(),
                     };
                     let hs_p99 = match extras {
@@ -581,11 +581,7 @@ fn round2(x: f64) -> f64 {
 ///   error category)
 /// - `zerobench_bytes_sent_total` / `zerobench_bytes_received_total`
 ///   (counters)
-pub fn print_prometheus(
-    summary: &Summary,
-    _plan: &Plan,
-    out: &mut impl Write,
-) -> io::Result<()> {
+pub fn print_prometheus(summary: &Summary, _plan: &Plan, out: &mut impl Write) -> io::Result<()> {
     // requests_total
     writeln!(
         out,
@@ -653,10 +649,7 @@ pub fn print_prometheus(
         ("assertion_failed", e.assertion_failed),
     ];
     for (cat, n) in pairs {
-        writeln!(
-            out,
-            "zerobench_errors_total{{category=\"{cat}\"}} {n}"
-        )?;
+        writeln!(out, "zerobench_errors_total{{category=\"{cat}\"}} {n}")?;
     }
     writeln!(out)?;
 
@@ -674,11 +667,7 @@ pub fn print_prometheus(
         "# HELP zerobench_bytes_received_total Response bytes received on-wire."
     )?;
     writeln!(out, "# TYPE zerobench_bytes_received_total counter")?;
-    writeln!(
-        out,
-        "zerobench_bytes_received_total {}",
-        summary.bytes_recv
-    )?;
+    writeln!(out, "zerobench_bytes_received_total {}", summary.bytes_recv)?;
 
     out.flush()
 }
@@ -717,13 +706,33 @@ fn pick_latency_source(summary: &Summary, plan: &Plan) -> (&'static str, u64, u6
 
     // HTTP-or-mixed: aggregate.
     let hist = &summary.latency;
-    let label = if protocols.len() > 1 { "latency" } else { "latency" };
+    let label = if protocols.len() > 1 {
+        "latency"
+    } else {
+        "latency"
+    };
     (
         label,
-        if hist.is_empty() { 0 } else { hist.value_at_percentile(50.0) },
-        if hist.is_empty() { 0 } else { hist.value_at_percentile(90.0) },
-        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.0) },
-        if hist.is_empty() { 0 } else { hist.value_at_percentile(99.9) },
+        if hist.is_empty() {
+            0
+        } else {
+            hist.value_at_percentile(50.0)
+        },
+        if hist.is_empty() {
+            0
+        } else {
+            hist.value_at_percentile(90.0)
+        },
+        if hist.is_empty() {
+            0
+        } else {
+            hist.value_at_percentile(99.0)
+        },
+        if hist.is_empty() {
+            0
+        } else {
+            hist.value_at_percentile(99.9)
+        },
         hist.max(),
     )
 }
@@ -878,8 +887,8 @@ fn format_f64(x: f64) -> String {
 /// per-scenario entries in scenario order; single-scenario (or all
 /// identical) plans produce the scalar shape for diff-tool simplicity.
 fn target_rate_json(plan: &Plan) -> serde_json::Value {
-    use zerobench_core::plan::RateProfile;
     use serde_json::json;
+    use zerobench_core::plan::RateProfile;
 
     fn one(p: &RateProfile) -> serde_json::Value {
         match p {
@@ -911,10 +920,7 @@ fn target_rate_json(plan: &Plan) -> serde_json::Value {
             // Emit an array when profiles differ; otherwise collapse to
             // the scalar shape (every scenario has the same rate).
             let first = one(&many[0].rate);
-            let all_same = many
-                .iter()
-                .skip(1)
-                .all(|s| one(&s.rate) == first);
+            let all_same = many.iter().skip(1).all(|s| one(&s.rate) == first);
             if all_same {
                 first
             } else {
@@ -959,7 +965,7 @@ fn describe_target_rate(plan: &Plan) -> String {
 }
 
 /// One-line human summary of the assertions in the plan (for the
-/// "assertions" report line). 
+/// "assertions" report line).
 fn describe_assertions(plan: &Plan) -> String {
     use zerobench_core::plan::Assertion;
     let mut parts = Vec::new();
@@ -1208,19 +1214,13 @@ mod tests {
             "52.1 MB/s"
         );
         // 500 B/s.
-        assert_eq!(
-            format_byte_rate(500, Duration::from_secs(1)),
-            "500 B/s"
-        );
+        assert_eq!(format_byte_rate(500, Duration::from_secs(1)), "500 B/s");
     }
 
     #[test]
     fn format_byte_rate_handles_edge_cases() {
         // Zero duration → 0 B/s (no division-by-zero).
-        assert_eq!(
-            format_byte_rate(1_000_000, Duration::from_secs(0)),
-            "0 B/s"
-        );
+        assert_eq!(format_byte_rate(1_000_000, Duration::from_secs(0)), "0 B/s");
         // Zero bytes → 0 B/s regardless of duration.
         assert_eq!(format_byte_rate(0, Duration::from_secs(5)), "0 B/s");
     }
@@ -1253,7 +1253,13 @@ mod tests {
         // Record requests but no bytes (SSE/WS style).
         let mut stats = TaskStats::new(1);
         for _ in 0..100 {
-            stats.record(0, Duration::from_micros(100), Duration::from_micros(50), 0, 0);
+            stats.record(
+                0,
+                Duration::from_micros(100),
+                Duration::from_micros(50),
+                0,
+                0,
+            );
         }
         let summary = Summary::merge(vec![stats], Duration::from_secs(1));
 
@@ -1266,7 +1272,10 @@ mod tests {
         );
         // Throughput line should still be present — just without the arrows.
         assert!(s.contains("throughput"), "missing throughput:\n{s}");
-        assert!(!s.contains('↑'), "unexpected ↑ arrow in byte-less report:\n{s}");
+        assert!(
+            !s.contains('↑'),
+            "unexpected ↑ arrow in byte-less report:\n{s}"
+        );
     }
 
     #[test]
@@ -1312,8 +1321,14 @@ mod tests {
         assert!(s.contains('↑'), "missing ↑ arrow:\n{s}");
         assert!(s.contains('↓'), "missing ↓ arrow:\n{s}");
         // 100 * 200 B = 20 kB sent, 100 * 1000 B = 100 kB received.
-        assert!(s.contains("20.0 kB"), "expected '20.0 kB' in transfer:\n{s}");
-        assert!(s.contains("100.0 kB"), "expected '100.0 kB' in transfer:\n{s}");
+        assert!(
+            s.contains("20.0 kB"),
+            "expected '20.0 kB' in transfer:\n{s}"
+        );
+        assert!(
+            s.contains("100.0 kB"),
+            "expected '100.0 kB' in transfer:\n{s}"
+        );
     }
 
     #[test]
@@ -1333,12 +1348,12 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn plan_with_protocols(entries: &[(&str, Protocol)]) -> Plan {
+        use smallvec::SmallVec;
         use zerobench_core::plan::{
             Mode, Plan, RateProfile, RequestPlan, Scenario, SseHoldPlan, Step, WsEchoRttPlan,
         };
         use zerobench_core::template::Template;
         use zerobench_core::var::VarRegistry;
-        use smallvec::SmallVec;
 
         let mut vars = VarRegistry::new();
         let url = Template::compile("/", &mut vars).unwrap();
@@ -1365,9 +1380,7 @@ mod tests {
                 };
                 Scenario {
                     name: name.to_string(),
-                    rate: RateProfile::Saturate {
-                        max_concurrency: 8,
-                    },
+                    rate: RateProfile::Saturate { max_concurrency: 8 },
                     steps: vec![step],
                 }
             })
@@ -1394,8 +1407,7 @@ mod tests {
 
     #[test]
     fn operation_noun_is_operations_for_mixed_plan() {
-        let plan =
-            plan_with_protocols(&[("h", Protocol::Http), ("s", Protocol::Sse)]);
+        let plan = plan_with_protocols(&[("h", Protocol::Http), ("s", Protocol::Sse)]);
         assert_eq!(operation_noun(&plan), "operations");
         assert_eq!(rate_noun(&plan), "ops/s");
     }
@@ -1403,8 +1415,7 @@ mod tests {
     #[test]
     fn print_terminal_uses_operations_label_when_mixed() {
         use zerobench_core::stats::{Summary, TaskStats};
-        let plan =
-            plan_with_protocols(&[("h", Protocol::Http), ("s", Protocol::Sse)]);
+        let plan = plan_with_protocols(&[("h", Protocol::Http), ("s", Protocol::Sse)]);
         let mut stats = TaskStats::new(plan.scenarios.len());
         stats.record(
             0,
@@ -1423,16 +1434,16 @@ mod tests {
         // SSE-specific counters for scenario 1.
         stats.per_scenario[1].sse_mut().chunks = 42;
         stats.per_scenario[1].sse_mut().streams_completed = 1;
-        let _ = stats.per_scenario[1]
-            .sse_mut()
-            .ttfb
-            .record(1_000_000);
+        let _ = stats.per_scenario[1].sse_mut().ttfb.record(1_000_000);
 
         let summary = Summary::merge(vec![stats], Duration::from_secs(1));
         let mut out = Vec::new();
         print_terminal(&summary, &plan, ColorChoice::Never, false, &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("operations"), "expected 'operations' label:\n{s}");
+        assert!(
+            s.contains("operations"),
+            "expected 'operations' label:\n{s}"
+        );
         assert!(s.contains("ops/s"), "expected 'ops/s' label:\n{s}");
         // Per-scenario badges render.
         assert!(s.contains("HTTP"), "expected HTTP badge:\n{s}");
@@ -1444,10 +1455,7 @@ mod tests {
     #[test]
     fn print_terminal_ws_row_shows_conns_and_msgs() {
         use zerobench_core::stats::{Summary, TaskStats};
-        let plan = plan_with_protocols(&[
-            ("h", Protocol::Http),
-            ("w", Protocol::Ws),
-        ]);
+        let plan = plan_with_protocols(&[("h", Protocol::Http), ("w", Protocol::Ws)]);
         let mut stats = TaskStats::new(plan.scenarios.len());
         stats.record(
             0,

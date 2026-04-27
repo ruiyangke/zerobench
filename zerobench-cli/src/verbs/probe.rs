@@ -51,14 +51,22 @@ pub struct ProbeArgs {
     pub rate: Option<f64>,
 
     /// Concurrent connections (saturate mode) / pool cap (rate mode).
-    #[arg(short = 'c', long = "connections", default_value_t = 20,
-          help_heading = "Load")]
+    #[arg(
+        short = 'c',
+        long = "connections",
+        default_value_t = 20,
+        help_heading = "Load"
+    )]
     pub connections: usize,
 
     /// OS worker threads. Probe defaults to 2 to keep start-up cheap;
     /// use `measure` for a proper core-wide run.
-    #[arg(short = 't', long = "threads", default_value_t = 2,
-          help_heading = "Load")]
+    #[arg(
+        short = 't',
+        long = "threads",
+        default_value_t = 2,
+        help_heading = "Load"
+    )]
     pub threads: usize,
 
     /// TCP+TLS connect timeout.
@@ -171,13 +179,8 @@ pub fn run(args: ProbeArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         use std::io::{IsTerminal, Write};
         let is_tty = std::io::stdout().is_terminal();
         let mut out = std::io::stdout().lock();
-        let _ = zerobench_report::print_terminal(
-            &summary,
-            &plan,
-            ColorChoice::Auto,
-            is_tty,
-            &mut out,
-        );
+        let _ =
+            zerobench_report::print_terminal(&summary, &plan, ColorChoice::Auto, is_tty, &mut out);
         let _ = out.flush();
     }
 

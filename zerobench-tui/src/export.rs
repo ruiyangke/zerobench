@@ -35,10 +35,7 @@ fn default_filename() -> String {
 /// - If `path` is `None`, uses the current working directory with a
 ///   timestamped filename.
 /// - Returns the path that was actually written.
-pub fn export_report(
-    state: &DashboardState,
-    path: Option<&Path>,
-) -> Result<PathBuf, String> {
+pub fn export_report(state: &DashboardState, path: Option<&Path>) -> Result<PathBuf, String> {
     let file_path = match path {
         Some(p) if p.is_dir() => p.join(default_filename()),
         Some(p) => p.to_path_buf(),
@@ -46,8 +43,7 @@ pub fn export_report(
     };
 
     let json = build_json(state);
-    let pretty = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("json serialize: {e}"))?;
+    let pretty = serde_json::to_string_pretty(&json).map_err(|e| format!("json serialize: {e}"))?;
 
     let mut f = std::fs::File::create(&file_path)
         .map_err(|e| format!("create {}: {e}", file_path.display()))?;
@@ -81,66 +77,80 @@ fn build_json(state: &DashboardState) -> serde_json::Value {
     let e = &state.total_errors;
 
     // Per-tick time series for offline charting.
-    let ticks: Vec<serde_json::Value> = state.ticks.iter().map(|t| {
-        let per_scenario: Vec<serde_json::Value> = t.per_scenario.iter().enumerate().map(|(i, s)| {
+    let ticks: Vec<serde_json::Value> = state
+        .ticks
+        .iter()
+        .map(|t| {
+            let per_scenario: Vec<serde_json::Value> = t
+                .per_scenario
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    json!({
+                        "scenario_id": i,
+                        "requests": s.requests,
+                        "p50_ns": s.p50_ns,
+                        "p99_ns": s.p99_ns,
+                        "errors": {
+                            "connect": s.errors.connect,
+                            "read": s.errors.read,
+                            "write": s.errors.write,
+                            "timeout": s.errors.timeout,
+                            "keepup": s.errors.keepup,
+                            "status_4xx": s.errors.status_4xx,
+                            "status_5xx": s.errors.status_5xx,
+                            "assertion_failed": s.errors.assertion_failed,
+                        }
+                    })
+                })
+                .collect();
             json!({
-                "scenario_id": i,
-                "requests": s.requests,
-                "p50_ns": s.p50_ns,
-                "p99_ns": s.p99_ns,
+                "elapsed_s": t.elapsed.as_secs_f64(),
+                "requests": t.requests,
+                "bytes_sent": t.bytes_sent,
+                "bytes_recv": t.bytes_recv,
+                "p50_ns": t.p50_ns,
+                "p90_ns": t.p90_ns,
+                "p99_ns": t.p99_ns,
+                "p99_9_ns": t.p99_9_ns,
                 "errors": {
-                    "connect": s.errors.connect,
-                    "read": s.errors.read,
-                    "write": s.errors.write,
-                    "timeout": s.errors.timeout,
-                    "keepup": s.errors.keepup,
-                    "status_4xx": s.errors.status_4xx,
-                    "status_5xx": s.errors.status_5xx,
-                    "assertion_failed": s.errors.assertion_failed,
-                }
+                    "connect": t.errors.connect,
+                    "read": t.errors.read,
+                    "write": t.errors.write,
+                    "timeout": t.errors.timeout,
+                    "keepup": t.errors.keepup,
+                    "status_4xx": t.errors.status_4xx,
+                    "status_5xx": t.errors.status_5xx,
+                    "assertion_failed": t.errors.assertion_failed,
+                },
+                "per_scenario": per_scenario,
             })
-        }).collect();
-        json!({
-            "elapsed_s": t.elapsed.as_secs_f64(),
-            "requests": t.requests,
-            "bytes_sent": t.bytes_sent,
-            "bytes_recv": t.bytes_recv,
-            "p50_ns": t.p50_ns,
-            "p90_ns": t.p90_ns,
-            "p99_ns": t.p99_ns,
-            "p99_9_ns": t.p99_9_ns,
-            "errors": {
-                "connect": t.errors.connect,
-                "read": t.errors.read,
-                "write": t.errors.write,
-                "timeout": t.errors.timeout,
-                "keepup": t.errors.keepup,
-                "status_4xx": t.errors.status_4xx,
-                "status_5xx": t.errors.status_5xx,
-                "assertion_failed": t.errors.assertion_failed,
-            },
-            "per_scenario": per_scenario,
         })
-    }).collect();
+        .collect();
 
     // Per-scenario cumulative summary.
-    let scenarios: Vec<serde_json::Value> = state.scenario_names.iter().enumerate().map(|(i, name)| {
-        let errs = state.scenario_total_errors.get(i);
-        json!({
-            "name": name,
-            "requests": state.scenario_total_requests.get(i).copied().unwrap_or(0),
-            "errors": errs.map(|e| json!({
-                "connect": e.connect,
-                "read": e.read,
-                "write": e.write,
-                "timeout": e.timeout,
-                "keepup": e.keepup,
-                "status_4xx": e.status_4xx,
-                "status_5xx": e.status_5xx,
-                "assertion_failed": e.assertion_failed,
-            })),
+    let scenarios: Vec<serde_json::Value> = state
+        .scenario_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let errs = state.scenario_total_errors.get(i);
+            json!({
+                "name": name,
+                "requests": state.scenario_total_requests.get(i).copied().unwrap_or(0),
+                "errors": errs.map(|e| json!({
+                    "connect": e.connect,
+                    "read": e.read,
+                    "write": e.write,
+                    "timeout": e.timeout,
+                    "keepup": e.keepup,
+                    "status_4xx": e.status_4xx,
+                    "status_5xx": e.status_5xx,
+                    "assertion_failed": e.assertion_failed,
+                })),
+            })
         })
-    }).collect();
+        .collect();
 
     json!({
         "schema_version": 1,

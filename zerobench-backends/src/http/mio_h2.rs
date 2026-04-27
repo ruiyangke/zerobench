@@ -84,11 +84,15 @@ fn connect_with_retry(
     let addr = target.resolve(opts)?;
     match connect_once(addr) {
         Ok(s) => Ok((s, addr)),
-        Err(e) if matches!(
-            e.kind(),
-            io::ErrorKind::ConnectionRefused | io::ErrorKind::HostUnreachable
-                | io::ErrorKind::NetworkUnreachable | io::ErrorKind::TimedOut
-        ) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::TimedOut
+            ) =>
+        {
             let fresh = target.resolve(opts)?;
             connect_once(fresh).map(|s| (s, fresh))
         }
@@ -205,8 +209,7 @@ const WAKER_TOKEN: Token = Token(usize::MAX);
 
 /// Create a Waker that wakes the given mio::Poll via eventfd.
 fn mio_waker(poll: &mio::Poll) -> Waker {
-    let mio_waker = mio::Waker::new(poll.registry(), WAKER_TOKEN)
-        .expect("mio::Waker::new");
+    let mio_waker = mio::Waker::new(poll.registry(), WAKER_TOKEN).expect("mio::Waker::new");
     Waker::from(Arc::new(MioWaker { inner: mio_waker }))
 }
 
@@ -303,14 +306,11 @@ impl H2Conn {
                         // :path) arrive with the `:` prefix; we keep
                         // them so scripts can extract them by name
                         // if they want (e.g. `.extract_header(":status")`).
-                        let mut hdrs =
-                            Vec::with_capacity(response.headers().len());
+                        let mut hdrs = Vec::with_capacity(response.headers().len());
                         for (name, value) in response.headers() {
                             let name_bytes = name.as_str().as_bytes();
-                            let lower: Vec<u8> = name_bytes
-                                .iter()
-                                .map(|b| b.to_ascii_lowercase())
-                                .collect();
+                            let lower: Vec<u8> =
+                                name_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
                             hdrs.push((lower, value.as_bytes().to_vec()));
                         }
                         stream.extracted_headers = hdrs;
@@ -340,8 +340,7 @@ impl H2Conn {
                 match body.poll_data(cx) {
                     Poll::Ready(Some(Ok(chunk))) => {
                         let n = chunk.len();
-                        stream.response_bytes =
-                            stream.response_bytes.saturating_add(n as u64);
+                        stream.response_bytes = stream.response_bytes.saturating_add(n as u64);
                         // Release flow-control capacity so the sender can
                         // continue. Without this, the connection stalls once
                         // the window fills up.
@@ -471,7 +470,10 @@ fn handshake_blocking(
     poll: &mut mio::Poll,
     events: &mut Events,
     waker: &Waker,
-) -> io::Result<(SendRequest<Bytes>, client::Connection<MioAsyncAdapter, Bytes>)> {
+) -> io::Result<(
+    SendRequest<Bytes>,
+    client::Connection<MioAsyncAdapter, Bytes>,
+)> {
     let mut cx = Context::from_waker(waker);
     let mut fut = Box::pin(client::handshake(adapter));
 
@@ -589,13 +591,14 @@ pub fn run_mio_h2_worker(
 
     // H2 handshake (blocks until complete, using mio events).
     let adapter = MioAsyncAdapter { stream };
-    let (send_request, connection) = match handshake_blocking(adapter, &mut poll, &mut events, &waker) {
-        Ok(pair) => pair,
-        Err(_) => {
-            Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
-            return stats;
-        }
-    };
+    let (send_request, connection) =
+        match handshake_blocking(adapter, &mut poll, &mut events, &waker) {
+            Ok(pair) => pair,
+            Err(_) => {
+                Recorder::new(&mut stats, live).record_error(0, ErrorKind::Connect);
+                return stats;
+            }
+        };
 
     let mut h2 = H2Conn {
         connection,
@@ -850,7 +853,9 @@ fn build_h2_request_from_plan(
     let url_buf = {
         let mut taken = ctx.take_url_buf();
         taken.clear();
-        request_plan.url.expand_into(&mut taken, &mut ctx.expand_ctx());
+        request_plan
+            .url
+            .expand_into(&mut taken, &mut ctx.expand_ctx());
         taken
     };
     let url_str = std::str::from_utf8(&url_buf).unwrap_or("/");

@@ -71,7 +71,9 @@ pub fn run_cold_connect_from_plan_threaded(
         .enumerate()
         .filter_map(|(i, s)| {
             (s.protocol() == Protocol::Http
-                && s.steps.iter().any(|st| matches!(st, Step::HttpColdConnect(_))))
+                && s.steps
+                    .iter()
+                    .any(|st| matches!(st, Step::HttpColdConnect(_))))
             .then_some(i)
         })
         .collect();
@@ -209,27 +211,22 @@ fn run_worker(
         let intended_start = if interval_ns == 0 {
             now
         } else {
-            let my_slot_ns =
-                intended_elapsed_ns.fetch_add(interval_ns, Ordering::Relaxed);
+            let my_slot_ns = intended_elapsed_ns.fetch_add(interval_ns, Ordering::Relaxed);
             let target_at = base + Duration::from_nanos(my_slot_ns);
             if target_at > now {
                 let sleep_for = target_at - now;
                 if sleep_for > Duration::from_micros(5) {
-                    std::thread::sleep(
-                        sleep_for.min(Duration::from_millis(100)),
-                    );
+                    std::thread::sleep(sleep_for.min(Duration::from_millis(100)));
                 }
             } else {
                 // Falling behind — record keep-up miss.
-                Recorder::new(&mut task, live)
-                    .record_error(scenario_id, ErrorKind::Keepup);
+                Recorder::new(&mut task, live).record_error(scenario_id, ErrorKind::Keepup);
             }
             target_at
         };
 
         let Some(addr) = cached_addr else {
-            Recorder::new(&mut task, live)
-                .record_error(scenario_id, ErrorKind::Connect);
+            Recorder::new(&mut task, live).record_error(scenario_id, ErrorKind::Connect);
             continue;
         };
 
@@ -276,11 +273,9 @@ fn run_worker(
                 }
                 // Classify 4xx/5xx.
                 if (400..500).contains(&outcome.status) {
-                    Recorder::new(&mut task, live)
-                        .record_error(scenario_id, ErrorKind::Status4xx);
+                    Recorder::new(&mut task, live).record_error(scenario_id, ErrorKind::Status4xx);
                 } else if (500..600).contains(&outcome.status) {
-                    Recorder::new(&mut task, live)
-                        .record_error(scenario_id, ErrorKind::Status5xx);
+                    Recorder::new(&mut task, live).record_error(scenario_id, ErrorKind::Status5xx);
                 }
 
                 // Run user-declared assertions + extractions. Matches
@@ -292,8 +287,7 @@ fn run_worker(
                 // after each op so extractions are effectively op-
                 // scoped (no cross-op var carry, unlike keep-alive
                 // pool reuse in mio_h1).
-                let assertion_failures =
-                    check_assertions(req_plan, outcome.status, total);
+                let assertion_failures = check_assertions(req_plan, outcome.status, total);
                 for _ in 0..assertion_failures {
                     Recorder::new(&mut task, live)
                         .record_error(scenario_id, ErrorKind::AssertionFailed);
@@ -348,7 +342,11 @@ struct StreamGuard {
 
 impl StreamGuard {
     fn new(registry: mio::Registry, stream: MioStream) -> Self {
-        Self { registry, stream, armed: false }
+        Self {
+            registry,
+            stream,
+            armed: false,
+        }
     }
     fn arm(&mut self) {
         self.armed = true;
@@ -397,8 +395,7 @@ fn do_one_op(
     let stream = if target.tls {
         let config = tls_config.ok_or_else(|| {
             TransportError::Tls(
-                "https:// target but no TLS config was provided by the caller"
-                    .into(),
+                "https:// target but no TLS config was provided by the caller".into(),
             )
         })?;
         let sni = target.sni_name().to_string();
@@ -426,12 +423,9 @@ fn do_one_op(
     guard.arm();
 
     // Wait for writable (TCP connect done).
-    wait_for(
-        poll,
-        events,
-        opts.connect_timeout,
-        |ev| ev.token() == POLL_TOKEN && ev.is_writable(),
-    )
+    wait_for(poll, events, opts.connect_timeout, |ev| {
+        ev.token() == POLL_TOKEN && ev.is_writable()
+    })
     .map_err(|e| TransportError::Connect(e.to_string()))?;
     if let Err(e) = guard.stream_mut().tcp_stream_mut().peer_addr() {
         return Err(TransportError::Connect(e.to_string()));
@@ -523,9 +517,7 @@ fn do_one_op(
                 read_buf.extend_from_slice(&scratch[..n]);
 
                 if header_end.is_none() {
-                    if let Some(pos) =
-                        memchr::memmem::find(&read_buf, b"\r\n\r\n").map(|p| p + 4)
-                    {
+                    if let Some(pos) = memchr::memmem::find(&read_buf, b"\r\n\r\n").map(|p| p + 4) {
                         header_end = Some(pos);
                         let mut headers = [httparse::EMPTY_HEADER; 32];
                         let mut resp = httparse::Response::new(&mut headers);
@@ -572,9 +564,7 @@ fn do_one_op(
                                 )));
                             }
                         }
-                    } else if have_content_length
-                        && read_buf.len() - hdr >= content_length
-                    {
+                    } else if have_content_length && read_buf.len() - hdr >= content_length {
                         break;
                     }
                 }

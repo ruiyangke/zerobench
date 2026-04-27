@@ -25,13 +25,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::TcpListener as CompioTcpListener;
-use compio_tls::{TlsAcceptor, TlsStream};
 use compio::net::TcpStream;
+use compio_tls::{TlsAcceptor, TlsStream};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -87,7 +87,12 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-    Args { port, workers, tls, verbose }
+    Args {
+        port,
+        workers,
+        tls,
+        verbose,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,15 +101,11 @@ fn parse_args() -> Args {
 
 fn generate_tls_config() -> Arc<ServerConfig> {
     let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-        ])
-        .expect("self-signed cert");
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("self-signed cert");
 
     let cert_der: CertificateDer<'static> = cert.into();
-    let key_der: PrivatePkcs8KeyDer<'static> =
-        PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+    let key_der: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -151,9 +152,7 @@ fn main() {
 
     // Print banner
     if args.tls {
-        eprintln!(
-            "[zerobench-stub] TLS enabled (self-signed, ALPN: http/1.1)"
-        );
+        eprintln!("[zerobench-stub] TLS enabled (self-signed, ALPN: http/1.1)");
     }
     eprintln!(
         "[zerobench-stub] {} worker{} on port {}",
@@ -194,19 +193,16 @@ fn main() {
     }
 }
 
-fn run_worker(
-    port: u16,
-    use_reuseport: bool,
-    tls: Option<Arc<ServerConfig>>,
-    verbose: bool,
-) {
+fn run_worker(port: u16, use_reuseport: bool, tls: Option<Arc<ServerConfig>>, verbose: bool) {
     let rt = compio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
         let listener = if use_reuseport {
             let std_listener = create_reuseport_listener(port);
             CompioTcpListener::from_std(std_listener).unwrap()
         } else {
-            CompioTcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap()
+            CompioTcpListener::bind(format!("0.0.0.0:{port}"))
+                .await
+                .unwrap()
         };
 
         let acceptor = tls.map(TlsAcceptor::from);
@@ -241,10 +237,7 @@ fn run_worker(
 // Connection handler -- generic over plain TCP and TLS streams
 // ---------------------------------------------------------------------------
 
-async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
-    verbose: bool,
-) {
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, verbose: bool) {
     let mut data = Vec::with_capacity(8192);
 
     loop {
@@ -301,10 +294,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             // We may already have part of the body after the headers.
             let already_read = data.len() - headers_end;
             let remaining = content_length.saturating_sub(already_read);
-            if remaining > 0 {
-                if read_exact_into(&mut stream, &mut data, remaining).await.is_none() {
-                    return;
-                }
+            if remaining > 0
+                && read_exact_into(&mut stream, &mut data, remaining)
+                    .await
+                    .is_none()
+            {
+                return;
             }
             data[headers_end..headers_end + content_length].to_vec()
         } else {
@@ -354,9 +349,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 )
                 .await
             }
-            _ => {
-                write_response(&mut stream, 404, &[], b"not found").await
-            }
+            _ => write_response(&mut stream, 404, &[], b"not found").await,
         };
 
         if responded.is_err() {
@@ -381,7 +374,11 @@ async fn write_response<S: AsyncWrite + Unpin>(
     let reason = status_reason(status);
     let mut out = Vec::with_capacity(256 + body.len());
     out.extend_from_slice(
-        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n", body.len()).as_bytes(),
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+        .as_bytes(),
     );
     for (name, value) in headers {
         out.extend_from_slice(name.as_bytes());
@@ -510,12 +507,16 @@ fn is_ws_upgrade(headers: &[httparse::Header<'_>]) -> bool {
     for h in headers {
         if h.name.eq_ignore_ascii_case("upgrade") {
             let v = std::str::from_utf8(h.value).unwrap_or("");
-            if v.split(',').any(|t| t.trim().eq_ignore_ascii_case("websocket")) {
+            if v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+            {
                 has_upgrade = true;
             }
         } else if h.name.eq_ignore_ascii_case("connection") {
             let v = std::str::from_utf8(h.value).unwrap_or("");
-            if v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")) {
+            if v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+            {
                 has_connection = true;
             }
         }
@@ -566,14 +567,15 @@ async fn handle_ws_upgrade<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// WebSocket echo loop: read masked client frames, echo unmasked.
-async fn ws_echo_loop<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    mut buf: Vec<u8>,
-) {
+async fn ws_echo_loop<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, mut buf: Vec<u8>) {
     loop {
         // Try to decode a frame from the buffer.
         match try_decode_client_frame(&buf) {
-            FrameResult::Complete { opcode, payload, consumed } => {
+            FrameResult::Complete {
+                opcode,
+                payload,
+                consumed,
+            } => {
                 buf.drain(..consumed);
 
                 match opcode {
@@ -594,7 +596,7 @@ async fn ws_echo_loop<S: AsyncRead + AsyncWrite + Unpin>(
                             return;
                         }
                     }
-                    0xA => {} // Pong -- ignore.
+                    0xA => {}    // Pong -- ignore.
                     _ => return, // Unknown opcode.
                 }
             }
@@ -735,7 +737,12 @@ async fn handle_sse_stream<S: AsyncWrite + Unpin>(stream: &mut S, path: &str) {
                    Cache-Control: no-cache\r\n\
                    Connection: keep-alive\r\n\
                    \r\n";
-    if stream.write_all(headers.as_bytes().to_vec()).await.0.is_err() {
+    if stream
+        .write_all(headers.as_bytes().to_vec())
+        .await
+        .0
+        .is_err()
+    {
         return;
     }
     if stream.flush().await.is_err() {
@@ -758,7 +765,12 @@ async fn handle_sse_stream<S: AsyncWrite + Unpin>(stream: &mut S, path: &str) {
     }
 
     // Done sentinel.
-    if stream.write_all(b"data: [DONE]\n\n".to_vec()).await.0.is_err() {
+    if stream
+        .write_all(b"data: [DONE]\n\n".to_vec())
+        .await
+        .0
+        .is_err()
+    {
         return;
     }
     let _ = stream.flush().await;

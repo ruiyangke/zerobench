@@ -127,22 +127,28 @@ pub fn load_script_str(src: &str) -> Result<LoadedScript, ScriptError> {
     // which always returns a string — is unusable without them,
     // so register the minimum pair explicitly. Bad input yields a
     // runtime error via `EvalAltResult::ErrorRuntime`.
-    engine.register_fn("parse_int", |s: rhai::ImmutableString| -> Result<i64, Box<rhai::EvalAltResult>> {
-        s.trim().parse::<i64>().map_err(|e| {
-            Box::new(rhai::EvalAltResult::ErrorRuntime(
-                rhai::Dynamic::from(format!("parse_int({:?}): {e}", s.as_str())),
-                rhai::Position::NONE,
-            ))
-        })
-    });
-    engine.register_fn("parse_float", |s: rhai::ImmutableString| -> Result<f64, Box<rhai::EvalAltResult>> {
-        s.trim().parse::<f64>().map_err(|e| {
-            Box::new(rhai::EvalAltResult::ErrorRuntime(
-                rhai::Dynamic::from(format!("parse_float({:?}): {e}", s.as_str())),
-                rhai::Position::NONE,
-            ))
-        })
-    });
+    engine.register_fn(
+        "parse_int",
+        |s: rhai::ImmutableString| -> Result<i64, Box<rhai::EvalAltResult>> {
+            s.trim().parse::<i64>().map_err(|e| {
+                Box::new(rhai::EvalAltResult::ErrorRuntime(
+                    rhai::Dynamic::from(format!("parse_int({:?}): {e}", s.as_str())),
+                    rhai::Position::NONE,
+                ))
+            })
+        },
+    );
+    engine.register_fn(
+        "parse_float",
+        |s: rhai::ImmutableString| -> Result<f64, Box<rhai::EvalAltResult>> {
+            s.trim().parse::<f64>().map_err(|e| {
+                Box::new(rhai::EvalAltResult::ErrorRuntime(
+                    rhai::Dynamic::from(format!("parse_float({:?}): {e}", s.as_str())),
+                    rhai::Position::NONE,
+                ))
+            })
+        },
+    );
 
     // Cap a runaway script at ~10M operations. A well-formed plan builds
     // in well under a million ops; this guard rail catches infinite loops

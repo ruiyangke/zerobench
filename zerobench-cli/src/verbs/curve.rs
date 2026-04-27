@@ -65,20 +65,26 @@ pub struct CurveArgs {
 
     /// Knee p99 multiplier. Knee = first step whose p99 exceeds
     /// `multiplier × baseline p99` (baseline = first step).
-    #[arg(long = "knee-p99-mult", default_value_t = 2.0,
-          help_heading = "Curve")]
+    #[arg(long = "knee-p99-mult", default_value_t = 2.0, help_heading = "Curve")]
     pub knee_p99_mult: f64,
 
     /// Knee error rate threshold. Knee = also fires when error rate
     /// reaches this fraction of requests for ≥3 seconds consecutively
     /// (per PHILOSOPHY §P4).
-    #[arg(long = "knee-error-rate", default_value_t = 0.01,
-          help_heading = "Curve")]
+    #[arg(
+        long = "knee-error-rate",
+        default_value_t = 0.01,
+        help_heading = "Curve"
+    )]
     pub knee_error_rate: f64,
 
     /// Connection pool.
-    #[arg(short = 'c', long = "connections", default_value_t = 100,
-          help_heading = "Load")]
+    #[arg(
+        short = 'c',
+        long = "connections",
+        default_value_t = 100,
+        help_heading = "Load"
+    )]
     pub connections: usize,
 
     /// OS worker threads.
@@ -509,7 +515,8 @@ fn detect_knee(
                 i,
                 format!(
                     "p99 {}× baseline ({:.2}× threshold)",
-                    p99_mult, s.p99_ns as f64 / baseline
+                    p99_mult,
+                    s.p99_ns as f64 / baseline
                 ),
             ));
         }

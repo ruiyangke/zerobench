@@ -155,8 +155,9 @@ fn run_one_hold(
         match send_result {
             Ok(()) => {
                 stats.heartbeats_sent += 1;
-                stats.bytes_sent =
-                    stats.bytes_sent.saturating_add(heartbeat_payload.len() as u64);
+                stats.bytes_sent = stats
+                    .bytes_sent
+                    .saturating_add(heartbeat_payload.len() as u64);
             }
             Err(_) => {
                 stats.errors_write += 1;
@@ -301,7 +302,10 @@ fn extract_path(url: &zerobench_core::Template) -> String {
     };
     url.expand_into(&mut buf, &mut ctx);
     let s = String::from_utf8_lossy(&buf).to_string();
-    if let Some(path_start) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j)) {
+    if let Some(path_start) = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         s[path_start..].to_string()
     } else {
         "/".to_string()

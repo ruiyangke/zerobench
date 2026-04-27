@@ -20,8 +20,8 @@
 //! The CLI's `-H` flags are forwarded verbatim, so users who need those
 //! fields can pass them as raw headers.
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use rand::RngCore;
 use sha1::{Digest, Sha1};
 
@@ -183,13 +183,17 @@ pub fn validate_response(
         if name.eq_ignore_ascii_case("upgrade") {
             let v = std::str::from_utf8(h.value).unwrap_or("");
             // Upgrade: websocket
-            if v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("websocket")) {
+            if v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("websocket"))
+            {
                 has_upgrade = true;
             }
         } else if name.eq_ignore_ascii_case("connection") {
             let v = std::str::from_utf8(h.value).unwrap_or("");
             // Connection: Upgrade (may be a comma-separated token list)
-            if v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("upgrade")) {
+            if v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+            {
                 has_connection = true;
             }
         } else if name.eq_ignore_ascii_case("sec-websocket-accept") {

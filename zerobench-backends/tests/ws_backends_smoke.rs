@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 use zerobench_core::plan::{
-    FanoutMode, HeartbeatFrame, Mode, Plan, RateProfile, Scenario, Step, TriggerSpec,
-    WsFanoutPlan, WsHoldPlan, WsServerPushRttPlan,
+    FanoutMode, HeartbeatFrame, Mode, Plan, RateProfile, Scenario, Step, TriggerSpec, WsFanoutPlan,
+    WsHoldPlan, WsServerPushRttPlan,
 };
 use zerobench_core::template::Template;
 use zerobench_core::transport::{AddrFamily, Target, TransportOpts};
@@ -192,9 +192,7 @@ fn spawn_ws_hold_stub(ping_count: Arc<Mutex<u32>>) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .ok();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             if do_ws_handshake(&mut stream).is_err() {
                 return;
             }
@@ -261,10 +259,7 @@ fn ws_hold_sends_heartbeats_and_records_stats() {
     assert_eq!(stats.len(), 1, "one scenario");
     // At least one heartbeat should have reached the server in 400ms at 100ms cadence.
     let seen = *pings.lock().unwrap();
-    assert!(
-        seen >= 2,
-        "expected ≥2 heartbeat pings at stub; got {seen}"
-    );
+    assert!(seen >= 2, "expected ≥2 heartbeat pings at stub; got {seen}");
 }
 
 // ---------------------------------------------------------------------------
@@ -421,10 +416,7 @@ fn spawn_ws_fanout_stubs(triggers_seen: Arc<std::sync::atomic::AtomicU32>) -> So
             }
             // --- HTTP trigger path ---
             for line in req_s.lines() {
-                if let Some(v) = line
-                    .to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     body_len = v.trim().parse().unwrap_or(0);
                 }
             }
@@ -465,8 +457,7 @@ fn ws_fanout_receives_broadcasts_after_triggers() {
     // Trigger must live on the SAME host:port as the subscribers —
     // zerobench_backends::ws::fanout::fire_http_trigger reuses the WS Target
     // for the POST (same-host assumption documented in fanout.rs).
-    let trigger_url =
-        Template::compile(&format!("http://{ws_addr}/broadcast"), &mut vars).unwrap();
+    let trigger_url = Template::compile(&format!("http://{ws_addr}/broadcast"), &mut vars).unwrap();
     let fanout = WsFanoutPlan {
         subscribers: WsHoldPlan {
             url: ws_url,
@@ -537,9 +528,7 @@ fn spawn_ws_echo_text_verbatim() -> SocketAddr {
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             std::thread::spawn(move || {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
                 if do_ws_handshake(&mut stream).is_err() {
                     return;
                 }

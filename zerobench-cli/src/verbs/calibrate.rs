@@ -36,8 +36,12 @@ pub struct CalibrateArgs {
     pub duration: Duration,
 
     /// Connection pool size against the in-process echo. Defaults to 8.
-    #[arg(short = 'c', long = "concurrency", default_value_t = 8,
-          help_heading = "Load")]
+    #[arg(
+        short = 'c',
+        long = "concurrency",
+        default_value_t = 8,
+        help_heading = "Load"
+    )]
     pub concurrency: usize,
 }
 

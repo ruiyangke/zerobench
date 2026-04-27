@@ -105,10 +105,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
 fn section(title: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            title,
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
     ])
 }
 

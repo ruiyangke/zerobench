@@ -114,8 +114,13 @@ fn run_tui_inner(
     scenario_names: Vec<String>,
 ) -> io::Result<()> {
     let mut terminal: DefaultTerminal = ratatui::try_init()?;
-    let mut state =
-        DashboardState::new(target_rate, total_duration, url_label, transport, scenario_names);
+    let mut state = DashboardState::new(
+        target_rate,
+        total_duration,
+        url_label,
+        transport,
+        scenario_names,
+    );
 
     // `next_snapshot_at` tracks the wall-clock instant at which we'll
     // swap the LiveSnapshot bucket. Using a clock-anchored deadline
@@ -201,11 +206,7 @@ fn run_tui_inner(
 /// public behaviour contract: changing a binding ripples into the help
 /// overlay and the footer text and is easier to reason about in one
 /// place.
-pub(crate) fn handle_key(
-    state: &mut DashboardState,
-    code: KeyCode,
-    mods: KeyModifiers,
-) {
+pub(crate) fn handle_key(state: &mut DashboardState, code: KeyCode, mods: KeyModifiers) {
     // Help overlay eats most keys while visible — only `?`, `Esc`, or
     // `q` should close/quit.
     if state.help_visible {

@@ -311,22 +311,22 @@ impl ArchiveWriter {
 
     /// Write `plan.json`. Pretty-printed for human review.
     pub fn write_plan(&self, plan: &Plan) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(plan)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes =
+            serde_json::to_vec_pretty(plan).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.write_file("plan.json", &bytes)
     }
 
     /// Write `machine.json`.
     pub fn write_machine(&self, fp: &MachineFingerprint) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(fp)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes =
+            serde_json::to_vec_pretty(fp).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.write_file("machine.json", &bytes)
     }
 
     /// Write `env.json`.
     pub fn write_env(&self, env: &EnvRecord) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(env)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes =
+            serde_json::to_vec_pretty(env).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.write_file("env.json", &bytes)
     }
 
@@ -372,19 +372,23 @@ impl ArchiveWriter {
             builder.with_start_time(start);
             let mut writer = builder
                 .begin_log_with(&mut buf, &mut serializer)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog begin: {e:?}")))?;
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("histlog begin: {e:?}"))
+                })?;
 
             if let Some(c) = comment {
-                writer
-                    .write_comment(c)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog comment: {e:?}")))?;
+                writer.write_comment(c).map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("histlog comment: {e:?}"))
+                })?;
             }
 
             // Use the same `SystemTime` base for both start and
             // interval-offset: offset = `start.duration_since(start) = 0`.
             writer
                 .write_histogram(hist, Duration::ZERO, duration, None)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("histlog write: {e:?}")))?;
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("histlog write: {e:?}"))
+                })?;
             // IntervalLogWriter flushes on drop.
         }
 
@@ -607,28 +611,20 @@ mod tests {
         writer.write_env(&env).unwrap();
         writer.finalise(&idx).unwrap();
 
-        let plan_back: Plan = serde_json::from_slice(
-            &fs::read(writer.dir().join("plan.json")).unwrap(),
-        )
-        .unwrap();
+        let plan_back: Plan =
+            serde_json::from_slice(&fs::read(writer.dir().join("plan.json")).unwrap()).unwrap();
         assert_eq!(plan.name, plan_back.name);
 
-        let fp_back: MachineFingerprint = serde_json::from_slice(
-            &fs::read(writer.dir().join("machine.json")).unwrap(),
-        )
-        .unwrap();
+        let fp_back: MachineFingerprint =
+            serde_json::from_slice(&fs::read(writer.dir().join("machine.json")).unwrap()).unwrap();
         assert_eq!(fp, fp_back);
 
-        let env_back: EnvRecord = serde_json::from_slice(
-            &fs::read(writer.dir().join("env.json")).unwrap(),
-        )
-        .unwrap();
+        let env_back: EnvRecord =
+            serde_json::from_slice(&fs::read(writer.dir().join("env.json")).unwrap()).unwrap();
         assert_eq!(env.tool_version, env_back.tool_version);
 
-        let idx_back: Index = serde_json::from_slice(
-            &fs::read(writer.dir().join("INDEX.json")).unwrap(),
-        )
-        .unwrap();
+        let idx_back: Index =
+            serde_json::from_slice(&fs::read(writer.dir().join("INDEX.json")).unwrap()).unwrap();
         assert_eq!(idx, idx_back);
     }
 
@@ -749,7 +745,10 @@ mod tests {
         while let Some(entry) = iter.next() {
             let entry = entry.expect("parse entry");
             if let LogEntry::Interval(ilh) = entry {
-                assert!(!ilh.encoded_histogram().is_empty(), "empty histogram record");
+                assert!(
+                    !ilh.encoded_histogram().is_empty(),
+                    "empty histogram record"
+                );
                 assert_eq!(
                     ilh.duration(),
                     Duration::from_secs(10),

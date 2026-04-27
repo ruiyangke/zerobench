@@ -206,9 +206,7 @@ fn collect_kernel() -> String {
 
 fn collect_hostname_blake3() -> String {
     let mut buf = [0u8; 256];
-    let ret = unsafe {
-        libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-    };
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if ret != 0 {
         return "unknown".into();
     }
@@ -312,12 +310,7 @@ fn collect_ram_gib() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .trim()
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
             // 1 GiB = 1024 * 1024 KiB. /proc/meminfo reports in KiB.
             return Some(kb / (1024 * 1024));
         }
@@ -445,9 +438,7 @@ unsafe fn cstr_to_string(p: *const libc::c_char) -> String {
     if p.is_null() {
         return String::new();
     }
-    std::ffi::CStr::from_ptr(p)
-        .to_string_lossy()
-        .into_owned()
+    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
 }
 
 /// Duration → nanoseconds, saturating at u64::MAX. Tiny helper kept
@@ -515,7 +506,10 @@ mod tests {
             cgroup_version: None,
         };
         let j = serde_json::to_string(&fp).expect("serialize");
-        assert!(!j.contains("cpu_model"), "expected cpu_model omitted; got {j}");
+        assert!(
+            !j.contains("cpu_model"),
+            "expected cpu_model omitted; got {j}"
+        );
         assert!(
             !j.contains("cpu_flags"),
             "expected cpu_flags omitted when empty; got {j}"

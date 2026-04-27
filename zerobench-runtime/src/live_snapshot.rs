@@ -196,8 +196,9 @@ fn new_shard_array() -> Box<[Mutex<Histogram<u64>>; LATENCY_SHARDS]> {
     // AND produces a `Mutex<Histogram>` in a no-alloc way, so we build
     // the array via a vector and unwrap into a boxed array. The boxing
     // avoids a 480 KiB stack object at construction time.
-    let vec: Vec<Mutex<Histogram<u64>>> =
-        (0..LATENCY_SHARDS).map(|_| Mutex::new(new_hist())).collect();
+    let vec: Vec<Mutex<Histogram<u64>>> = (0..LATENCY_SHARDS)
+        .map(|_| Mutex::new(new_hist()))
+        .collect();
     vec.into_boxed_slice()
         .try_into()
         .expect("LATENCY_SHARDS vec always has the right length")

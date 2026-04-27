@@ -94,7 +94,7 @@ impl Target {
         // Strip path/query/fragment — the authority is whatever precedes
         // the first '/', '?', or '#'.
         let authority_end = rest
-            .find(|c: char| c == '/' || c == '?' || c == '#')
+            .find(['/', '?', '#'])
             .unwrap_or(rest.len());
         let authority = &rest[..authority_end];
         if authority.is_empty() {
@@ -128,9 +128,7 @@ impl Target {
         }
 
         let port = match port_str {
-            Some(s) => s
-                .parse::<u16>()
-                .map_err(|_| TargetError::InvalidPort(s))?,
+            Some(s) => s.parse::<u16>().map_err(|_| TargetError::InvalidPort(s))?,
             None => {
                 if tls {
                     443
@@ -481,11 +479,7 @@ mod tests {
         let mut t = Target::parse("http://example.com:8080").unwrap();
         t.addr_family = AddrFamily::Any;
         let opts = TransportOpts {
-            resolve_overrides: vec![(
-                "example.com".to_string(),
-                8080,
-                "10.0.0.1".to_string(),
-            )],
+            resolve_overrides: vec![("example.com".to_string(), 8080, "10.0.0.1".to_string())],
             ..TransportOpts::default()
         };
         let addr = t.resolve(&opts).unwrap();
@@ -497,11 +491,7 @@ mod tests {
     fn resolve_uses_override_v6() {
         let t = Target::parse("http://example.com:443").unwrap();
         let opts = TransportOpts {
-            resolve_overrides: vec![(
-                "example.com".to_string(),
-                443,
-                "::1".to_string(),
-            )],
+            resolve_overrides: vec![("example.com".to_string(), 443, "::1".to_string())],
             ..TransportOpts::default()
         };
         let addr = t.resolve(&opts).unwrap();
@@ -513,11 +503,7 @@ mod tests {
     fn resolve_override_is_case_insensitive_host() {
         let t = Target::parse("http://ExAmPlE.CoM:80").unwrap();
         let opts = TransportOpts {
-            resolve_overrides: vec![(
-                "example.com".to_string(),
-                80,
-                "10.0.0.5".to_string(),
-            )],
+            resolve_overrides: vec![("example.com".to_string(), 80, "10.0.0.5".to_string())],
             ..TransportOpts::default()
         };
         let addr = t.resolve(&opts).unwrap();
@@ -530,11 +516,7 @@ mod tests {
         let opts = TransportOpts {
             // Wrong port — must fall through to DNS (which will fail
             // deterministically here because example.com is arbitrary).
-            resolve_overrides: vec![(
-                "example.com".to_string(),
-                9999,
-                "10.0.0.1".to_string(),
-            )],
+            resolve_overrides: vec![("example.com".to_string(), 9999, "10.0.0.1".to_string())],
             ..TransportOpts::default()
         };
         // Without a matching override we go to real DNS. On a sandbox
@@ -550,11 +532,7 @@ mod tests {
     fn resolve_override_invalid_ip_is_error() {
         let t = Target::parse("http://example.com:80").unwrap();
         let opts = TransportOpts {
-            resolve_overrides: vec![(
-                "example.com".to_string(),
-                80,
-                "not-an-ip".to_string(),
-            )],
+            resolve_overrides: vec![("example.com".to_string(), 80, "not-an-ip".to_string())],
             ..TransportOpts::default()
         };
         let err = t.resolve(&opts).unwrap_err();
@@ -567,11 +545,7 @@ mod tests {
         let mut t = Target::parse("http://localhost:1234").unwrap();
         t.addr_family = AddrFamily::V4;
         let opts = TransportOpts {
-            resolve_overrides: vec![(
-                "localhost".to_string(),
-                1234,
-                "127.0.0.1".to_string(),
-            )],
+            resolve_overrides: vec![("localhost".to_string(), 1234, "127.0.0.1".to_string())],
             ..TransportOpts::default()
         };
         let addr = t.resolve(&opts).unwrap();
@@ -612,5 +586,4 @@ mod tests {
         let err = t.resolve(&opts).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
-
 }

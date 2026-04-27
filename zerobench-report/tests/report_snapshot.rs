@@ -12,9 +12,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use zerobench_core::plan::{
-    Assertion, Plan, RateProfile, RequestPlan, Scenario, Step,
-};
+use zerobench_core::plan::{Assertion, Plan, RateProfile, RequestPlan, Scenario, Step};
 use zerobench_core::stats::{ErrorKind, Summary, TaskStats};
 use zerobench_core::template::Template;
 use zerobench_core::var::VarRegistry;
@@ -33,7 +31,9 @@ fn sample_plan(duration: Duration) -> Plan {
     Plan {
         scenarios: vec![Scenario {
             name: "bench".into(),
-            rate: RateProfile::Saturate { max_concurrency: 50 },
+            rate: RateProfile::Saturate {
+                max_concurrency: 50,
+            },
             steps: vec![Step::Request(req)],
         }],
         vars,
@@ -56,12 +56,16 @@ fn two_scenario_plan(duration: Duration) -> Plan {
         scenarios: vec![
             Scenario {
                 name: "purchase-flow".into(),
-                rate: RateProfile::Saturate { max_concurrency: 50 },
+                rate: RateProfile::Saturate {
+                    max_concurrency: 50,
+                },
                 steps: vec![Step::Request(RequestPlan::get(a))],
             },
             Scenario {
                 name: "browse-only".into(),
-                rate: RateProfile::Saturate { max_concurrency: 50 },
+                rate: RateProfile::Saturate {
+                    max_concurrency: 50,
+                },
                 steps: vec![Step::Request(RequestPlan::get(b))],
             },
         ],
@@ -128,8 +132,7 @@ fn terminal_single_scenario_contains_expected_fields() {
     let summary = build_summary(1, Duration::from_secs(30));
 
     let mut out = Vec::new();
-    print_terminal(&summary, &plan, ColorChoice::Never, false, &mut out)
-        .expect("terminal render");
+    print_terminal(&summary, &plan, ColorChoice::Never, false, &mut out).expect("terminal render");
     let s = String::from_utf8(out).expect("utf8");
 
     // Header labels.
@@ -162,10 +165,16 @@ fn terminal_single_scenario_contains_expected_fields() {
     assert!(s.contains("30.00s"), "expected '30.00s' in output:\n{s}");
 
     // No per-scenario block for a single-scenario plan.
-    assert!(!s.contains("scenarios\n"), "unexpected per-scenario block:\n{s}");
+    assert!(
+        !s.contains("scenarios\n"),
+        "unexpected per-scenario block:\n{s}"
+    );
 
     // Color-off: no ANSI codes.
-    assert!(!s.contains('\x1b'), "ANSI escape present with ColorChoice::Never:\n{s}");
+    assert!(
+        !s.contains('\x1b'),
+        "ANSI escape present with ColorChoice::Never:\n{s}"
+    );
 }
 
 #[test]
@@ -174,8 +183,7 @@ fn terminal_multi_scenario_renders_per_scenario_block() {
     let summary = build_summary(2, Duration::from_secs(10));
 
     let mut out = Vec::new();
-    print_terminal(&summary, &plan, ColorChoice::Never, false, &mut out)
-        .expect("terminal render");
+    print_terminal(&summary, &plan, ColorChoice::Never, false, &mut out).expect("terminal render");
     let s = String::from_utf8(out).expect("utf8");
 
     // "scenarios" header appears.
@@ -192,10 +200,12 @@ fn terminal_color_always_produces_ansi_codes() {
     let summary = build_summary(1, Duration::from_secs(1));
 
     let mut out = Vec::new();
-    print_terminal(&summary, &plan, ColorChoice::Always, false, &mut out)
-        .expect("terminal render");
+    print_terminal(&summary, &plan, ColorChoice::Always, false, &mut out).expect("terminal render");
     let s = String::from_utf8(out).expect("utf8");
-    assert!(s.contains('\x1b'), "expected ANSI escape with ColorChoice::Always");
+    assert!(
+        s.contains('\x1b'),
+        "expected ANSI escape with ColorChoice::Always"
+    );
 }
 
 // ---------------------------------------------------------------------------

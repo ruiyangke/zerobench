@@ -202,16 +202,19 @@ impl WsConnection {
         // For plain TCP, we wait for the connect event ourselves before
         // writing the WS upgrade request.
         let mut stream = if target.tls {
-            let config = tls_config.ok_or_else(|| {
-                WsError::Tls("wss:// target but no TLS config provided".into())
-            })?;
+            let config = tls_config
+                .ok_or_else(|| WsError::Tls("wss:// target but no TLS config provided".into()))?;
             let sni = target.sni_name().to_string();
             let mut tls = MioTlsStream::new(tcp, Arc::clone(config), &sni)
                 .map_err(|e| WsError::Tls(format!("tls init: {e}")))?;
             tls.complete_handshake(&mut poll, token, opts.connect_timeout)
                 .map_err(|e| WsError::Tls(format!("tls handshake: {e}")))?;
             poll.registry()
-                .reregister(tls.tcp_stream_mut(), token, Interest::READABLE | Interest::WRITABLE)
+                .reregister(
+                    tls.tcp_stream_mut(),
+                    token,
+                    Interest::READABLE | Interest::WRITABLE,
+                )
                 .map_err(WsError::Io)?;
             MioStream::Tls(tls)
         } else {
@@ -293,7 +296,13 @@ impl WsConnection {
         let mask = generate_mask(&mut self.mask_rng);
         let mut buf = Vec::with_capacity(14 + payload.len());
         frame::encode_frame(opcode, payload, mask, &mut buf);
-        write_all_mio(&mut self.stream, &buf, &mut self.poll, &mut self.events, self.token)?;
+        write_all_mio(
+            &mut self.stream,
+            &buf,
+            &mut self.poll,
+            &mut self.events,
+            self.token,
+        )?;
         self.stream.flush_tls();
         Ok(())
     }
@@ -362,10 +371,7 @@ impl WsConnection {
     /// still handled transparently, so this also keeps auto-Pong alive
     /// for callers that need bounded waits (e.g. `WsHold` between
     /// heartbeats; `WsServerPushRtt` deadline polling).
-    pub fn try_recv(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<DataFrame>, WsError> {
+    pub fn try_recv(&mut self, timeout: Duration) -> Result<Option<DataFrame>, WsError> {
         let deadline = Instant::now() + timeout;
         loop {
             match frame::decode_frame(&self.recv_buf) {
@@ -505,7 +511,13 @@ impl WsConnection {
         let mask = generate_mask(&mut self.mask_rng);
         frame::encode_close(code, reason, mask, &mut buf);
         self.close_sent = true;
-        write_all_mio(&mut self.stream, &buf, &mut self.poll, &mut self.events, self.token)?;
+        write_all_mio(
+            &mut self.stream,
+            &buf,
+            &mut self.poll,
+            &mut self.events,
+            self.token,
+        )?;
         self.stream.flush_tls();
         Ok(())
     }

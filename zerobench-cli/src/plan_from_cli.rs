@@ -16,9 +16,7 @@ use http::Method;
 use smallvec::SmallVec;
 use zerobench_core::plan::{Assertion, BodySource, Plan, RateProfile, RequestPlan};
 use zerobench_core::plan_builder::{scenario_http_request, PlanBuilder};
-use zerobench_core::request_file::{
-    parse_request_bytes, parse_scenario_dir, RequestFileError,
-};
+use zerobench_core::request_file::{parse_request_bytes, parse_scenario_dir, RequestFileError};
 use zerobench_core::template::Template;
 use zerobench_core::transport::{HttpVersionPref, Target, TargetError, TransportOpts};
 
@@ -128,11 +126,12 @@ fn build_from_url(
     // S2.22 — warn on explicit `-X GET` combined with a body.
     if has_body_hint
         && method == Method::GET
-        && args.method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("GET"))
+        && args
+            .method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("GET"))
     {
-        eprintln!(
-            "warning: GET request with body — technically valid but most servers ignore it",
-        );
+        eprintln!("warning: GET request with body — technically valid but most servers ignore it",);
     }
 
     // `PlanBuilder` owns the VarRegistry; we compile templates against
@@ -241,11 +240,11 @@ fn push_auth_header(
         None
     };
 
-    let Some(value) = auth_value else { return Ok(()) };
+    let Some(value) = auth_value else {
+        return Ok(());
+    };
     if user_has_auth_header {
-        eprintln!(
-            "warning: -H 'Authorization: ...' overrides --basic-auth / --bearer",
-        );
+        eprintln!("warning: -H 'Authorization: ...' overrides --basic-auth / --bearer",);
         return Ok(());
     }
     headers.push((
@@ -397,9 +396,7 @@ fn build_from_request_dir(
     // not a routing key.
     let (first_file, first) = first_target.expect("at least one scenario");
     let first_authority = format_authority(&first);
-    let all_match = host_summary
-        .iter()
-        .all(|(_, a)| a == &first_authority);
+    let all_match = host_summary.iter().all(|(_, a)| a == &first_authority);
     if !all_match {
         let mut lines = Vec::with_capacity(host_summary.len());
         lines.push(format!("  {first_file}: {first_authority}"));
@@ -611,9 +608,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zerobench-multihost-{pid}-{seq}-{nanos}"
-        ));
+        let dir = std::env::temp_dir().join(format!("zerobench-multihost-{pid}-{seq}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Two scenarios pointing at *different* hosts.
@@ -700,13 +695,7 @@ mod tests {
 
     #[test]
     fn build_warmup_is_plumbed_through_to_plan() {
-        let args = parse(&[
-            "zerobench",
-            "--saturate",
-            "--warmup",
-            "7s",
-            "http://h:1/",
-        ]);
+        let args = parse(&["zerobench", "--saturate", "--warmup", "7s", "http://h:1/"]);
         let (plan, _target, _opts) = build(&args).unwrap();
         assert_eq!(plan.warmup, std::time::Duration::from_secs(7));
     }
@@ -745,7 +734,9 @@ mod tests {
         ]);
         let (plan, _target, _opts) = build(&args).unwrap();
         let step = &plan.scenarios[0].steps[0];
-        let Step::Request(req) = step else { panic!("expected Request") };
+        let Step::Request(req) = step else {
+            panic!("expected Request")
+        };
         // Expect one header named `Authorization`.
         assert_eq!(req.headers.len(), 1);
     }
@@ -832,9 +823,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zerobench-samehost-{pid}-{seq}-{nanos}"
-        ));
+        let dir = std::env::temp_dir().join(format!("zerobench-samehost-{pid}-{seq}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("login.http"),

@@ -24,12 +24,12 @@ use mio::{Events, Interest, Poll, Token};
 use rand::Rng;
 use rustls::ClientConfig;
 
+use crate::http::mio_tls::MioStream;
 use zerobench_core::histogram::{duration_to_hist_ns, new_hist};
 use zerobench_core::plan::{Plan, Protocol, SseReconnectStormPlan, Step};
 use zerobench_core::stats::{ErrorKind, SseExtras, TaskStats};
 use zerobench_core::transport::{Target, TransportOpts};
 use zerobench_runtime::transport::{classify, TransportError};
-use crate::http::mio_tls::MioStream;
 
 use crate::sse::line_parser::{SseEvent, SseLineParser};
 
@@ -99,7 +99,9 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
             Step::SseReconnectStorm(p) => Some(p.clone()),
             _ => None,
         });
-        let Some(storm_plan) = storm_plan else { continue };
+        let Some(storm_plan) = storm_plan else {
+            continue;
+        };
 
         let wall_deadline = Instant::now()
             + duration.min(if storm_plan.subscribers.hold_for.is_zero() {
@@ -161,8 +163,9 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
 
         // Only the resumed count is counted as a hard error; connect
         // failures during reconnect are accepted for storm loads.
-        let resume_failures =
-            rollup.reconnects_succeeded.saturating_sub(rollup.reconnects_resumed);
+        let resume_failures = rollup
+            .reconnects_succeeded
+            .saturating_sub(rollup.reconnects_resumed);
 
         let mut task = TaskStats::new(num_scenarios);
         if let Some(sc) = task.per_scenario.get_mut(sid) {
@@ -171,10 +174,18 @@ pub fn run_sse_reconnect_storm_from_plan_threaded(
             task.bytes_recv = rollup.bytes_received;
             sc.errors.connect = rollup.errors_connect;
             sc.errors.read = rollup.errors_read
-                + if storm_plan.verify_last_event_id { resume_failures } else { 0 };
+                + if storm_plan.verify_last_event_id {
+                    resume_failures
+                } else {
+                    0
+                };
             task.errors.connect += rollup.errors_connect;
             task.errors.read += rollup.errors_read
-                + if storm_plan.verify_last_event_id { resume_failures } else { 0 };
+                + if storm_plan.verify_last_event_id {
+                    resume_failures
+                } else {
+                    0
+                };
             *sc.sse_mut() = SseExtras {
                 ttfb: ttfb_hist,
                 chunk_gap: reconnect_gap,
@@ -224,7 +235,11 @@ fn run_one_subscriber(
         };
         let session_deadline = (Instant::now() + kill_duration).min(deadline);
 
-        let prior_id = if first_connect { None } else { last_event_id.clone() };
+        let prior_id = if first_connect {
+            None
+        } else {
+            last_event_id.clone()
+        };
         if !first_connect {
             stats.reconnects_attempted += 1;
         }
@@ -266,8 +281,7 @@ fn run_one_subscriber(
                     if let (Some(prior_end), Some(first_byte)) =
                         (prior_session_end, session.first_byte_at)
                     {
-                        reconnect_gaps
-                            .push(first_byte.saturating_duration_since(prior_end));
+                        reconnect_gaps.push(first_byte.saturating_duration_since(prior_end));
                     }
                     // C6: Resume-honoured heuristic. We count a
                     // reconnect as "resumed" only when (a) the server
@@ -281,10 +295,7 @@ fn run_one_subscriber(
                     // server that skips past prior and only emits new
                     // IDs does NOT trip saw_prior_id → counted as
                     // resumed.
-                    if prior_id.is_some()
-                        && session.events > 0
-                        && !session.saw_prior_id
-                    {
+                    if prior_id.is_some() && session.events > 0 && !session.saw_prior_id {
                         stats.reconnects_resumed += 1;
                     }
                 }
@@ -346,11 +357,14 @@ fn run_one_session(
         .map_err(|_| TransportError::Connect("dns".into()))?;
     let mut poll = Poll::new().map_err(|e| TransportError::Connect(e.to_string()))?;
     let mut events = Events::with_capacity(4);
-    let mut tcp =
-        MioTcp::connect(addr).map_err(|e| TransportError::Connect(e.to_string()))?;
+    let mut tcp = MioTcp::connect(addr).map_err(|e| TransportError::Connect(e.to_string()))?;
     let _ = tcp.set_nodelay(true);
     poll.registry()
-        .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)
+        .register(
+            &mut tcp,
+            POLL_TOKEN,
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .map_err(|e| TransportError::Connect(e.to_string()))?;
     wait_for(&mut poll, &mut events, opts.connect_timeout, |e| {
         e.token() == POLL_TOKEN && e.is_writable()
@@ -360,8 +374,7 @@ fn run_one_session(
         return Err(TransportError::Connect(e.to_string()));
     }
     let mut stream = if target.tls {
-        let cfg = tls_config
-            .ok_or_else(|| TransportError::Tls("tls config missing".into()))?;
+        let cfg = tls_config.ok_or_else(|| TransportError::Tls("tls config missing".into()))?;
         let sni = target.sni_name().to_string();
         let tls = crate::http::mio_tls::MioTlsStream::new(tcp, Arc::clone(cfg), &sni)
             .map_err(|e| TransportError::Tls(e.to_string()))?;
@@ -482,8 +495,7 @@ fn run_one_session(
                 if now >= deadline {
                     break;
                 }
-                let budget =
-                    (deadline - now).min(Duration::from_millis(100));
+                let budget = (deadline - now).min(Duration::from_millis(100));
                 let _ = poll.poll(&mut events, Some(budget));
             }
             Err(e) => {
@@ -505,7 +517,10 @@ fn wait_for(
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "reconnect-storm wait"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "reconnect-storm wait",
+            ));
         }
         poll.poll(events, Some(deadline - now))?;
         for ev in events.iter() {
@@ -522,7 +537,10 @@ fn build_request(
     last_event_id: Option<&str>,
 ) -> Vec<u8> {
     let url_str = render_template(&plan.subscribers.url);
-    let path = match url_str.find("://").and_then(|i| url_str[i + 3..].find('/').map(|j| i + 3 + j)) {
+    let path = match url_str
+        .find("://")
+        .and_then(|i| url_str[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         Some(p) => url_str[p..].to_string(),
         None => "/".to_string(),
     };

@@ -101,9 +101,8 @@ fn run_one_push(
             Ok(Some(DataFrame::Text(b))) | Ok(Some(DataFrame::Binary(b))) => {
                 let now = Instant::now();
                 if let Some(prev) = last_at {
-                    let gap =
-                        duration_to_hist_ns(now.saturating_duration_since(prev))
-                            .clamp(HIST_LO_NS, HIST_HI_NS);
+                    let gap = duration_to_hist_ns(now.saturating_duration_since(prev))
+                        .clamp(HIST_LO_NS, HIST_HI_NS);
                     let _ = stats.gap.record(gap);
                     if let Some(live) = live {
                         // Op-count semantic: each inbound frame is
@@ -275,7 +274,10 @@ fn extract_path(url: &zerobench_core::Template) -> String {
     };
     url.expand_into(&mut buf, &mut ctx);
     let s = String::from_utf8_lossy(&buf).to_string();
-    if let Some(path_start) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j)) {
+    if let Some(path_start) = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         s[path_start..].to_string()
     } else {
         "/".to_string()

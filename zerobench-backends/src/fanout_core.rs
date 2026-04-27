@@ -74,7 +74,10 @@ pub fn fire_trigger(
     trigger_url: &str,
     tls_config: Option<&Arc<ClientConfig>>,
 ) -> std::io::Result<()> {
-    let path = match trigger_url.find("://").and_then(|i| trigger_url[i + 3..].find('/')) {
+    let path = match trigger_url
+        .find("://")
+        .and_then(|i| trigger_url[i + 3..].find('/'))
+    {
         Some(rel) => {
             let abs_idx = trigger_url.find("://").map(|i| i + 3).unwrap_or(0) + rel;
             &trigger_url[abs_idx..]
@@ -105,7 +108,10 @@ pub fn render_template(tpl: &Template) -> String {
 /// before writing it into a wire request.
 pub fn extract_path(url: &Template) -> String {
     let s = render_template(url);
-    if let Some(path_start) = s.find("://").and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j)) {
+    if let Some(path_start) = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         s[path_start..].to_string()
     } else {
         "/".to_string()

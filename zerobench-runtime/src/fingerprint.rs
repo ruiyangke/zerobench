@@ -53,8 +53,7 @@ pub fn canonical_sha256<T: Serialize>(value: &T) -> String {
     let v = serde_json::to_value(value).expect("value must be serialisable");
     let canonical = canonicalise(v);
     // `serde_json::to_vec` uses compact (no-whitespace) formatting.
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical value must be re-serialisable");
+    let bytes = serde_json::to_vec(&canonical).expect("canonical value must be re-serialisable");
     let digest = Sha256::digest(&bytes);
     hex::encode(digest)
 }
@@ -377,7 +376,9 @@ mod tests {
         let mut p2 = Plan::new();
         p2.scenarios.push(Scenario {
             name: "added".into(),
-            rate: RateProfile::Saturate { max_concurrency: 10 },
+            rate: RateProfile::Saturate {
+                max_concurrency: 10,
+            },
             steps: Vec::new(),
         });
         assert_ne!(plan_hash(&p1), plan_hash(&p2));

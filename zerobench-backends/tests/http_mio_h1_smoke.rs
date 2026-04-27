@@ -28,18 +28,14 @@ fn spawn_server(stop: Arc<AtomicBool>) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(false).unwrap();
     // Short accept timeout so we can check the stop flag.
-    listener
-        .set_nonblocking(false)
-        .unwrap();
+    listener.set_nonblocking(false).unwrap();
 
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong";
 
     std::thread::spawn(move || {
         // Set a short timeout on accept so the loop can check `stop`.
         // On Linux, use SO_RCVTIMEO via the socket itself.
-        listener
-            .set_nonblocking(true)
-            .unwrap();
+        listener.set_nonblocking(true).unwrap();
 
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -179,8 +175,8 @@ fn mio_threaded_records_requests() {
         &target,
         &topts,
         &plan,
-        2,  // 2 threads
-        8,  // 8 total connections
+        2, // 2 threads
+        8, // 8 total connections
         plan.duration,
         None, // saturate mode
         None, // no TLS
@@ -209,9 +205,7 @@ fn mio_https_without_server_records_connect_errors() {
     let req = RequestPlan::get(url);
     let scenario = Scenario {
         name: "tls".into(),
-        rate: RateProfile::Saturate {
-            max_concurrency: 1,
-        },
+        rate: RateProfile::Saturate { max_concurrency: 1 },
         steps: vec![Step::Request(req)],
     };
     let plan = Plan {
@@ -230,9 +224,21 @@ fn mio_https_without_server_records_connect_errors() {
         insecure_tls: true,
         ..Default::default()
     };
-    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]));
+    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(
+        &opts,
+        &[b"http/1.1"],
+    ));
     let stats = zerobench_backends::http::mio_h1::run_mio_threaded(
-        &target, &opts, &plan, 1, 1, Duration::from_secs(1), None, tls_config, None, None,
+        &target,
+        &opts,
+        &plan,
+        1,
+        1,
+        Duration::from_secs(1),
+        None,
+        tls_config,
+        None,
+        None,
     );
     // No panic -- that's the key assertion. Stats may have connect errors.
     let total: u64 = stats.iter().map(|s| s.requests).sum();
@@ -309,8 +315,8 @@ fn mio_open_loop_records_keepup_on_overload() {
         2, // only 2 connections -- bottleneck
         &worker_stop,
         Some(1_000_000.0), // 1M req/s -- way more than 2 connections can handle
-        None, // no TLS
-        None, // no LiveSnapshot
+        None,              // no TLS
+        None,              // no LiveSnapshot
     );
 
     stop.store(true, Ordering::Relaxed);
@@ -338,8 +344,7 @@ fn spawn_tls_server(stop: Arc<AtomicBool>) -> SocketAddr {
         generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("self-signed cert");
     let cert_der: CertificateDer<'static> = cert.into();
-    let key_der: PrivatePkcs8KeyDer<'static> =
-        PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+    let key_der: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -414,7 +419,11 @@ fn mio_tls_stream_low_level() {
     tcp.set_nodelay(true).ok();
     let token = mio::Token(0);
     poll.registry()
-        .register(&mut tcp, token, mio::Interest::READABLE | mio::Interest::WRITABLE)
+        .register(
+            &mut tcp,
+            token,
+            mio::Interest::READABLE | mio::Interest::WRITABLE,
+        )
         .unwrap();
 
     let opts = zerobench_core::transport::TransportOpts {
@@ -422,7 +431,8 @@ fn mio_tls_stream_low_level() {
         ..Default::default()
     };
     let config = zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]);
-    let mut tls = zerobench_backends::http::mio_tls::MioTlsStream::new(tcp, config, "localhost").unwrap();
+    let mut tls =
+        zerobench_backends::http::mio_tls::MioTlsStream::new(tcp, config, "localhost").unwrap();
     tls.complete_handshake(&mut poll, token, std::time::Duration::from_secs(10))
         .unwrap();
 
@@ -440,7 +450,8 @@ fn mio_tls_stream_low_level() {
         if std::time::Instant::now() > deadline {
             panic!("timeout waiting for TLS response");
         }
-        poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .unwrap();
         let mut buf = [0u8; 4096];
         match tls.read(&mut buf) {
             Ok(0) => break,
@@ -469,8 +480,11 @@ fn mio_h1_tls_with_self_signed_cert() {
     let addr = spawn_tls_server(stop.clone());
 
     let mut vars = VarRegistry::new();
-    let url = Template::compile(&format!("https://127.0.0.1:{}/bench", addr.port()), &mut vars)
-        .unwrap();
+    let url = Template::compile(
+        &format!("https://127.0.0.1:{}/bench", addr.port()),
+        &mut vars,
+    )
+    .unwrap();
     let req = RequestPlan::get(url);
     let scenario = Scenario {
         name: "mio-tls-smoke".into(),
@@ -496,7 +510,10 @@ fn mio_h1_tls_with_self_signed_cert() {
         insecure_tls: true,
         ..Default::default()
     };
-    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]));
+    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(
+        &opts,
+        &[b"http/1.1"],
+    ));
 
     let worker_stop = Arc::new(AtomicBool::new(false));
     let ws = worker_stop.clone();
@@ -521,7 +538,10 @@ fn mio_h1_tls_with_self_signed_cert() {
     assert!(
         stats.requests > 0,
         "expected at least some TLS requests, got {} (errors: connect={}, read={}, write={})",
-        stats.requests, stats.errors.connect, stats.errors.read, stats.errors.write,
+        stats.requests,
+        stats.errors.connect,
+        stats.errors.read,
+        stats.errors.write,
     );
     assert!(
         stats.bytes_sent > 0,

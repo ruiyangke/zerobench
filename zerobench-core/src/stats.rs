@@ -830,18 +830,12 @@ mod tests {
 
     #[test]
     fn duration_clamps_above_hi() {
-        assert_eq!(
-            duration_to_hist_ns(Duration::from_secs(120)),
-            HIST_HI_NS
-        );
+        assert_eq!(duration_to_hist_ns(Duration::from_secs(120)), HIST_HI_NS);
     }
 
     #[test]
     fn duration_preserves_mid_range() {
-        assert_eq!(
-            duration_to_hist_ns(Duration::from_nanos(500)),
-            500
-        );
+        assert_eq!(duration_to_hist_ns(Duration::from_nanos(500)), 500);
     }
 
     #[test]

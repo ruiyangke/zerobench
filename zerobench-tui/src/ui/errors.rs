@@ -279,7 +279,9 @@ fn render_status_timeseries(frame: &mut Frame, area: Rect, state: &DashboardStat
 
 fn render_cumulative_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let e = &state.total_errors;
-    let success = state.total_requests.saturating_sub(e.status_4xx + e.status_5xx);
+    let success = state
+        .total_requests
+        .saturating_sub(e.status_4xx + e.status_5xx);
 
     let dim = Style::new().fg(Color::DarkGray);
     let red_bold = Style::new().fg(CRITICAL).add_modifier(Modifier::BOLD);

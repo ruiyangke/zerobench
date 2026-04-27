@@ -77,8 +77,7 @@ use zerobench_runtime::{LiveSnapshot, Recorder, Sample};
 use super::mio_tls::{MioStream, MioTlsStream};
 use super::raw_h1_common::{
     build_raw_request, find_connection_close, find_content_length_raw,
-    find_transfer_encoding_chunked, ChunkProgress, ChunkedDecoder, ConnectionMode,
-    ContentLength,
+    find_transfer_encoding_chunked, ChunkProgress, ChunkedDecoder, ConnectionMode, ContentLength,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,11 +107,15 @@ fn connect_with_retry(
     let addr = target.resolve(opts)?;
     match connect_once(addr) {
         Ok(s) => Ok((s, addr)),
-        Err(e) if matches!(
-            e.kind(),
-            io::ErrorKind::ConnectionRefused | io::ErrorKind::HostUnreachable
-                | io::ErrorKind::NetworkUnreachable | io::ErrorKind::TimedOut
-        ) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::TimedOut
+            ) =>
+        {
             // One re-resolve + retry. If the second attempt fails, bubble
             // the original error kind up — callers classify it as Connect.
             let fresh = target.resolve(opts)?;
@@ -332,8 +335,14 @@ impl Conn {
         scenario_id: u16,
     ) {
         self.write_buf.clear();
-        build_raw_request(plan, ctx, target, ConnectionMode::KeepAlive, &mut self.write_buf)
-            .expect("failed to build request bytes");
+        build_raw_request(
+            plan,
+            ctx,
+            target,
+            ConnectionMode::KeepAlive,
+            &mut self.write_buf,
+        )
+        .expect("failed to build request bytes");
         self.write_offset = 0;
         self.read_buf.clear();
         self.intended_start = intended_start;
@@ -398,7 +407,10 @@ impl Conn {
                 }
                 Ok(None)
             }
-            ConnState::ReadingChunkedBody { header_len, ref mut decoder } => {
+            ConnState::ReadingChunkedBody {
+                header_len,
+                ref mut decoder,
+            } => {
                 let body = &self.read_buf[header_len..];
                 match decoder.advance(body) {
                     ChunkProgress::NeedMore => Ok(None),
@@ -454,10 +466,13 @@ impl Conn {
                         if h.name.is_empty() {
                             break;
                         }
-                        let name_lower: Vec<u8> =
-                            h.name.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
-                        self.extracted_headers
-                            .push((name_lower, h.value.to_vec()));
+                        let name_lower: Vec<u8> = h
+                            .name
+                            .as_bytes()
+                            .iter()
+                            .map(|b| b.to_ascii_lowercase())
+                            .collect();
+                        self.extracted_headers.push((name_lower, h.value.to_vec()));
                     }
                 }
 
@@ -625,7 +640,10 @@ pub fn run_mio_worker(
     let first_req_plan = plan.scenarios[http_indices[0]]
         .steps
         .iter()
-        .find_map(|s| match s { Step::Request(r) => Some(r), _ => None })
+        .find_map(|s| match s {
+            Step::Request(r) => Some(r),
+            _ => None,
+        })
         .expect("HTTP scenario must have at least one Request step");
     let use_static = single_scenario
         && first_req_plan.is_static()
@@ -693,11 +711,7 @@ pub fn run_mio_worker(
         // plain and TLS paths — mio watches the socket fd, not the
         // TLS wrapper).
         poll.registry()
-            .register(
-                &mut tcp,
-                Token(i),
-                Interest::READABLE | Interest::WRITABLE,
-            )
+            .register(&mut tcp, Token(i), Interest::READABLE | Interest::WRITABLE)
             .expect("mio register");
 
         let stream = if let Some(ref config) = tls_config {
@@ -760,7 +774,14 @@ pub fn run_mio_worker(
         for (i, conn) in connections.iter_mut().enumerate() {
             let sel = pick_scenario(plan, &http_indices, &mut ctx);
             conn_scenario_idx[i] = sel.scenario_id as usize;
-            prepare_conn!(conn, now, sel.request_plan, &mut ctx, target, sel.scenario_id);
+            prepare_conn!(
+                conn,
+                now,
+                sel.request_plan,
+                &mut ctx,
+                target,
+                sel.scenario_id
+            );
         }
     }
 
@@ -794,7 +815,14 @@ pub fn run_mio_worker(
                     let sel = pick_scenario(plan, &http_indices, &mut ctx);
                     conn_scenario_idx[conn_idx] = sel.scenario_id as usize;
                     let conn = &mut connections[conn_idx];
-                    prepare_conn!(conn, intended, sel.request_plan, &mut ctx, target, sel.scenario_id);
+                    prepare_conn!(
+                        conn,
+                        intended,
+                        sel.request_plan,
+                        &mut ctx,
+                        target,
+                        sel.scenario_id
+                    );
                     match conn.try_write() {
                         Ok(true) => conn.state = ConnState::ReadingHeaders,
                         Ok(false) => {}
@@ -869,7 +897,14 @@ pub fn run_mio_worker(
                         // prior events in this same batch.
                         let sel = pick_scenario(plan, &http_indices, &mut ctx);
                         conn_scenario_idx[idx] = sel.scenario_id as usize;
-                        prepare_conn!(conn, batch_now, sel.request_plan, &mut ctx, target, sel.scenario_id);
+                        prepare_conn!(
+                            conn,
+                            batch_now,
+                            sel.request_plan,
+                            &mut ctx,
+                            target,
+                            sel.scenario_id
+                        );
                         match conn.try_write() {
                             Ok(true) => {
                                 conn.state = ConnState::ReadingHeaders;
@@ -960,7 +995,14 @@ pub fn run_mio_worker(
                                 // Saturate: pipeline next request immediately.
                                 let sel = pick_scenario(plan, &http_indices, &mut ctx);
                                 conn_scenario_idx[idx] = sel.scenario_id as usize;
-                                prepare_conn!(conn, batch_now, sel.request_plan, &mut ctx, target, sel.scenario_id);
+                                prepare_conn!(
+                                    conn,
+                                    batch_now,
+                                    sel.request_plan,
+                                    &mut ctx,
+                                    target,
+                                    sel.scenario_id
+                                );
                                 match conn.try_write() {
                                     Ok(true) => {
                                         conn.state = ConnState::ReadingHeaders;
@@ -968,10 +1010,7 @@ pub fn run_mio_worker(
                                     Ok(false) => {}
                                     Err(_) => {
                                         conn.state = ConnState::Dead;
-                                        recorder.record_error(
-                                            sel.scenario_id,
-                                            ErrorKind::Write,
-                                        );
+                                        recorder.record_error(sel.scenario_id, ErrorKind::Write);
                                     }
                                 }
                             }
@@ -998,7 +1037,14 @@ pub fn run_mio_worker(
                     let sel = pick_scenario(plan, &http_indices, &mut ctx);
                     conn_scenario_idx[conn_idx] = sel.scenario_id as usize;
                     let conn = &mut connections[conn_idx];
-                    prepare_conn!(conn, intended, sel.request_plan, &mut ctx, target, sel.scenario_id);
+                    prepare_conn!(
+                        conn,
+                        intended,
+                        sel.request_plan,
+                        &mut ctx,
+                        target,
+                        sel.scenario_id
+                    );
                     match conn.try_write() {
                         Ok(true) => conn.state = ConnState::ReadingHeaders,
                         Ok(false) => {}
@@ -1118,14 +1164,8 @@ pub fn __test_build_request(
     target: &Target,
     out: &mut Vec<u8>,
 ) {
-    super::raw_h1_common::build_raw_request(
-        plan,
-        ctx,
-        target,
-        ConnectionMode::KeepAlive,
-        out,
-    )
-    .expect("build request");
+    super::raw_h1_common::build_raw_request(plan, ctx, target, ConnectionMode::KeepAlive, out)
+        .expect("build request");
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,7 +1183,8 @@ mod tests {
     #[test]
     fn conn_check_headers_complete_response() {
         // Simulate a connection that has already read a full response.
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
 
         // Test memchr-accelerated find_header_end + httparse.
         assert!(find_header_end(response).is_some());
@@ -1155,7 +1196,10 @@ mod tests {
         let status = resp.parse(&response[..hdr_end]);
         assert!(status.is_ok());
         assert_eq!(resp.code, Some(200));
-        assert_eq!(find_content_length_raw(resp.headers), ContentLength::Present(5));
+        assert_eq!(
+            find_content_length_raw(resp.headers),
+            ContentLength::Present(5)
+        );
         assert!(!find_connection_close(resp.headers));
     }
 
@@ -1257,10 +1301,7 @@ mod tests {
     fn apply_extractions_header_missing_clears_slot() {
         let mut ctx = ScenarioContext::new(1, zerobench_core::rng::from_seed(1));
         // Pre-set the slot.
-        ctx.set_var(
-            zerobench_core::var::VarSlot(0),
-            Bytes::from_static(b"old"),
-        );
+        ctx.set_var(zerobench_core::var::VarSlot(0), Bytes::from_static(b"old"));
         let plan = RequestPlan {
             method: http::Method::GET,
             url: zerobench_core::template::Template::literal("/"),

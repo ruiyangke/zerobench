@@ -541,10 +541,7 @@ impl DashboardState {
     /// Requests in the most recent 1s tick. Returns 0 before any tick
     /// has been ingested.
     pub fn requests_per_sec(&self) -> f64 {
-        self.ticks
-            .back()
-            .map(|t| t.requests as f64)
-            .unwrap_or(0.0)
+        self.ticks.back().map(|t| t.requests as f64).unwrap_or(0.0)
     }
 
     /// Average rps across all ticks in the ring. Returns 0 when empty.
@@ -734,12 +731,7 @@ mod tests {
         }
     }
 
-    fn make_tick(
-        elapsed_s: u64,
-        requests: u64,
-        lat_ns: &[u64],
-        errors: ErrorCounters,
-    ) -> LiveTick {
+    fn make_tick(elapsed_s: u64, requests: u64, lat_ns: &[u64], errors: ErrorCounters) -> LiveTick {
         let mut lat = new_hist();
         for &n in lat_ns {
             let _ = lat.record(n);

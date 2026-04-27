@@ -40,10 +40,10 @@ pub fn run(args: &DiffArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let current_text = std::fs::read_to_string(&args.current)
         .map_err(|e| format!("reading current {}: {e}", args.current.display()))?;
 
-    let baseline: serde_json::Value = serde_json::from_str(&baseline_text)
-        .map_err(|e| format!("parsing baseline JSON: {e}"))?;
-    let current: serde_json::Value = serde_json::from_str(&current_text)
-        .map_err(|e| format!("parsing current JSON: {e}"))?;
+    let baseline: serde_json::Value =
+        serde_json::from_str(&baseline_text).map_err(|e| format!("parsing baseline JSON: {e}"))?;
+    let current: serde_json::Value =
+        serde_json::from_str(&current_text).map_err(|e| format!("parsing current JSON: {e}"))?;
 
     // Schema version sanity check. We only emit version 1; anything else
     // is a user (or upgrade) error.
@@ -441,7 +441,11 @@ fn write_terminal(
     is_tty: bool,
 ) -> io::Result<()> {
     let color = color_effective(args.color, is_tty);
-    let on = if color { Condition::ALWAYS } else { Condition::NEVER };
+    let on = if color {
+        Condition::ALWAYS
+    } else {
+        Condition::NEVER
+    };
 
     writeln!(
         out,
@@ -465,7 +469,11 @@ fn write_terminal(
         let status_str = match d.status {
             Status::Ok => "✓".green().whenever(on).to_string(),
             Status::Regression => {
-                format!("{} {}", "⚠".red().whenever(on), "REGRESSION".red().whenever(on))
+                format!(
+                    "{} {}",
+                    "⚠".red().whenever(on),
+                    "REGRESSION".red().whenever(on)
+                )
             }
             Status::Neutral => "—".dim().whenever(on).to_string(),
         };
@@ -478,7 +486,12 @@ fn write_terminal(
     writeln!(out)?;
 
     let summary = if regression {
-        format!("{}", "REGRESSION — one or more metrics breached threshold.".red().whenever(on))
+        format!(
+            "{}",
+            "REGRESSION — one or more metrics breached threshold."
+                .red()
+                .whenever(on)
+        )
     } else {
         format!("{}", "OK — no regressions detected.".green().whenever(on))
     };

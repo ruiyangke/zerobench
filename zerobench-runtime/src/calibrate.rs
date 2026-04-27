@@ -165,7 +165,9 @@ fn run_echo_loop(listener: &mut MioTcpListener, stop: &AtomicBool) -> io::Result
                 continue;
             }
 
-            let Some(conn) = conns.get_mut(&event.token()) else { continue };
+            let Some(conn) = conns.get_mut(&event.token()) else {
+                continue;
+            };
 
             let mut drop_conn = false;
             if event.is_readable() {
@@ -194,11 +196,7 @@ fn run_echo_loop(listener: &mut MioTcpListener, stop: &AtomicBool) -> io::Result
 /// Read as much as the kernel has buffered into the pending-write
 /// queue. On EOF or fatal error, returns Err so the caller drops the
 /// connection.
-fn echo_read(
-    conn: &mut EchoConn,
-    registry: &mio::Registry,
-    token: Token,
-) -> io::Result<()> {
+fn echo_read(conn: &mut EchoConn, registry: &mio::Registry, token: Token) -> io::Result<()> {
     let mut buf = [0u8; 8192];
     loop {
         match conn.stream.read(&mut buf) {
@@ -219,11 +217,7 @@ fn echo_read(
 
 /// Flush as much of the pending-write queue as the kernel accepts.
 /// Toggles interest to include WRITABLE when bytes remain.
-fn echo_write(
-    conn: &mut EchoConn,
-    registry: &mio::Registry,
-    token: Token,
-) -> io::Result<()> {
+fn echo_write(conn: &mut EchoConn, registry: &mio::Registry, token: Token) -> io::Result<()> {
     while !conn.pending_write.is_empty() {
         match conn.stream.write(&conn.pending_write) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "zero write")),
@@ -354,11 +348,8 @@ impl ClientSelfCheck {
         for i in 0..pool_size {
             let mut s = MioTcpStream::connect(self.echo.addr)?;
             s.set_nodelay(true)?;
-            poll.registry().register(
-                &mut s,
-                Token(i),
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
+            poll.registry()
+                .register(&mut s, Token(i), Interest::READABLE | Interest::WRITABLE)?;
             pool.push(s);
         }
         wait_connected(&mut poll, &mut events, &mut pool)?;
@@ -580,10 +571,8 @@ fn wait_for_interest(
                     "socket error during calibration",
                 ));
             }
-            let readable_ok =
-                desired == Interest::READABLE && event.is_readable();
-            let writable_ok =
-                desired == Interest::WRITABLE && event.is_writable();
+            let readable_ok = desired == Interest::READABLE && event.is_readable();
+            let writable_ok = desired == Interest::WRITABLE && event.is_writable();
             if readable_ok || writable_ok {
                 return Ok(());
             }

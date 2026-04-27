@@ -165,12 +165,7 @@ const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 ///
 /// Returns the byte count written. The output buffer is *appended to*,
 /// not overwritten, so callers can batch multiple frames if they want.
-pub fn encode_frame(
-    opcode: Opcode,
-    payload: &[u8],
-    mask: [u8; 4],
-    out: &mut Vec<u8>,
-) -> usize {
+pub fn encode_frame(opcode: Opcode, payload: &[u8], mask: [u8; 4], out: &mut Vec<u8>) -> usize {
     let len = payload.len();
     let start = out.len();
 
@@ -362,8 +357,11 @@ mod tests {
         // Bytes 2..6: the mask
         assert_eq!(&out[2..6], &mask);
         // Bytes 6..11: payload XOR mask
-        let expected: Vec<u8> =
-            b"hello".iter().enumerate().map(|(i, b)| b ^ mask[i & 3]).collect();
+        let expected: Vec<u8> = b"hello"
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i & 3])
+            .collect();
         assert_eq!(&out[6..11], expected.as_slice());
     }
 
@@ -415,7 +413,10 @@ mod tests {
         // mask. Payload starts at byte 2 + 4 (mask) = 6.
         server_view[1] &= 0x7f;
         let mask_slice = [
-            server_view[2], server_view[3], server_view[4], server_view[5],
+            server_view[2],
+            server_view[3],
+            server_view[4],
+            server_view[5],
         ];
         // Unmask payload in place:
         for (i, b) in server_view[6..].iter_mut().enumerate() {

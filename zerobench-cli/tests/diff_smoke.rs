@@ -34,10 +34,7 @@ fn diff_near_identical_runs_exits_zero() {
         String::from_utf8_lossy(&out.stderr),
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("OK"),
-        "expected OK marker, got:\n{stdout}"
-    );
+    assert!(stdout.contains("OK"), "expected OK marker, got:\n{stdout}");
 }
 
 #[test]
@@ -99,10 +96,7 @@ fn diff_threshold_override_suppresses_regression() {
     // non-zero due to the 5xx count.
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Find the p99 row — it shouldn't show REGRESSION.
-    let p99_line = stdout
-        .lines()
-        .find(|l| l.starts_with("p99 "))
-        .unwrap_or("");
+    let p99_line = stdout.lines().find(|l| l.starts_with("p99 ")).unwrap_or("");
     assert!(
         !p99_line.contains("REGRESSION"),
         "p99 should not be a regression at threshold=20, got line: {p99_line:?}\nfull:\n{stdout}"
@@ -130,7 +124,11 @@ fn diff_json_format_is_valid_and_has_regression_flag() {
     assert_eq!(v["regression"], serde_json::Value::from(true));
     assert!(v.get("deltas").is_some());
     // p99 entry should be in the deltas.
-    assert!(v["deltas"].get("p99_ns").is_some(), "deltas: {:?}", v["deltas"]);
+    assert!(
+        v["deltas"].get("p99_ns").is_some(),
+        "deltas: {:?}",
+        v["deltas"]
+    );
 }
 
 #[test]

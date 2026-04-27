@@ -183,8 +183,10 @@ macro_rules! register_parsed_setter_fn {
     ($engine:expr, $method:literal, $Builder:ty, $field:ident, $parser:expr) => {
         $engine.register_fn(
             $method,
-            move |ctx: NativeCallContext, b: $Builder, kind: ImmutableString|
-                -> Result<$Builder, Box<EvalAltResult>> {
+            move |ctx: NativeCallContext,
+                  b: $Builder,
+                  kind: ImmutableString|
+                  -> Result<$Builder, Box<EvalAltResult>> {
                 let parsed = $parser(&kind).map_err(|e| {
                     Box::new(EvalAltResult::ErrorRuntime(e.into(), ctx.call_position()))
                 })?;
@@ -334,9 +336,7 @@ impl PlanBuilder {
     }
 }
 
-fn finalize_state(
-    mut state: PlanBuilderState,
-) -> Result<(Plan, HttpVersionPref), ScriptError> {
+fn finalize_state(mut state: PlanBuilderState) -> Result<(Plan, HttpVersionPref), ScriptError> {
     if state.scenarios.is_empty() {
         return Err(ScriptError::NoScenarios);
     }
@@ -475,9 +475,9 @@ fn scale_rate(global: &RateProfile, share: f64) -> RateProfile {
             to: to * share,
             over: *over,
         },
-        RateProfile::Stepped(points) => RateProfile::Stepped(
-            points.iter().map(|(d, r)| (*d, r * share)).collect(),
-        ),
+        RateProfile::Stepped(points) => {
+            RateProfile::Stepped(points.iter().map(|(d, r)| (*d, r * share)).collect())
+        }
         // Saturate never gets scaled — it's a concurrency count, not a
         // rate. A script that sets `saturate(N)` and then uses weighted
         // scenarios gets `Saturate { N }` on every scenario (matching the
@@ -772,7 +772,10 @@ pub(crate) enum StepSource {
     #[allow(dead_code)]
     Pause(Duration),
     #[allow(dead_code)]
-    PauseRandom { min: Duration, max: Duration },
+    PauseRandom {
+        min: Duration,
+        max: Duration,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +879,12 @@ fn compile_headers<const N: usize>(
 ) -> Result<SmallVec<[(Template, Template); N]>, ScriptError> {
     let mut out: SmallVec<[(Template, Template); N]> = SmallVec::new();
     for (name, value) in raw {
-        let n = compile_tpl(&name, vars, scenario, format!("{kind} header name {name:?}"))?;
+        let n = compile_tpl(
+            &name,
+            vars,
+            scenario,
+            format!("{kind} header name {name:?}"),
+        )?;
         let v = compile_tpl(
             &value,
             vars,
@@ -1114,8 +1122,7 @@ fn compile_step(
             let body = match body {
                 None => None,
                 Some(BodySourceSpec::Raw(bytes)) => Some(BodySource::Static(bytes)),
-                Some(BodySourceSpec::Template(src))
-                | Some(BodySourceSpec::JsonTemplate(src)) => {
+                Some(BodySourceSpec::Template(src)) | Some(BodySourceSpec::JsonTemplate(src)) => {
                     let tpl = compile_tpl(&src, vars, scenario, "body")?;
                     Some(BodySource::Template(tpl))
                 }
@@ -1241,8 +1248,9 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
         ($method:literal, $field:ident) => {{
             let r = root.clone();
             engine.register_fn($method, move |spec: ImmutableString| {
-                let d = parse::parse_duration(&spec)
-                    .ok_or_else(|| to_rhai_err(format!(concat!("invalid ", $method, " {:?}"), spec)))?;
+                let d = parse::parse_duration(&spec).ok_or_else(|| {
+                    to_rhai_err(format!(concat!("invalid ", $method, " {:?}"), spec))
+                })?;
                 r.modify(|s| s.$field = Some(d));
                 Ok::<(), Box<EvalAltResult>>(())
             });
@@ -1290,8 +1298,9 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
     });
 
     // env("NAME") — required env var (or script error)
-    engine.register_fn("env", move |ctx: NativeCallContext, name: ImmutableString| {
-        match std::env::var(name.as_str()) {
+    engine.register_fn(
+        "env",
+        move |ctx: NativeCallContext, name: ImmutableString| match std::env::var(name.as_str()) {
             Ok(v) => Ok::<ImmutableString, Box<EvalAltResult>>(v.into()),
             Err(_) => Err(Box::new(EvalAltResult::ErrorRuntime(
                 Dynamic::from(format!(
@@ -1300,8 +1309,8 @@ fn register_top_level(engine: &mut Engine, root: PlanBuilder) {
                 )),
                 ctx.call_position(),
             ))),
-        }
-    });
+        },
+    );
 
     // env("NAME", "default") — with fallback
     engine.register_fn(
@@ -1457,10 +1466,7 @@ fn register_request_builders(engine: &mut Engine) {
               slot: VarSlotHandle| {
             let name = HeaderName::from_bytes(header.as_bytes()).map_err(|e| {
                 Box::new(EvalAltResult::ErrorRuntime(
-                    Dynamic::from(format!(
-                        "invalid header name {:?}: {e}",
-                        header.as_str()
-                    )),
+                    Dynamic::from(format!("invalid header name {:?}: {e}", header.as_str())),
                     ctx.call_position(),
                 ))
             })?;
@@ -1535,14 +1541,22 @@ fn register_ws_echo_rtt_builders(engine: &mut Engine) {
 
     register_header_fn!(engine, WsEchoRttBuilder);
     register_setter_fn!(
-        engine, "payload", WsEchoRttBuilder, payload, ImmutableString,
+        engine,
+        "payload",
+        WsEchoRttBuilder,
+        payload,
+        ImmutableString,
         |t: ImmutableString| t.to_string()
     );
     // .correlate(strategy) — how to match server echoes to client sends.
     // Accepts "pingpong", "prepend" (default), "first_text", or
     // "substring:<marker>". Unknown values fail at plan build time.
     register_parsed_setter_fn!(
-        engine, "correlate", WsEchoRttBuilder, correlate, parse_correlate
+        engine,
+        "correlate",
+        WsEchoRttBuilder,
+        correlate,
+        parse_correlate
     );
 }
 
@@ -1566,7 +1580,11 @@ fn register_ws_hold_builders(engine: &mut Engine) {
         },
     );
     register_setter_fn!(
-        engine, "heartbeat", WsHoldBuilder, heartbeat, ImmutableString,
+        engine,
+        "heartbeat",
+        WsHoldBuilder,
+        heartbeat,
+        ImmutableString,
         |i: ImmutableString| parse_duration_str(&i).unwrap_or(Duration::from_secs(25))
     );
     register_header_fn!(engine, WsHoldBuilder);
@@ -1574,7 +1592,11 @@ fn register_ws_hold_builders(engine: &mut Engine) {
     // "text" (app-level text frame, for servers that don't reply to
     // Ping).
     register_parsed_setter_fn!(
-        engine, "heartbeat_frame", WsHoldBuilder, heartbeat_frame, parse_heartbeat_frame
+        engine,
+        "heartbeat_frame",
+        WsHoldBuilder,
+        heartbeat_frame,
+        parse_heartbeat_frame
     );
 }
 
@@ -1588,7 +1610,11 @@ fn register_sse_fanout_builders(engine: &mut Engine) {
         },
     );
     register_setter_fn!(
-        engine, "trigger_url", SseFanoutBuilder, trigger_url, ImmutableString,
+        engine,
+        "trigger_url",
+        SseFanoutBuilder,
+        trigger_url,
+        ImmutableString,
         |u: ImmutableString| u.to_string()
     );
     register_setter_fn!(engine, "reconnect", SseFanoutBuilder, reconnect, bool);
@@ -1596,9 +1622,7 @@ fn register_sse_fanout_builders(engine: &mut Engine) {
     // .mode(kind) — "trigger_rtt" (default, proxy from trigger 2xx)
     // or "timestamp[:<field>]" (read emit ns from the broadcast
     // payload; requires server cooperation).
-    register_parsed_setter_fn!(
-        engine, "mode", SseFanoutBuilder, mode, parse_fanout_mode
-    );
+    register_parsed_setter_fn!(engine, "mode", SseFanoutBuilder, mode, parse_fanout_mode);
 }
 
 fn register_ws_fanout_builders(engine: &mut Engine) {
@@ -1611,20 +1635,30 @@ fn register_ws_fanout_builders(engine: &mut Engine) {
         },
     );
     register_setter_fn!(
-        engine, "trigger_url", WsFanoutBuilder, trigger_url, ImmutableString,
+        engine,
+        "trigger_url",
+        WsFanoutBuilder,
+        trigger_url,
+        ImmutableString,
         |u: ImmutableString| u.to_string()
     );
     register_setter_fn!(
-        engine, "heartbeat", WsFanoutBuilder, heartbeat, ImmutableString,
+        engine,
+        "heartbeat",
+        WsFanoutBuilder,
+        heartbeat,
+        ImmutableString,
         |i: ImmutableString| parse_duration_str(&i).unwrap_or(Duration::from_secs(25))
     );
     register_header_fn!(engine, WsFanoutBuilder);
     register_parsed_setter_fn!(
-        engine, "heartbeat_frame", WsFanoutBuilder, heartbeat_frame, parse_heartbeat_frame
+        engine,
+        "heartbeat_frame",
+        WsFanoutBuilder,
+        heartbeat_frame,
+        parse_heartbeat_frame
     );
-    register_parsed_setter_fn!(
-        engine, "mode", WsFanoutBuilder, mode, parse_fanout_mode
-    );
+    register_parsed_setter_fn!(engine, "mode", WsFanoutBuilder, mode, parse_fanout_mode);
 }
 
 fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
@@ -1637,11 +1671,18 @@ fn register_sse_reconnect_storm_builders(engine: &mut Engine) {
         },
     );
     register_setter_fn!(
-        engine, "kill_rate", SseReconnectStormBuilder, kill_rate_per_s, f64
+        engine,
+        "kill_rate",
+        SseReconnectStormBuilder,
+        kill_rate_per_s,
+        f64
     );
     register_setter_fn!(
-        engine, "verify_last_event_id", SseReconnectStormBuilder,
-        verify_last_event_id, bool
+        engine,
+        "verify_last_event_id",
+        SseReconnectStormBuilder,
+        verify_last_event_id,
+        bool
     );
     register_header_fn!(engine, SseReconnectStormBuilder);
 }
@@ -1666,7 +1707,11 @@ fn register_ws_server_push_builders(engine: &mut Engine) {
         },
     );
     register_setter_fn!(
-        engine, "expected_rate", WsServerPushBuilder, expected_rate_per_conn, f64
+        engine,
+        "expected_rate",
+        WsServerPushBuilder,
+        expected_rate_per_conn,
+        f64
     );
     register_header_fn!(engine, WsServerPushBuilder);
 }
@@ -1680,7 +1725,9 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
     } else if let Some(n) = s.strip_suffix('s') {
         Some(Duration::from_secs_f64(n.trim().parse().ok()?))
     } else if let Some(n) = s.strip_suffix('m') {
-        Some(Duration::from_secs_f64(n.trim().parse::<f64>().ok()? * 60.0))
+        Some(Duration::from_secs_f64(
+            n.trim().parse::<f64>().ok()? * 60.0,
+        ))
     } else {
         Some(Duration::from_secs(s.parse().ok()?))
     }
@@ -1725,14 +1772,11 @@ fn register_scenario_builder(engine: &mut Engine) {
     });
 
     // s.rate("3k/s")  — per-scenario open-loop rate
-    engine.register_fn(
-        "rate",
-        move |s: ScenarioBuilder, spec: ImmutableString| {
-            let rate = parse::parse_rate_with_unit(&spec).map_err(to_rhai_err)?;
-            s.modify(|st| st.rate = Some(RateProfile::Constant(rate)));
-            Ok::<(), Box<EvalAltResult>>(())
-        },
-    );
+    engine.register_fn("rate", move |s: ScenarioBuilder, spec: ImmutableString| {
+        let rate = parse::parse_rate_with_unit(&spec).map_err(to_rhai_err)?;
+        s.modify(|st| st.rate = Some(RateProfile::Constant(rate)));
+        Ok::<(), Box<EvalAltResult>>(())
+    });
 
     // s.saturate(n)  — per-scenario closed-loop concurrency
     engine.register_fn("saturate", move |s: ScenarioBuilder, n: i64| {
@@ -1792,7 +1836,11 @@ fn to_rhai_err(msg: impl Into<String>) -> Box<EvalAltResult> {
 /// entry point.
 #[inline]
 fn clamp_u32_min1(n: i64) -> u32 {
-    if n < 1 { 1 } else { (n as u32).max(1) }
+    if n < 1 {
+        1
+    } else {
+        (n as u32).max(1)
+    }
 }
 
 /// Parse a `hold_for` spec. The DSL accepts either a duration string
@@ -1851,11 +1899,16 @@ fn dynamic_to_serde(v: &Dynamic) -> Result<serde_json::Value, String> {
     }
     if v.is_string() {
         return Ok(Value::String(
-            v.clone().into_string().map_err(|t| format!("expected string, got {t}"))?,
+            v.clone()
+                .into_string()
+                .map_err(|t| format!("expected string, got {t}"))?,
         ));
     }
     if v.is_array() {
-        let arr = v.clone().into_array().map_err(|t| format!("expected array, got {t}"))?;
+        let arr = v
+            .clone()
+            .into_array()
+            .map_err(|t| format!("expected array, got {t}"))?;
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             out.push(dynamic_to_serde(&item)?);
@@ -1878,4 +1931,3 @@ fn dynamic_to_serde(v: &Dynamic) -> Result<serde_json::Value, String> {
         v.type_name()
     ))
 }
-

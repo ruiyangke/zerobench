@@ -378,7 +378,14 @@ fn compare_bootstrap(
     let delta_pct = pct_delta(a_mean, b_mean);
 
     // Seeded PRNG — determinism contract.
-    let mut rng = Xoshiro { s: [opts.seed.wrapping_add(metric as u64 * 0x9E37_79B9), 0x243F_6A88_85A3_08D3, 0x13198A2E_03707344, 0xA409_3822_299F_31D0] };
+    let mut rng = Xoshiro {
+        s: [
+            opts.seed.wrapping_add(metric as u64 * 0x9E37_79B9),
+            0x243F_6A88_85A3_08D3,
+            0x13198A2E_03707344,
+            0xA409_3822_299F_31D0,
+        ],
+    };
 
     let mut deltas: Vec<f64> = Vec::with_capacity(opts.bootstrap_resamples as usize);
     for _ in 0..opts.bootstrap_resamples {
@@ -390,8 +397,7 @@ fn compare_bootstrap(
 
     let alpha = 1.0 - opts.confidence_level;
     let lo_idx = ((alpha / 2.0) * deltas.len() as f64).round() as usize;
-    let hi_idx =
-        ((1.0 - alpha / 2.0) * deltas.len() as f64).round() as usize;
+    let hi_idx = ((1.0 - alpha / 2.0) * deltas.len() as f64).round() as usize;
     let lo = deltas[lo_idx.min(deltas.len() - 1)];
     let hi = deltas[hi_idx.min(deltas.len() - 1)];
 
@@ -972,17 +978,42 @@ mod tests {
             rate_per_s: rate,
             bytes_sent: 0,
             bytes_recv: 0,
-            latency: runs.first().map(|r| r.latency.clone()).unwrap_or(LatencyExport {
-                count: 0, min_ns: 0, p50_ns: 0, p90_ns: 0, p99_ns: 0,
-                p99_9_ns: 0, p99_99_ns: 0, max_ns: 0, mean_ns: 0.0, stddev_ns: 0.0,
-            }),
+            latency: runs
+                .first()
+                .map(|r| r.latency.clone())
+                .unwrap_or(LatencyExport {
+                    count: 0,
+                    min_ns: 0,
+                    p50_ns: 0,
+                    p90_ns: 0,
+                    p99_ns: 0,
+                    p99_9_ns: 0,
+                    p99_99_ns: 0,
+                    max_ns: 0,
+                    mean_ns: 0.0,
+                    stddev_ns: 0.0,
+                }),
             ttfb: LatencyExport {
-                count: 0, min_ns: 0, p50_ns: 0, p90_ns: 0, p99_ns: 0,
-                p99_9_ns: 0, p99_99_ns: 0, max_ns: 0, mean_ns: 0.0, stddev_ns: 0.0,
+                count: 0,
+                min_ns: 0,
+                p50_ns: 0,
+                p90_ns: 0,
+                p99_ns: 0,
+                p99_9_ns: 0,
+                p99_99_ns: 0,
+                max_ns: 0,
+                mean_ns: 0.0,
+                stddev_ns: 0.0,
             },
             errors: ErrorCountersExport {
-                connect: 0, read: 0, write: 0, timeout: 0, keepup: 0,
-                status_4xx: 0, status_5xx: 0, assertion_failed: 0,
+                connect: 0,
+                read: 0,
+                write: 0,
+                timeout: 0,
+                keepup: 0,
+                status_4xx: 0,
+                status_5xx: 0,
+                assertion_failed: 0,
             },
             scenarios: Vec::new(),
             per_run: runs,
@@ -1166,7 +1197,11 @@ mod tests {
         let mut a = mk_hist();
         let mut b = mk_hist();
         // Same samples into each.
-        for v in [100u64, 200, 500, 1_000, 2_000, 5_000].iter().cycle().take(1000) {
+        for v in [100u64, 200, 500, 1_000, 2_000, 5_000]
+            .iter()
+            .cycle()
+            .take(1000)
+        {
             a.record(*v).unwrap();
             b.record(*v).unwrap();
         }
@@ -1273,7 +1308,11 @@ mod tests {
     fn ad_identical_histograms_are_not_significant() {
         let mut a = mk_hist();
         let mut b = mk_hist();
-        for v in [100u64, 200, 500, 1_000, 2_000, 5_000].iter().cycle().take(1000) {
+        for v in [100u64, 200, 500, 1_000, 2_000, 5_000]
+            .iter()
+            .cycle()
+            .take(1000)
+        {
             a.record(*v).unwrap();
             b.record(*v).unwrap();
         }

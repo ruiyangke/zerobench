@@ -44,9 +44,21 @@ fn mio_h2_https_without_server_records_connect_errors() {
         insecure_tls: true,
         ..Default::default()
     };
-    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"h2"]));
+    let tls_config = Some(zerobench_backends::http::mio_tls::build_tls_config(
+        &opts,
+        &[b"h2"],
+    ));
     let stats = zerobench_backends::http::mio_h2::run_mio_h2_threaded(
-        &target, &opts, &plan, 1, 1, Duration::from_secs(1), None, tls_config, None, None,
+        &target,
+        &opts,
+        &plan,
+        1,
+        1,
+        Duration::from_secs(1),
+        None,
+        tls_config,
+        None,
+        None,
     );
     let total: u64 = stats.iter().map(|s| s.requests).sum();
     let errors: u64 = stats.iter().map(|s| s.errors.total()).sum();

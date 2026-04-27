@@ -52,16 +52,19 @@ pub fn fire_http_post(
     body: &[u8],
     tls_config: Option<&Arc<ClientConfig>>,
 ) -> io::Result<()> {
-    let addr = target.resolve(opts).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("resolve: {e}"))
-    })?;
+    let addr = target
+        .resolve(opts)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("resolve: {e}")))?;
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(4);
     let mut tcp = MioTcp::connect(addr)?;
     let _ = tcp.set_nodelay(true);
-    poll.registry()
-        .register(&mut tcp, POLL_TOKEN, Interest::READABLE | Interest::WRITABLE)?;
+    poll.registry().register(
+        &mut tcp,
+        POLL_TOKEN,
+        Interest::READABLE | Interest::WRITABLE,
+    )?;
 
     wait_for(&mut poll, &mut events, opts.connect_timeout, |e| {
         e.token() == POLL_TOKEN && e.is_writable()
@@ -91,10 +94,7 @@ pub fn fire_http_post(
         let hs_start = Instant::now();
         while stream.is_handshaking() {
             if hs_start.elapsed() > Duration::from_millis(5_000) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "tls handshake",
-                ));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake"));
             }
             stream.drive_tls_io()?;
             if !stream.is_handshaking() {

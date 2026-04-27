@@ -16,9 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smallvec::SmallVec;
-use zerobench_core::plan::{
-    ColdConnectPlan, Mode, Plan, RateProfile, RequestPlan, Scenario, Step,
-};
+use zerobench_core::plan::{ColdConnectPlan, Mode, Plan, RateProfile, RequestPlan, Scenario, Step};
 use zerobench_core::transport::{AddrFamily, Target, TransportOpts};
 use zerobench_core::var::VarRegistry;
 use zerobench_core::Template;
@@ -75,9 +73,7 @@ fn plan_for(addr: SocketAddr) -> (Plan, Target) {
     };
     let scenario = Scenario {
         name: "cold".into(),
-        rate: RateProfile::Saturate {
-            max_concurrency: 4,
-        },
+        rate: RateProfile::Saturate { max_concurrency: 4 },
         steps: vec![Step::HttpColdConnect(ColdConnectPlan { request })],
     };
     let plan = Plan {
@@ -131,10 +127,7 @@ fn cold_connect_records_requests_from_fresh_connections() {
         "expected ≥1 cold-connect op, got {}",
         ts.requests
     );
-    assert_eq!(
-        ts.errors.connect, 0,
-        "no connect errors against local stub"
-    );
+    assert_eq!(ts.errors.connect, 0, "no connect errors against local stub");
     // Payload is 4 bytes per response ("pong"); a connect+read cycle
     // should drain it.
     assert!(

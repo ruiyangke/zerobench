@@ -155,9 +155,7 @@ fn run_dry(args: &CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // `opts.resolve_overrides` (populated from `--resolve` on the CLI)
     // before falling back to the system resolver.
     let scheme = if target.tls { "https" } else { "http" };
-    let url_label = if (target.tls && target.port == 443)
-        || (!target.tls && target.port == 80)
-    {
+    let url_label = if (target.tls && target.port == 443) || (!target.tls && target.port == 80) {
         format!("{scheme}://{}", target.host)
     } else {
         format!("{scheme}://{}:{}", target.host, target.port)
@@ -183,10 +181,8 @@ fn run_dry(args: &CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         format_duration(plan.duration),
     );
     // The method & headers live on the first scenario's first step.
-    if let Some(zerobench_core::plan::Step::Request(req)) = plan
-        .scenarios
-        .first()
-        .and_then(|s| s.steps.first())
+    if let Some(zerobench_core::plan::Step::Request(req)) =
+        plan.scenarios.first().and_then(|s| s.steps.first())
     {
         println!("method:     {}", req.method);
         if req.headers.is_empty() {
@@ -219,9 +215,8 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Open `path` for writing the final report, returning the owned file
 /// so stdout-locking code can use a single `Write` trait object.
 fn open_output_file(path: &Path) -> Result<File, Box<dyn std::error::Error>> {
-    File::create(path).map_err(|e| {
-        format!("cannot open output file {}: {e}", path.display()).into()
-    })
+    File::create(path)
+        .map_err(|e| format!("cannot open output file {}: {e}", path.display()).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +276,7 @@ fn build_transport_info(
 /// Drive the mio-based benchmark — pure synchronous epoll, no async runtime.
 /// Builds the plan, spawns N OS threads with their own `mio::Poll`, waits
 /// for `plan.duration`, merges stats, renders.
-fn run_mio_sync(
-    args: &CliArgs,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn run_mio_sync(args: &CliArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // SSE / WS bench paths go through `zerobench measure --sse-hold N`
     // / `--ws-echo N` (v0.1.0). The old top-level `--sse` / `--ws`
     // flags are rejected at the clap level (see CliArgs).
@@ -293,9 +286,7 @@ fn run_mio_sync(
     let tui_enabled = false;
 
     if tui_enabled && matches!(args.format, CliFormat::Jsonl) {
-        return Err(
-            "--tui cannot be combined with --format jsonl (both write to stdout)".into(),
-        );
+        return Err("--tui cannot be combined with --format jsonl (both write to stdout)".into());
     }
     #[cfg(feature = "tui")]
     if tui_enabled && !std::io::stdout().is_terminal() {
@@ -309,13 +300,15 @@ fn run_mio_sync(
 
     // `--http2-prior-knowledge` is a discoverability alias for
     // `--http-version h2` — honour both when picking the wire version.
-    let use_h2 = args.http2_prior_knowledge
-        || matches!(args.http_version, cli_args::CliHttpVersion::H2);
+    let use_h2 =
+        args.http2_prior_knowledge || matches!(args.http_version, cli_args::CliHttpVersion::H2);
 
     // Build TLS config when targeting https://.
     let tls_config = if target.tls {
         let alpn: &[&[u8]] = if use_h2 { &[b"h2"] } else { &[b"http/1.1"] };
-        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, alpn))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
+            &opts, alpn,
+        ))
     } else {
         None
     };
@@ -345,8 +338,7 @@ fn run_mio_sync(
         let stop_for_tui = stop.clone().unwrap();
         let url_label = format_url_label(&target);
         let transport = build_transport_info(args, &target, &opts);
-        let scenario_names: Vec<String> =
-            plan.scenarios.iter().map(|s| s.name.clone()).collect();
+        let scenario_names: Vec<String> = plan.scenarios.iter().map(|s| s.name.clone()).collect();
         let total_duration = plan.duration;
         let target_rate = args.rate;
 
@@ -412,13 +404,7 @@ fn run_mio_sync(
         CliColor::Auto => ColorChoice::Auto,
         CliColor::Never => ColorChoice::Never,
     };
-    render_report(
-        &summary,
-        &plan,
-        args.format,
-        args.output.as_deref(),
-        color,
-    )?;
+    render_report(&summary, &plan, args.format, args.output.as_deref(), color)?;
 
     let total_errors = summary.errors.total();
     if total_errors > 0 {
@@ -534,7 +520,10 @@ fn dispatch_multi_protocol_plan(
     // Shared TLS config across all three protocol groups — the Rhai
     // path pins ALPN to http/1.1 for every backend today.
     let tls_config = if target.tls {
-        Some(zerobench_backends::http::mio_tls::build_tls_config(opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
+            opts,
+            &[b"http/1.1"],
+        ))
     } else {
         None
     };
@@ -554,9 +543,7 @@ fn dispatch_multi_protocol_plan(
     Ok(Summary::merge(all_stats, plan.duration))
 }
 
-fn run_script_sync(
-    args: cli_args::RunArgs,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn run_script_sync(args: cli_args::RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     use zerobench_core::plan::{RateProfile, Step};
     use zerobench_core::template::Template;
     use zerobench_core::transport::TransportOpts;
@@ -701,7 +688,10 @@ fn run_script_sync(
     // All three backend groups use HTTP/1.1 ALPN on the Rhai path —
     // build one shared TLS config to hand to `run_plan`.
     let tls_config = if target.tls {
-        Some(zerobench_backends::http::mio_tls::build_tls_config(&opts, &[b"http/1.1"]))
+        Some(zerobench_backends::http::mio_tls::build_tls_config(
+            &opts,
+            &[b"http/1.1"],
+        ))
     } else {
         None
     };
@@ -721,13 +711,7 @@ fn run_script_sync(
 
     let summary = Summary::merge(all_stats, plan.duration);
 
-    render_report(
-        &summary,
-        &plan,
-        args.format,
-        args.output.as_deref(),
-        color,
-    )?;
+    render_report(&summary, &plan, args.format, args.output.as_deref(), color)?;
 
     // Exit-code policy: hard transport errors (connect/read/write/
     // timeout/keepup) or zero operations completed → exit 1. 4xx/5xx

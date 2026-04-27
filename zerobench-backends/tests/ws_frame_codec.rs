@@ -5,7 +5,9 @@
 //! shape (client-encode → server-unmask → server-echo → client-decode)
 //! plus the edge cases around extended payload lengths.
 
-use zerobench_backends::ws::frame::{decode_frame, encode_close, encode_frame, parse_close_payload, Opcode, FrameError};
+use zerobench_backends::ws::frame::{
+    decode_frame, encode_close, encode_frame, parse_close_payload, FrameError, Opcode,
+};
 
 /// Simulate a server receiving a client frame: strip the MASK bit,
 /// unmask the payload in place, and drop the 4-byte mask so
@@ -41,7 +43,12 @@ fn unmask_client_frame(frame: &[u8]) -> Vec<u8> {
 fn round_trip_short_text_frame() {
     // Client encodes → server unmasks → decode parses.
     let mut client_buf = Vec::new();
-    encode_frame(Opcode::Text, b"hello", [0x12, 0x34, 0x56, 0x78], &mut client_buf);
+    encode_frame(
+        Opcode::Text,
+        b"hello",
+        [0x12, 0x34, 0x56, 0x78],
+        &mut client_buf,
+    );
 
     let server_view = unmask_client_frame(&client_buf);
     let hdr = decode_frame(&server_view).unwrap();
@@ -76,7 +83,12 @@ fn round_trip_64_bit_length_payload() {
     // trivial.
     let payload = vec![0x33u8; 70_000];
     let mut client_buf = Vec::new();
-    encode_frame(Opcode::Binary, &payload, [0x99, 0xAA, 0xBB, 0xCC], &mut client_buf);
+    encode_frame(
+        Opcode::Binary,
+        &payload,
+        [0x99, 0xAA, 0xBB, 0xCC],
+        &mut client_buf,
+    );
 
     let server_view = unmask_client_frame(&client_buf);
     let hdr = decode_frame(&server_view).unwrap();

@@ -21,7 +21,12 @@ pub struct OwnedDataset {
 
 impl OwnedDataset {
     /// Named line series — the common case for p50/p90/rps/etc.
-    pub fn line(name: impl Into<String>, data: Vec<(f64, f64)>, color: Color, marker: Marker) -> Self {
+    pub fn line(
+        name: impl Into<String>,
+        data: Vec<(f64, f64)>,
+        color: Color,
+        marker: Marker,
+    ) -> Self {
         Self {
             name: Some(name.into()),
             data,

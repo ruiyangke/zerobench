@@ -96,8 +96,12 @@ pub struct MeasureArgs {
     pub rate: Option<f64>,
 
     /// Max concurrent connections (H1) or streams (H2).
-    #[arg(short = 'c', long = "connections", default_value_t = 50,
-          help_heading = "Load")]
+    #[arg(
+        short = 'c',
+        long = "connections",
+        default_value_t = 50,
+        help_heading = "Load"
+    )]
     pub connections: usize,
 
     /// OS worker threads.
@@ -228,7 +232,11 @@ pub struct MeasureArgs {
 
     /// Text payload body for each send (the 16-char monotonic id
     /// prefix is prepended automatically for correlation).
-    #[arg(long = "ws-payload", default_value = "ping", help_heading = "WebSocket")]
+    #[arg(
+        long = "ws-payload",
+        default_value = "ping",
+        help_heading = "WebSocket"
+    )]
     pub ws_payload: String,
 
     // -------------------------------------------------------------------
@@ -336,8 +344,7 @@ pub struct MeasureArgs {
 
     /// Trigger URL for `--sse-fanout` / `--ws-fanout`. HTTP POST.
     /// Templates (`{{counter}}`, `{{uuid}}`) re-render per firing.
-    #[arg(long = "trigger-url", value_name = "URL",
-          help_heading = "Fanout")]
+    #[arg(long = "trigger-url", value_name = "URL", help_heading = "Fanout")]
     pub trigger_url: Option<String>,
 
     /// Open N SSE subscribers and kill them at `--kill-rate` per second
@@ -355,9 +362,12 @@ pub struct MeasureArgs {
 
     /// Aggregate kill rate (per subscriber per second) for
     /// `--sse-reconnect-storm`.
-    #[arg(long = "kill-rate", value_name = "RATE",
-          default_value = "0.1",
-          help_heading = "SSE")]
+    #[arg(
+        long = "kill-rate",
+        value_name = "RATE",
+        default_value = "0.1",
+        help_heading = "SSE"
+    )]
     pub kill_rate: f64,
 }
 
@@ -498,10 +508,7 @@ pub fn run(args: MeasureArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // Warmup is amortised across the N runs per PHILOSOPHY §P8 —
         // only fire on iteration 0.
         if !args.warmup.is_zero() && run_idx == 0 {
-            eprintln!(
-                "[warmup] {} (discarded)...",
-                format_duration(args.warmup)
-            );
+            eprintln!("[warmup] {} (discarded)...", format_duration(args.warmup));
             let _ = run_plan_with_harness(&plan, &harness, args.warmup);
         }
 
@@ -616,10 +623,7 @@ fn build_per_run_metrics(idx: u32, summary: &Summary, plan: &Plan) -> PerRunMetr
     // `--regress-on` reads this slot when set; pure-HTTP runs leave it
     // empty and the engine falls through to the generic `latency` field.
     let proto_hist = pick_primary_histogram(summary, plan);
-    let proto_latency = if std::ptr::eq(
-        proto_hist as *const _,
-        &summary.latency as *const _,
-    ) {
+    let proto_latency = if std::ptr::eq(proto_hist as *const _, &summary.latency as *const _) {
         LatencyExport::default()
     } else {
         LatencyExport::from_hist(proto_hist)

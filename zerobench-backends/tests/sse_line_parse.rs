@@ -212,10 +212,7 @@ fn normal_data_after_done_still_parses() {
     let out = feed_all(&[b"data: [DONE]\n\ndata: more\n\n"]);
     assert_eq!(
         out,
-        vec![
-            OwnedEvent::Done,
-            OwnedEvent::Data(b"more".to_vec()),
-        ]
+        vec![OwnedEvent::Done, OwnedEvent::Data(b"more".to_vec()),]
     );
 }
 

@@ -74,11 +74,7 @@ fn env_is_baked_at_compile_time() {
 fn env_default_used_when_unset() {
     // An extremely unlikely env name.
     let mut vars = VarRegistry::new();
-    let t = Template::compile(
-        "{{env:ZEROBENCH_DEFINITELY_UNSET_42:fallback}}",
-        &mut vars,
-    )
-    .unwrap();
+    let t = Template::compile("{{env:ZEROBENCH_DEFINITELY_UNSET_42:fallback}}", &mut vars).unwrap();
     let mut h = Harness::new();
     let out = expand(&t, &mut h);
     assert_eq!(out, b"fallback");
@@ -87,8 +83,7 @@ fn env_default_used_when_unset() {
 #[test]
 fn env_missing_without_default_errors() {
     let mut vars = VarRegistry::new();
-    let err =
-        Template::compile("{{env:ZEROBENCH_MISSING_NO_DEFAULT_42}}", &mut vars).unwrap_err();
+    let err = Template::compile("{{env:ZEROBENCH_MISSING_NO_DEFAULT_42}}", &mut vars).unwrap_err();
     match err {
         TemplateError::MissingEnv(s) => assert_eq!(s, "ZEROBENCH_MISSING_NO_DEFAULT_42"),
         other => panic!("expected MissingEnv, got {other:?}"),
@@ -344,8 +339,7 @@ fn escape_doubles_braces() {
 #[test]
 fn mixed_template_interleaves_literal_and_vars() {
     let mut vars = VarRegistry::new();
-    let t =
-        Template::compile("a={{rand_int:5:5}},b={{counter}},c={{counter}}", &mut vars).unwrap();
+    let t = Template::compile("a={{rand_int:5:5}},b={{counter}},c={{counter}}", &mut vars).unwrap();
     let mut h = Harness::new();
     let out = expand(&t, &mut h);
     assert_eq!(out, b"a=5,b=0,c=1");

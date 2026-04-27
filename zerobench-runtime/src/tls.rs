@@ -42,9 +42,9 @@
 
 use std::sync::Arc;
 
-use rustls::ClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use zerobench_core::transport::TransportOpts;

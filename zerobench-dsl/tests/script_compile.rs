@@ -186,7 +186,9 @@ fn invalid_template_surfaces_template_error() {
     "#;
     let err = load_script_str(src).unwrap_err();
     match err {
-        ScriptError::Template { scenario, field, .. } => {
+        ScriptError::Template {
+            scenario, field, ..
+        } => {
             assert_eq!(scenario, "x");
             assert!(field.contains("url"), "field = {field}");
         }
@@ -274,7 +276,10 @@ fn var_slot_reused_by_template_and_extractor() {
     let loaded = load_script_str(src).unwrap();
     // Exactly one named slot: "token".
     assert_eq!(loaded.plan.vars.len(), 1);
-    assert_eq!(loaded.plan.vars.name(zerobench_core::VarSlot(0)), Some("token"));
+    assert_eq!(
+        loaded.plan.vars.name(zerobench_core::VarSlot(0)),
+        Some("token")
+    );
 }
 
 #[test]
@@ -339,7 +344,10 @@ fn json_body_adds_content_type_and_becomes_template() {
     let loaded = load_script_str(src).unwrap();
     match &loaded.plan.scenarios[0].steps[0] {
         Step::Request(r) => {
-            assert!(matches!(&r.body, Some(zerobench_core::BodySource::Template(_))));
+            assert!(matches!(
+                &r.body,
+                Some(zerobench_core::BodySource::Template(_))
+            ));
             // Exactly one header: Content-Type application/json.
             assert_eq!(r.headers.len(), 1);
         }
@@ -472,12 +480,7 @@ fn mixed_protocol_plan_from_rhai() {
     assert_eq!(loaded.plan.scenarios.len(), 3);
 
     use zerobench_core::plan::Protocol;
-    let protocols: Vec<Protocol> = loaded
-        .plan
-        .scenarios
-        .iter()
-        .map(|s| s.protocol())
-        .collect();
+    let protocols: Vec<Protocol> = loaded.plan.scenarios.iter().map(|s| s.protocol()).collect();
     assert_eq!(protocols, vec![Protocol::Http, Protocol::Sse, Protocol::Ws]);
 }
 

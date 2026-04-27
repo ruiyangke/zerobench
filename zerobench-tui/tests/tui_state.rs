@@ -12,8 +12,7 @@ use hdrhistogram::Histogram;
 use zerobench_core::stats::ErrorCounters;
 use zerobench_runtime::live_snapshot::LiveTick;
 use zerobench_tui::state::{
-    DashboardState, RunMode, Tab, TransportInfo, DELTA_LOOKBACK, MAX_TICKS,
-    ROLLING_LATENCY_WINDOW,
+    DashboardState, RunMode, Tab, TransportInfo, DELTA_LOOKBACK, MAX_TICKS, ROLLING_LATENCY_WINDOW,
 };
 
 // ---------------------------------------------------------------------------
@@ -214,18 +213,11 @@ fn p99_9_delta_reports_regression_after_lookback() {
     // need at least ROLLING_LATENCY_WINDOW so the current rolling
     // window is entirely inside the new high-latency regime.
     for i in 0..(ROLLING_LATENCY_WINDOW + 2) {
-        s.ingest(tick(
-            DELTA_LOOKBACK as u64 + i as u64,
-            100,
-            10_000_000,
-        ));
+        s.ingest(tick(DELTA_LOOKBACK as u64 + i as u64, 100, 10_000_000));
     }
     let delta = s.p99_9_delta_pct().unwrap();
     // Rolling p99.9 jumped from ~1ms to ~10ms — expect ~+900%.
-    assert!(
-        delta > 500.0,
-        "expected large positive delta, got {delta}%",
-    );
+    assert!(delta > 500.0, "expected large positive delta, got {delta}%",);
 }
 
 #[test]
@@ -245,11 +237,7 @@ fn p99_9_delta_uses_symmetric_rolling_windows() {
     }
 
     for i in 0..ROLLING_LATENCY_WINDOW {
-        s.ingest(tick(
-            DELTA_LOOKBACK as u64 + i as u64,
-            100,
-            10_000_000,
-        ));
+        s.ingest(tick(DELTA_LOOKBACK as u64 + i as u64, 100, 10_000_000));
     }
 
     let baseline = s.prev_p99_9_ns.expect("baseline should be set");

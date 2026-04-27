@@ -55,11 +55,7 @@ impl MioTlsStream {
     /// Create a new TLS connection over an already-connected TCP stream.
     /// Does NOT perform the handshake — call `complete_handshake` after
     /// registering the underlying TCP stream with mio.
-    pub fn new(
-        tcp: TcpStream,
-        config: Arc<ClientConfig>,
-        server_name: &str,
-    ) -> io::Result<Self> {
+    pub fn new(tcp: TcpStream, config: Arc<ClientConfig>, server_name: &str) -> io::Result<Self> {
         let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad SNI: {e}")))?;
         let tls = rustls::ClientConnection::new(config, server_name)
@@ -165,10 +161,7 @@ impl MioTlsStream {
                         }
                         Ok(n) => {
                             self.tls.process_new_packets().map_err(|e| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("tls: {e}"),
-                                )
+                                io::Error::new(io::ErrorKind::InvalidData, format!("tls: {e}"))
                             })?;
                             n > 0
                         }
@@ -199,8 +192,7 @@ impl MioTlsStream {
             // loop still reacts to external signals (the thread may
             // need to observe stop flags), but never past the deadline.
             let remaining = deadline - now;
-            let poll_budget =
-                remaining.min(std::time::Duration::from_millis(100));
+            let poll_budget = remaining.min(std::time::Duration::from_millis(100));
             poll.poll(&mut events, Some(poll_budget))?;
         }
     }

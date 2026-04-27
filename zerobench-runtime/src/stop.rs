@@ -19,8 +19,8 @@
 //! for the requested duration, then flips the flag. This works
 //! regardless of whether the calling thread is blocked on joins.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Shared stop flag.
