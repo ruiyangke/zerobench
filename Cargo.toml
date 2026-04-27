@@ -14,9 +14,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# MSRV is 1.85 — clap_lex (transitive via clap 4.6) needs edition2024,
-# which stabilised in Rust 1.85.
-rust-version = "1.85"
+# MSRV is 1.88 — the dep tree pulls `time 0.3.47` /
+# `instability 0.3.12` / `darling_macro 0.23.0` (transitively via rhai),
+# all of which require rustc 1.88. clap_lex 1.1.0 needs edition2024
+# (Rust 1.85+) and ratatui 0.30 needs 1.86; 1.88 covers them all.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/ruiyangke/zerobench"
 homepage = "https://github.com/ruiyangke/zerobench"
